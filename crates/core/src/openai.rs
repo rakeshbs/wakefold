@@ -10,13 +10,16 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionTool,
-    ChatCompletionTools, CreateChatCompletionRequest, FinishReason, FunctionCall, FunctionObject,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools,
+    CreateChatCompletionRequest, FinishReason, FunctionCall, FunctionObject,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
 
-use crate::{Message, ModelRequest, ModelResponse, Provider, ProviderError, ToolCall};
+use crate::{
+    Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError, TokenUsage, ToolCall,
+};
 
 /// A streaming provider using the OpenAI-compatible Chat Completions API.
 ///
@@ -25,14 +28,19 @@ use crate::{Message, ModelRequest, ModelResponse, Provider, ProviderError, ToolC
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// use wakefold::{OpenAiProvider, run_streaming};
+/// use wakefold::{OpenAiProvider, RunOptions, run_streaming_with_options};
 ///
 /// let provider = OpenAiProvider::new(
 ///     std::env::var("OPENAI_MODEL")?,
 ///     std::env::var("OPENAI_API_KEY")?,
 /// )?;
-/// let answer = run_streaming("Hello", &provider, &[], 1, |text| print!("{text}")).await?;
-/// # let _ = answer;
+/// let options = RunOptions::new(1).with_token_budget(1_000);
+/// let report = run_streaming_with_options("Hello", &provider, &[], options, |text| {
+///     print!("{text}");
+/// })
+/// .await?;
+/// println!("Reported tokens: {}", report.usage.reported.total_tokens());
+/// println!("Turns without usage: {}", report.usage.unreported_turns);
 /// # Ok(())
 /// # }
 /// ```
@@ -40,6 +48,7 @@ use crate::{Message, ModelRequest, ModelResponse, Provider, ProviderError, ToolC
 pub struct OpenAiProvider {
     model: String,
     client: Client<OpenAIConfig>,
+    include_usage: bool,
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -47,12 +56,13 @@ impl fmt::Debug for OpenAiProvider {
         formatter
             .debug_struct("OpenAiProvider")
             .field("model", &self.model)
+            .field("include_usage", &self.include_usage)
             .finish_non_exhaustive()
     }
 }
 
 impl OpenAiProvider {
-    /// Create a provider for OpenAI with the supplied model ID and API key.
+    /// Create a provider for OpenAI with streamed usage reporting enabled.
     ///
     /// # Errors
     ///
@@ -61,13 +71,14 @@ impl OpenAiProvider {
         model: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Result<Self, ProviderError> {
-        Self::with_base_url(model, OPENAI_API_BASE, api_key)
+        Ok(Self::with_base_url(model, OPENAI_API_BASE, api_key)?.with_usage_reporting())
     }
 
     /// Create a provider for a base URL such as `http://localhost:8000/v1`.
     ///
     /// Include the server's API prefix in `base_url`. The client adds
-    /// `/chat/completions` to it.
+    /// `/chat/completions` to it. Use [`Self::with_usage_reporting`] when
+    /// the endpoint supports returning token counts in a streaming request.
     ///
     /// # Errors
     ///
@@ -90,7 +101,14 @@ impl OpenAiProvider {
         Ok(Self {
             model: model.into(),
             client: Client::with_config(config),
+            include_usage: false,
         })
+    }
+
+    /// Request token usage from a compatible endpoint that supports it.
+    pub fn with_usage_reporting(mut self) -> Self {
+        self.include_usage = true;
+        self
     }
 
     fn chat_request(&self, request: ModelRequest<'_>) -> CreateChatCompletionRequest {
@@ -114,6 +132,10 @@ impl OpenAiProvider {
             messages: request.messages.iter().map(chat_message).collect(),
             tools: (!tools.is_empty()).then_some(tools),
             stream: Some(true),
+            stream_options: self.include_usage.then_some(ChatCompletionStreamOptions {
+                include_usage: Some(true),
+                include_obfuscation: None,
+            }),
             ..Default::default()
         }
     }
@@ -130,6 +152,14 @@ impl Provider for OpenAiProvider {
         request: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelResponse, ProviderError> {
+        Ok(self.complete_turn(request, on_text).await?.response)
+    }
+
+    async fn complete_turn(
+        &self,
+        request: ModelRequest<'_>,
+        on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
+    ) -> Result<ModelTurn, ProviderError> {
         let mut stream = self
             .client
             .chat()
@@ -138,29 +168,47 @@ impl Provider for OpenAiProvider {
             .map_err(|source| ProviderError::with_source("could not open chat stream", source))?;
         let mut text = String::new();
         let mut calls = BTreeMap::<u32, ToolCallParts>::new();
+        let mut response = None;
+        let mut usage = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk =
                 chunk.map_err(|source| ProviderError::with_source("chat stream failed", source))?;
-            for choice in chunk.choices.into_iter().filter(|choice| choice.index == 0) {
-                if let Some(delta) = choice.delta.content.or(choice.delta.refusal) {
-                    text.push_str(&delta);
-                    if !delta.is_empty() {
-                        on_text(&delta);
+            if let Some(reported) = chunk.usage {
+                usage = Some(TokenUsage::new(
+                    u64::from(reported.prompt_tokens),
+                    u64::from(reported.completion_tokens),
+                ));
+            }
+            if response.is_none() {
+                for choice in chunk.choices.into_iter().filter(|choice| choice.index == 0) {
+                    if let Some(delta) = choice.delta.content.or(choice.delta.refusal) {
+                        text.push_str(&delta);
+                        if !delta.is_empty() {
+                            on_text(&delta);
+                        }
+                    }
+                    for delta in choice.delta.tool_calls.into_iter().flatten() {
+                        calls.entry(delta.index).or_default().append(delta)?;
+                    }
+                    if let Some(reason) = choice.finish_reason {
+                        response = Some(finish_turn(
+                            reason,
+                            std::mem::take(&mut text),
+                            std::mem::take(&mut calls),
+                        )?);
+                        break;
                     }
                 }
-                for delta in choice.delta.tool_calls.into_iter().flatten() {
-                    calls.entry(delta.index).or_default().append(delta)?;
-                }
-                if let Some(reason) = choice.finish_reason {
-                    return finish_turn(reason, text, calls);
-                }
+            }
+            if response.is_some() && (!self.include_usage || usage.is_some()) {
+                break;
             }
         }
 
-        Err(ProviderError::new(
-            "chat stream ended before a finish reason",
-        ))
+        let response = response
+            .ok_or_else(|| ProviderError::new("chat stream ended before a finish reason"))?;
+        Ok(ModelTurn::new(response, usage))
     }
 }
 

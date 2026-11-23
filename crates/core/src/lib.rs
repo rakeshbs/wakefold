@@ -16,10 +16,15 @@ pub mod testing;
 #[cfg(feature = "derive")]
 extern crate self as wakefold;
 
-pub use agent::{RunError, run, run_streaming};
+pub use agent::{
+    RunError, RunOptions, RunReport, RunUsage, run, run_streaming, run_streaming_with_options,
+    run_with_options,
+};
 #[cfg(feature = "openai")]
 pub use openai::OpenAiProvider;
-pub use provider::{Message, ModelRequest, ModelResponse, Provider, ProviderError};
+pub use provider::{
+    Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError, TokenUsage,
+};
 pub use serde_json::Value as JsonValue;
 pub use tool::{CallId, Tool, ToolCall, ToolError, ToolResult, ToolSpec};
 #[cfg(feature = "derive")]

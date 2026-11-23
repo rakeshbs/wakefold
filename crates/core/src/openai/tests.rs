@@ -10,13 +10,14 @@ use tower::service_fn;
 
 use super::OpenAiProvider;
 use crate::{
-    JsonValue, Message, ModelRequest, ModelResponse, Provider, ProviderError, RunError, Tool,
-    ToolError, ToolSpec, run_streaming,
+    JsonValue, Message, ModelRequest, ModelResponse, Provider, ProviderError, RunError, RunOptions,
+    TokenUsage, Tool, ToolError, ToolSpec, run_streaming, run_streaming_with_options,
 };
 
 struct Exchange {
     messages: JsonValue,
     tools: Option<JsonValue>,
+    stream_options: Option<JsonValue>,
     chunks: Vec<JsonValue>,
 }
 
@@ -47,6 +48,7 @@ fn offline_provider(exchanges: Vec<Exchange>) -> Result<OpenAiProvider, Provider
             assert_eq!(body["model"], "offline-model");
             assert_eq!(body["messages"], exchange.messages);
             assert_eq!(body.get("tools"), exchange.tools.as_ref());
+            assert_eq!(body.get("stream_options"), exchange.stream_options.as_ref());
 
             let mut sse = String::new();
             for chunk in exchange.chunks {
@@ -79,6 +81,17 @@ fn chunk(delta: JsonValue, finish_reason: Option<&str>) -> JsonValue {
         "model": "offline-model",
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
     })
+}
+
+fn usage_chunk(input: u32, output: u32) -> JsonValue {
+    let mut chunk = chunk(json!({}), None);
+    chunk["choices"] = json!([]);
+    chunk["usage"] = json!({
+        "prompt_tokens": input,
+        "completion_tokens": output,
+        "total_tokens": input + output
+    });
+    chunk
 }
 
 fn catalog_schema() -> JsonValue {
@@ -130,7 +143,7 @@ impl Tool for LookupPrice {
 }
 
 #[tokio::test]
-async fn streams_text_and_round_trips_interleaved_tool_calls()
+async fn streams_text_tracks_usage_and_round_trips_interleaved_tool_calls()
 -> Result<(), Box<dyn std::error::Error>> {
     let prompt = "What do a notebook and a pen cost?";
     let user = json!({"role": "user", "content": prompt});
@@ -139,6 +152,7 @@ async fn streams_text_and_round_trips_interleaved_tool_calls()
         Exchange {
             messages: json!([user]),
             tools: Some(tools.clone()),
+            stream_options: Some(json!({"include_usage": true})),
             chunks: vec![
                 chunk(
                     json!({
@@ -167,6 +181,7 @@ async fn streams_text_and_round_trips_interleaved_tool_calls()
                     None,
                 ),
                 chunk(json!({}), Some("tool_calls")),
+                usage_chunk(18, 7),
             ],
         },
         Exchange {
@@ -192,22 +207,28 @@ async fn streams_text_and_round_trips_interleaved_tool_calls()
                 {"role": "tool", "tool_call_id": "price-pen", "content": "{\"price_cents\":120}"}
             ]),
             tools: Some(tools),
+            stream_options: Some(json!({"include_usage": true})),
             chunks: vec![
                 chunk(json!({"content": "Notebook: $3.50. "}), None),
                 chunk(json!({"content": "Pen: $1.20."}), None),
                 chunk(json!({}), Some("stop")),
+                usage_chunk(36, 9),
             ],
         },
-    ])?;
+    ])?
+    .with_usage_reporting();
     let tool = LookupPrice::default();
     let mut chunks = Vec::new();
 
-    let answer = run_streaming(prompt, &provider, &[&tool], 2, |text| {
+    let options = RunOptions::new(2).with_token_budget(100);
+    let report = run_streaming_with_options(prompt, &provider, &[&tool], options, |text| {
         chunks.push(text.to_owned());
     })
     .await?;
 
-    assert_eq!(answer, "Notebook: $3.50. Pen: $1.20.");
+    assert_eq!(report.answer, "Notebook: $3.50. Pen: $1.20.");
+    assert_eq!(report.usage.reported, TokenUsage::new(54, 16));
+    assert_eq!(report.usage.unreported_turns, 0);
     assert_eq!(chunks, ["Checking. ", "Notebook: $3.50. ", "Pen: $1.20."]);
     assert_eq!(
         *tool.items.lock().expect("the tool call completed"),
@@ -221,6 +242,7 @@ async fn completes_a_plain_text_request_without_advertising_tools() -> Result<()
     let provider = offline_provider(vec![Exchange {
         messages: json!([{"role": "user", "content": "Hello"}]),
         tools: None,
+        stream_options: None,
         chunks: vec![
             chunk(json!({"content": "Hello"}), None),
             chunk(json!({"content": " there."}), Some("stop")),
@@ -239,6 +261,32 @@ async fn completes_a_plain_text_request_without_advertising_tools() -> Result<()
 }
 
 #[tokio::test]
+async fn returns_a_completed_turn_when_the_endpoint_omits_requested_usage()
+-> Result<(), ProviderError> {
+    let provider = offline_provider(vec![Exchange {
+        messages: json!([{"role": "user", "content": "Hello"}]),
+        tools: None,
+        stream_options: Some(json!({"include_usage": true})),
+        chunks: vec![chunk(json!({"content": "Hello."}), Some("stop"))],
+    }])?
+    .with_usage_reporting();
+
+    let turn = provider
+        .complete_turn(
+            ModelRequest {
+                messages: &[Message::User(String::from("Hello"))],
+                tools: &[],
+            },
+            &mut |_| {},
+        )
+        .await?;
+
+    assert_eq!(turn.response, ModelResponse::Final(String::from("Hello.")));
+    assert_eq!(turn.usage, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn interrupted_or_invalid_calls_do_not_dispatch_tools() -> Result<(), ProviderError> {
     let prompt = "What does a notebook cost?";
     for (arguments, finish, expected_error) in [
@@ -253,6 +301,7 @@ async fn interrupted_or_invalid_calls_do_not_dispatch_tools() -> Result<(), Prov
         let provider = offline_provider(vec![Exchange {
             messages: json!([{"role": "user", "content": prompt}]),
             tools: Some(advertised_tools()),
+            stream_options: None,
             chunks: vec![chunk(
                 json!({
                     "tool_calls": [{

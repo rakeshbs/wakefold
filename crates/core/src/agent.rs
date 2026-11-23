@@ -5,8 +5,83 @@ use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
 
 use crate::{
-    CallId, Message, ModelRequest, Provider, ProviderError, Tool, ToolCall, ToolError, ToolResult,
+    CallId, Message, ModelRequest, ModelTurn, Provider, ProviderError, TokenUsage, Tool, ToolCall,
+    ToolError, ToolResult,
 };
+
+/// Limits for a single agent run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOptions {
+    max_model_turns: usize,
+    token_budget: Option<u64>,
+}
+
+impl RunOptions {
+    /// Set the maximum number of model calls.
+    pub fn new(max_model_turns: usize) -> Self {
+        Self {
+            max_model_turns,
+            token_budget: None,
+        }
+    }
+
+    /// Stop further model calls and tool dispatch once observed usage reaches this limit.
+    ///
+    /// A model call can cross the limit before its usage is reported. A
+    /// completed final answer is returned with its observed usage.
+    pub fn with_token_budget(mut self, max_tokens: u64) -> Self {
+        self.token_budget = Some(max_tokens);
+        self
+    }
+}
+
+/// The provider-reported usage accumulated during a run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RunUsage {
+    /// Sum of counts reported by completed model turns.
+    pub reported: TokenUsage,
+    /// Completed model turns for which the provider omitted usage.
+    pub unreported_turns: usize,
+}
+
+impl RunUsage {
+    fn record(&mut self, usage: Option<TokenUsage>) -> Result<(), RunError> {
+        match usage {
+            Some(usage) => {
+                self.reported = self
+                    .reported
+                    .checked_add(usage)
+                    .ok_or(RunError::TokenUsageOverflow)?;
+            }
+            None => self.unreported_turns += 1,
+        }
+        Ok(())
+    }
+
+    fn check_budget(self, budget: Option<u64>) -> Result<(), RunError> {
+        let Some(limit) = budget else {
+            return Ok(());
+        };
+        if self.unreported_turns > 0 {
+            return Err(RunError::TokenUsageUnavailable { usage: self });
+        }
+        if self.reported.total_tokens() >= u128::from(limit) {
+            return Err(RunError::TokenBudgetReached { limit, usage: self });
+        }
+        Ok(())
+    }
+}
+
+/// The final answer and observed token usage for a completed run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RunReport {
+    /// The final answer to the user.
+    pub answer: String,
+    /// Usage reported by the model provider across the run.
+    pub usage: RunUsage,
+}
 
 /// The reason an agent run stopped before producing a final answer.
 #[derive(Debug, Error)]
@@ -53,6 +128,26 @@ pub enum RunError {
         /// Maximum number of model calls allowed in the run.
         limit: usize,
     },
+
+    /// The observed usage reached the configured token budget.
+    #[error("agent reached its token budget of {limit}")]
+    TokenBudgetReached {
+        /// The configured token budget.
+        limit: u64,
+        /// Usage observed when the run stopped.
+        usage: RunUsage,
+    },
+
+    /// The run needed another action but had incomplete token counts.
+    #[error("provider omitted token usage required to continue a budgeted run")]
+    TokenUsageUnavailable {
+        /// Known counts and the number of turns without reports.
+        usage: RunUsage,
+    },
+
+    /// The reported counts exceeded the supported range.
+    #[error("reported token usage exceeds the supported range")]
+    TokenUsageOverflow,
 }
 
 /// Run a single agent until it returns a final answer or reaches a limit.
@@ -87,8 +182,43 @@ pub async fn run_streaming(
     provider: &dyn Provider,
     tools: &[&dyn Tool],
     max_model_turns: usize,
-    mut on_text: impl FnMut(&str) + Send,
+    on_text: impl FnMut(&str) + Send,
 ) -> Result<String, RunError> {
+    let options = RunOptions::new(max_model_turns);
+    Ok(
+        run_streaming_with_options(prompt, provider, tools, options, on_text)
+            .await?
+            .answer,
+    )
+}
+
+/// Run an agent with configured limits and return its answer and usage.
+///
+/// # Errors
+///
+/// Returns [`RunError`] if the run fails or needs more work after a limit is
+/// reached. A budgeted run also stops if usage is missing and work remains.
+pub async fn run_with_options(
+    prompt: impl Into<String> + Send,
+    provider: &dyn Provider,
+    tools: &[&dyn Tool],
+    options: RunOptions,
+) -> Result<RunReport, RunError> {
+    run_streaming_with_options(prompt, provider, tools, options, |_| {}).await
+}
+
+/// Run an agent with configured limits while reporting model text as it arrives.
+///
+/// # Errors
+///
+/// Returns [`RunError`] under the same conditions as [`run_with_options`].
+pub async fn run_streaming_with_options(
+    prompt: impl Into<String> + Send,
+    provider: &dyn Provider,
+    tools: &[&dyn Tool],
+    options: RunOptions,
+    mut on_text: impl FnMut(&str) + Send,
+) -> Result<RunReport, RunError> {
     let specs: Vec<_> = tools.iter().map(|tool| tool.spec()).collect();
     let mut tools_by_name = BTreeMap::new();
     for (spec, &tool) in specs.iter().zip(tools) {
@@ -100,15 +230,20 @@ pub async fn run_streaming(
     }
 
     let mut messages = vec![Message::User(prompt.into())];
-    let mut remaining_turns = max_model_turns;
+    let mut remaining_turns = options.max_model_turns;
+    let mut usage = RunUsage::default();
     loop {
         let action = next_action(&messages, remaining_turns).ok_or(RunError::TurnLimitReached {
-            limit: max_model_turns,
+            limit: options.max_model_turns,
         })?;
         match action {
             Action::CallModel => {
-                let response = provider
-                    .complete_streaming(
+                usage.check_budget(options.token_budget)?;
+                let ModelTurn {
+                    response,
+                    usage: turn_usage,
+                } = provider
+                    .complete_turn(
                         ModelRequest {
                             messages: &messages,
                             tools: &specs,
@@ -116,8 +251,10 @@ pub async fn run_streaming(
                         &mut on_text,
                     )
                     .await?;
+                usage.record(turn_usage)?;
                 remaining_turns -= 1;
-                if remaining_turns > 0 {
+                if remaining_turns > 0 && !response.tool_calls().is_empty() {
+                    usage.check_budget(options.token_budget)?;
                     validate_calls(response.tool_calls(), &messages, &tools_by_name)?;
                 }
                 messages.push(Message::Assistant(response));
@@ -136,7 +273,12 @@ pub async fn run_streaming(
                 let result = ToolResult::new(call.id.clone(), value);
                 messages.push(Message::Tool(result));
             }
-            Action::Finish(answer) => return Ok(answer.to_owned()),
+            Action::Finish(answer) => {
+                return Ok(RunReport {
+                    answer: answer.to_owned(),
+                    usage,
+                });
+            }
         }
     }
 }
@@ -175,9 +317,6 @@ fn validate_calls(
     messages: &[Message],
     tools: &BTreeMap<&str, &dyn Tool>,
 ) -> Result<(), RunError> {
-    if calls.is_empty() {
-        return Ok(());
-    }
     let mut ids: HashSet<_> = messages
         .iter()
         .filter_map(|message| match message {
