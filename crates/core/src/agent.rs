@@ -1,19 +1,24 @@
 //! In-memory agent decisions and the driver that executes them.
 
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
+use std::pin::pin;
+
+use futures_util::future::{Either, select};
 
 use thiserror::Error;
 
 use crate::{
-    CallId, Message, ModelRequest, ModelTurn, Provider, ProviderError, TokenUsage, Tool, ToolCall,
-    ToolError, ToolResult,
+    CallId, CancellationToken, Message, ModelRequest, ModelTurn, Provider, ProviderError,
+    TokenUsage, Tool, ToolCall, ToolContext, ToolError, ToolResult,
 };
 
-/// Limits for a single agent run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Limits and cancellation for a single agent run.
+#[derive(Debug, Clone)]
 pub struct RunOptions {
     max_model_turns: usize,
     token_budget: Option<u64>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl RunOptions {
@@ -22,6 +27,7 @@ impl RunOptions {
         Self {
             max_model_turns,
             token_budget: None,
+            cancellation: None,
         }
     }
 
@@ -31,6 +37,16 @@ impl RunOptions {
     /// completed final answer is returned with its observed usage.
     pub fn with_token_budget(mut self, max_tokens: u64) -> Self {
         self.token_budget = Some(max_tokens);
+        self
+    }
+
+    /// Stop the run when the caller cancels this token.
+    ///
+    /// The token is also available to tools through [`ToolContext`]. The
+    /// driver drops in-flight provider and tool futures when cancellation
+    /// interrupts their wait.
+    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation = Some(token);
         self
     }
 }
@@ -87,6 +103,10 @@ pub struct RunReport {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunError {
+    /// The run was cancelled.
+    #[error("agent run was cancelled")]
+    Cancelled,
+
     /// The provider could not supply the next model turn.
     #[error("model call failed: {0}")]
     Provider(#[from] ProviderError),
@@ -196,8 +216,9 @@ pub async fn run_streaming(
 ///
 /// # Errors
 ///
-/// Returns [`RunError`] if the run fails or needs more work after a limit is
-/// reached. A budgeted run also stops if usage is missing and work remains.
+/// Returns [`RunError`] if the run fails, is cancelled, or needs more work
+/// after a limit is reached. A budgeted run also stops if usage is missing
+/// and work remains.
 pub async fn run_with_options(
     prompt: impl Into<String> + Send,
     provider: &dyn Provider,
@@ -219,6 +240,14 @@ pub async fn run_streaming_with_options(
     options: RunOptions,
     mut on_text: impl FnMut(&str) + Send,
 ) -> Result<RunReport, RunError> {
+    let cancellation = options.cancellation.as_ref();
+    check_cancelled(cancellation)?;
+    let mut emit_text = |chunk: &str| {
+        if check_cancelled(cancellation).is_ok() {
+            on_text(chunk);
+        }
+    };
+
     let specs: Vec<_> = tools.iter().map(|tool| tool.spec()).collect();
     let mut tools_by_name = BTreeMap::new();
     for (spec, &tool) in specs.iter().zip(tools) {
@@ -233,6 +262,7 @@ pub async fn run_streaming_with_options(
     let mut remaining_turns = options.max_model_turns;
     let mut usage = RunUsage::default();
     loop {
+        check_cancelled(cancellation)?;
         let action = next_action(&messages, remaining_turns).ok_or(RunError::TurnLimitReached {
             limit: options.max_model_turns,
         })?;
@@ -242,15 +272,17 @@ pub async fn run_streaming_with_options(
                 let ModelTurn {
                     response,
                     usage: turn_usage,
-                } = provider
-                    .complete_turn(
+                } = await_cancellable(
+                    provider.complete_turn(
                         ModelRequest {
                             messages: &messages,
                             tools: &specs,
                         },
-                        &mut on_text,
-                    )
-                    .await?;
+                        &mut emit_text,
+                    ),
+                    cancellation,
+                )
+                .await??;
                 usage.record(turn_usage)?;
                 remaining_turns -= 1;
                 if remaining_turns > 0 && !response.tool_calls().is_empty() {
@@ -263,13 +295,16 @@ pub async fn run_streaming_with_options(
                 let tool = tools_by_name
                     .get(call.name.as_str())
                     .expect("tool names are validated before the turn is scheduled");
-                let value = tool
-                    .call(&call.arguments)
-                    .await
-                    .map_err(|source| RunError::Tool {
-                        name: call.name.clone(),
-                        source,
-                    })?;
+                let context = ToolContext::new(cancellation.cloned());
+                let value = await_cancellable(
+                    tool.call_with_context(context, &call.arguments),
+                    cancellation,
+                )
+                .await?
+                .map_err(|source| RunError::Tool {
+                    name: call.name.clone(),
+                    source,
+                })?;
                 let result = ToolResult::new(call.id.clone(), value);
                 messages.push(Message::Tool(result));
             }
@@ -280,6 +315,32 @@ pub async fn run_streaming_with_options(
                 });
             }
         }
+    }
+}
+
+fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), RunError> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(RunError::Cancelled);
+    }
+    Ok(())
+}
+
+async fn await_cancellable<T>(
+    operation: impl Future<Output = T>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<T, RunError> {
+    let Some(token) = cancellation else {
+        return Ok(operation.await);
+    };
+    check_cancelled(cancellation)?;
+
+    // Poll in-flight work first so a cooperative handler can observe the signal.
+    match select(pin!(operation), pin!(token.cancelled())).await {
+        Either::Left((result, _)) => {
+            check_cancelled(cancellation)?;
+            Ok(result)
+        }
+        Either::Right(_) => Err(RunError::Cancelled),
     }
 }
 

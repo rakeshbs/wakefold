@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 
-use crate::{JsonValue, Tool, ToolError, ToolSpec};
+use crate::{JsonValue, Tool, ToolContext, ToolError, ToolSpec};
 
 /// Model-facing metadata for the argument type of a tool.
 pub trait ToolInput {
@@ -46,6 +46,18 @@ where
     Handler: Fn(Input) -> Output + Send + Sync,
     Output: Future<Output = Result<JsonValue, ToolError>> + Send,
 {
+    typed_tool_with_context(move |input, _context| handler(input))
+}
+
+/// Register a typed asynchronous handler that also receives the run context.
+///
+/// Use [`ToolContext::cancellation_token`] to observe the caller's signal.
+pub fn typed_tool_with_context<Input, Handler, Output>(handler: Handler) -> impl Tool
+where
+    Input: ToolInput + DeserializeOwned + JsonSchema + Send + 'static,
+    Handler: Fn(Input, ToolContext) -> Output + Send + Sync,
+    Output: Future<Output = Result<JsonValue, ToolError>> + Send,
+{
     TypedTool {
         handler,
         input: PhantomData::<fn() -> Input>,
@@ -61,7 +73,7 @@ struct TypedTool<Input, Handler> {
 impl<Input, Handler, Output> Tool for TypedTool<Input, Handler>
 where
     Input: ToolInput + DeserializeOwned + JsonSchema + Send + 'static,
-    Handler: Fn(Input) -> Output + Send + Sync,
+    Handler: Fn(Input, ToolContext) -> Output + Send + Sync,
     Output: Future<Output = Result<JsonValue, ToolError>> + Send,
 {
     fn spec(&self) -> ToolSpec {
@@ -73,8 +85,17 @@ where
     }
 
     async fn call(&self, arguments: &JsonValue) -> Result<JsonValue, ToolError> {
+        self.call_with_context(ToolContext::default(), arguments)
+            .await
+    }
+
+    async fn call_with_context(
+        &self,
+        context: ToolContext,
+        arguments: &JsonValue,
+    ) -> Result<JsonValue, ToolError> {
         let input = Input::deserialize(arguments)
             .map_err(|error| ToolError::new(format!("invalid tool arguments: {error}")))?;
-        (self.handler)(input).await
+        (self.handler)(input, context).await
     }
 }

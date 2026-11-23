@@ -5,7 +5,7 @@ use std::fmt;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::JsonValue;
+use crate::{CancellationToken, JsonValue};
 
 /// Identifies a model-requested tool call within a run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -99,6 +99,23 @@ impl ToolResult {
     }
 }
 
+/// Run information available to a tool handler.
+#[derive(Debug, Clone, Default)]
+pub struct ToolContext {
+    cancellation: Option<CancellationToken>,
+}
+
+impl ToolContext {
+    pub(crate) fn new(cancellation: Option<CancellationToken>) -> Self {
+        Self { cancellation }
+    }
+
+    /// The caller's cancellation signal, when supplied.
+    pub fn cancellation_token(&self) -> Option<&CancellationToken> {
+        self.cancellation.as_ref()
+    }
+}
+
 /// A tool that can be registered with the agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -113,6 +130,22 @@ pub trait Tool: Send + Sync {
     ///
     /// Returns a [`ToolError`] if the arguments are invalid or the tool fails.
     async fn call(&self, arguments: &JsonValue) -> Result<JsonValue, ToolError>;
+
+    /// Run the tool with access to the run context.
+    ///
+    /// Tools that coordinate cancellation can observe the signal in `context`.
+    /// Use drop guards for cleanup that must run when the agent drops the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ToolError`] if the arguments are invalid or the tool fails.
+    async fn call_with_context(
+        &self,
+        _context: ToolContext,
+        arguments: &JsonValue,
+    ) -> Result<JsonValue, ToolError> {
+        self.call(arguments).await
+    }
 }
 
 /// A failure to run a tool.
