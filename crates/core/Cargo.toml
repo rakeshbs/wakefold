@@ -28,7 +28,8 @@ tower = { version = "0.5", features = ["util"] }
 
 [[example]]
 name = "scripted_agent"
-required-features = ["test-util"]
+test = true
+required-features = ["derive", "test-util"]
 
 [[test]]
 name = "offline_agent"
