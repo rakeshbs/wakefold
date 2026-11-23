@@ -3,3 +3,28 @@ name = "wakefold"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[features]
+openai = ["dep:async-openai", "dep:futures-util"]
+test-util = []
+
+[dependencies]
+async-openai = { version = "0.43", default-features = false, features = ["chat-completion", "middleware", "rustls"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+async-trait = "0.1"
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+futures-executor = "0.3"
+http = "1"
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+
+[[example]]
+name = "scripted_agent"
+required-features = ["test-util"]
+
+[[test]]
+name = "offline_agent"
+required-features = ["test-util"]
