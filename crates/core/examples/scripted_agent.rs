@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::json;
 use wakefold::testing::{ScriptedProvider, ScriptedTurn};
 use wakefold::{
-    JsonValue, Message, ModelResponse, RunError, ToolCall, ToolError, ToolResult, WakefoldTool,
-    run, typed_tool,
+    JsonValue, Message, ModelResponse, RunError, RunOptions, RunReport, TokenUsage, ToolCall,
+    ToolError, ToolResult, WakefoldTool, run_with_options, typed_tool,
 };
 
 #[derive(Deserialize, JsonSchema, WakefoldTool)]
@@ -48,59 +48,89 @@ async fn calculate_total(input: CalculateTotal) -> Result<JsonValue, ToolError> 
     Ok(json!({"total_cents": total}))
 }
 
-fn notebook_total() -> Result<String, RunError> {
+fn notebook_total() -> Result<RunReport, RunError> {
     let prompt = "What do three notebooks cost?";
-    let lookup = ModelResponse::ToolCall(ToolCall::new(
-        "price-1",
-        "lookup_price",
-        json!({"item": "notebook"}),
-    ));
-    let calculate = ModelResponse::ToolCall(ToolCall::new(
-        "total-1",
-        "calculate_total",
-        json!({"unit_price_cents": 350, "quantity": 3}),
-    ));
+    let user = Message::User(prompt.to_owned());
+    let lookup = ModelResponse::ToolCalls {
+        text: Some(String::from(
+            "I’ll start by checking the catalog for the price of one notebook.",
+        )),
+        calls: vec![ToolCall::new(
+            "price-1",
+            "lookup_price",
+            json!({"item": "notebook"}),
+        )],
+    };
+    let calculate = ModelResponse::ToolCalls {
+        text: Some(String::from(concat!(
+            "I’ll use the catalog’s unit price of 350 cents and the requested quantity of three. ",
+            "I’ll ask the calculator to multiply those values, then use the returned total in cents ",
+            "to format the answer in dollars and cents."
+        ))),
+        calls: vec![ToolCall::new(
+            "total-1",
+            "calculate_total",
+            json!({"unit_price_cents": 350, "quantity": 3}),
+        )],
+    };
 
-    let mut transcript = vec![Message::User(prompt.to_owned())];
-    let lookup_turn = ScriptedTurn::new(transcript.clone(), lookup.clone());
-    transcript.extend([
+    let lookup_turn = ScriptedTurn::new(vec![user.clone()], lookup.clone());
+    let earlier = vec![
+        user.clone(),
         Message::Assistant(lookup),
         Message::Tool(ToolResult::new("price-1", json!({"price_cents": 350}))),
-    ]);
-    let calculate_turn = ScriptedTurn::new(transcript.clone(), calculate.clone());
-    transcript.extend([
-        Message::Assistant(calculate),
-        Message::Tool(ToolResult::new("total-1", json!({"total_cents": 1050}))),
-    ]);
+    ];
+    let calculate_turn = ScriptedTurn::new(earlier.clone(), calculate.clone());
 
-    let provider = ScriptedProvider::new([
-        lookup_turn,
-        calculate_turn,
-        ScriptedTurn::new(
-            transcript,
-            ModelResponse::Final(String::from("Three notebooks cost $10.50.")),
-        ),
-    ]);
+    // The calculator exchange pushes the next request over budget. The model
+    // summarizes the earlier lookup and keeps the calculator exchange intact.
+    let mut summary_request = earlier;
+    summary_request.push(Message::User(String::from(concat!(
+        "Summarize the earlier work for continuing the original task. ",
+        "Preserve relevant tool facts, decisions, and next steps. ",
+        "Return only the summary, up to 66 UTF-8 bytes."
+    ))));
+    let summary = String::from("Catalog lookup confirmed 350 cents per notebook.");
+    let summary_turn = ScriptedTurn::new(summary_request, ModelResponse::Final(summary.clone()))
+        .with_usage(TokenUsage::new(80, 12));
+    let final_turn = ScriptedTurn::new(
+        vec![
+            user,
+            Message::Summary(summary),
+            Message::Assistant(calculate),
+            Message::Tool(ToolResult::new("total-1", json!({"total_cents": 1050}))),
+        ],
+        ModelResponse::Final(String::from("Three notebooks cost $10.50.")),
+    );
 
+    let provider = ScriptedProvider::new([lookup_turn, calculate_turn, summary_turn, final_turn]);
     let lookup_tool = typed_tool(lookup_price);
     let total_tool = typed_tool(calculate_total);
-    block_on(run(prompt, &provider, &[&lookup_tool, &total_tool], 3))
+    let options = RunOptions::new(3).with_context_budget(400);
+    block_on(run_with_options(
+        prompt,
+        &provider,
+        &[&lookup_tool, &total_tool],
+        options,
+    ))
 }
 
 fn main() -> Result<(), RunError> {
-    let answer = notebook_total()?;
-    println!("{answer}");
+    let report = notebook_total()?;
+    println!("{}", report.answer);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::notebook_total;
-    use wakefold::RunError;
+    use wakefold::{RunError, TokenUsage};
 
     #[test]
-    fn looks_up_the_unit_price_before_calculating_the_total() -> Result<(), RunError> {
-        assert_eq!(notebook_total()?, "Three notebooks cost $10.50.");
+    fn calculates_the_total_after_compacting_context() -> Result<(), RunError> {
+        let report = notebook_total()?;
+        assert_eq!(report.answer, "Three notebooks cost $10.50.");
+        assert_eq!(report.usage.reported, TokenUsage::new(80, 12));
         Ok(())
     }
 }

@@ -11,6 +11,12 @@ use crate::{CancellationToken, JsonValue};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallId(String);
 
+impl CallId {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl From<String> for CallId {
     fn from(value: String) -> Self {
         Self(value)

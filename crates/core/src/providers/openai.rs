@@ -191,6 +191,7 @@ fn input_items(request: ModelRequest<'_>) -> Result<Vec<InputItem>, ProviderErro
     for message in request.messages {
         match message {
             Message::User(prompt) => items.push(text_message(Role::User, prompt)),
+            Message::Summary(summary) => items.push(text_message(Role::Assistant, summary)),
             Message::Assistant(response) => {
                 if let Some(Some(context)) = context.next() {
                     let output: Vec<OutputItem> =

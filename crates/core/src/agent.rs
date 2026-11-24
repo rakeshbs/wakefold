@@ -18,6 +18,7 @@ use crate::{
 pub struct RunOptions {
     max_model_turns: usize,
     token_budget: Option<u64>,
+    context_budget: Option<usize>,
     retry_policy: RetryPolicy,
     cancellation: Option<CancellationToken>,
 }
@@ -28,6 +29,7 @@ impl RunOptions {
         Self {
             max_model_turns,
             token_budget: None,
+            context_budget: None,
             retry_policy: RetryPolicy::default(),
             cancellation: None,
         }
@@ -39,6 +41,18 @@ impl RunOptions {
     /// completed final answer is returned with its observed usage.
     pub fn with_token_budget(mut self, max_tokens: u64) -> Self {
         self.token_budget = Some(max_tokens);
+        self
+    }
+
+    /// Limit the transcript and provider context used for model calls, in bytes.
+    ///
+    /// The budget counts message text, tool call IDs and names, and compact
+    /// JSON for tool arguments, results, and provider context. When needed,
+    /// the model summarizes older exchanges in a separate request. The
+    /// original prompt and latest exchange are kept. Summary requests count
+    /// toward token usage and have one opportunity per agent turn.
+    pub fn with_context_budget(mut self, max_bytes: usize) -> Self {
+        self.context_budget = Some(max_bytes);
         self
     }
 
@@ -168,6 +182,17 @@ pub enum RunError {
         usage: RunUsage,
     },
 
+    /// The transcript payload is too large to send after compaction.
+    #[error(
+        "agent context requires {required} bytes after compaction, exceeding its {limit}-byte budget"
+    )]
+    ContextBudgetExceeded {
+        /// Configured transcript budget in bytes.
+        limit: usize,
+        /// Transcript payload size in bytes when the run stopped.
+        required: u128,
+    },
+
     /// The run needed another action but had incomplete token counts.
     #[error("provider omitted token usage required to continue a budgeted run")]
     TokenUsageUnavailable {
@@ -270,6 +295,7 @@ pub async fn run_streaming_with_options(
 
     let mut messages = vec![Message::User(prompt.into())];
     let mut assistant_context = Vec::new();
+    let mut used_call_ids = HashSet::new();
     let mut remaining_turns = options.max_model_turns;
     let mut usage = RunUsage::default();
     loop {
@@ -280,6 +306,22 @@ pub async fn run_streaming_with_options(
         match action {
             Action::CallModel => {
                 usage.check_budget(options.token_budget)?;
+                if let Some(limit) = options.context_budget
+                    && let Some(compaction) =
+                        crate::context::prepare(&messages, &assistant_context, limit)?
+                {
+                    let summary = crate::retry::complete_turn(
+                        provider,
+                        compaction.request(),
+                        &mut |_| {},
+                        options.retry_policy,
+                        cancellation,
+                    )
+                    .await?;
+                    usage.record(summary.usage)?;
+                    usage.check_budget(options.token_budget)?;
+                    compaction.apply(summary.response, &mut messages, &mut assistant_context)?;
+                }
                 let ModelTurn {
                     response,
                     usage: turn_usage,
@@ -300,7 +342,7 @@ pub async fn run_streaming_with_options(
                 remaining_turns -= 1;
                 if remaining_turns > 0 && !response.tool_calls().is_empty() {
                     usage.check_budget(options.token_budget)?;
-                    validate_calls(response.tool_calls(), &messages, &tools_by_name)?;
+                    validate_calls(response.tool_calls(), &mut used_call_ids, &tools_by_name)?;
                 }
                 messages.push(Message::Assistant(response));
                 assistant_context.push(context);
@@ -383,29 +425,22 @@ fn next_action(messages: &[Message], remaining_turns: usize) -> Option<Action<'_
                 .get(completed_calls)
                 .map_or(Action::CallModel, Action::RunTool),
         ),
-        Message::User(_) | Message::Tool(_) => Some(Action::CallModel),
+        Message::User(_) | Message::Summary(_) | Message::Tool(_) => Some(Action::CallModel),
     }
 }
 
 fn validate_calls(
     calls: &[ToolCall],
-    messages: &[Message],
+    used_call_ids: &mut HashSet<CallId>,
     tools: &BTreeMap<&str, &dyn Tool>,
 ) -> Result<(), RunError> {
-    let mut ids: HashSet<_> = messages
-        .iter()
-        .filter_map(|message| match message {
-            Message::Tool(result) => Some(&result.call_id),
-            _ => None,
-        })
-        .collect();
     for call in calls {
         if !tools.contains_key(call.name.as_str()) {
             return Err(RunError::UnknownTool {
                 name: call.name.clone(),
             });
         }
-        if !ids.insert(&call.id) {
+        if !used_call_ids.insert(call.id.clone()) {
             return Err(RunError::DuplicateCallId {
                 id: call.id.clone(),
             });

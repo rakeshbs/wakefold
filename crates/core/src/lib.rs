@@ -1,6 +1,7 @@
 //! Core library for the Wakefold agent harness.
 
 mod agent;
+mod context;
 mod provider;
 mod providers;
 mod retry;

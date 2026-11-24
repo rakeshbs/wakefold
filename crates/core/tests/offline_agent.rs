@@ -206,3 +206,78 @@ fn reported_zero_allows_continuation_and_missing_final_usage_is_counted() -> Res
     assert_eq!(tool.calls.load(Ordering::Relaxed), 1);
     Ok(())
 }
+
+#[test]
+fn rejects_an_oversized_prompt_before_calling_the_provider() {
+    let provider = ScriptedProvider::new([]);
+    let result = block_on(run_with_options(
+        "café",
+        &provider,
+        &[],
+        RunOptions::new(1).with_context_budget(4),
+    ));
+
+    assert!(matches!(
+        result,
+        Err(RunError::ContextBudgetExceeded {
+            limit: 4,
+            required: 5,
+        })
+    ));
+}
+
+#[test]
+fn compacted_tool_call_ids_still_reject_duplicates() {
+    let prompt = "Echo twice.";
+    let user = Message::User(String::from(prompt));
+    let args = json!({"value": 42});
+    let first_call = ToolCall::new("first", "echo", args.clone());
+    let first_turn = ModelResponse::ToolCalls {
+        text: Some("a".repeat(30)),
+        calls: vec![first_call.clone()],
+    };
+    let second_turn = ModelResponse::ToolCalls {
+        text: Some("b".repeat(200)),
+        calls: vec![ToolCall::new("second", "echo", args.clone())],
+    };
+    let first_exchange = vec![
+        user.clone(),
+        Message::Assistant(first_turn.clone()),
+        Message::Tool(ToolResult::new("first", args.clone())),
+    ];
+    let mut summary_input = first_exchange.clone();
+    summary_input.push(Message::User(String::from(concat!(
+        "Summarize the earlier work for continuing the original task. ",
+        "Preserve relevant tool facts, decisions, and next steps. ",
+        "Return only the summary, up to 49 UTF-8 bytes."
+    ))));
+    let summary = String::from("First echo returned 42.");
+    let provider = ScriptedProvider::new([
+        ScriptedTurn::new(vec![user.clone()], first_turn),
+        ScriptedTurn::new(first_exchange, second_turn.clone()),
+        ScriptedTurn::new(summary_input, ModelResponse::Final(summary.clone())),
+        ScriptedTurn::new(
+            vec![
+                user,
+                Message::Summary(summary),
+                Message::Assistant(second_turn),
+                Message::Tool(ToolResult::new("second", args)),
+            ],
+            ModelResponse::ToolCall(first_call),
+        ),
+    ]);
+    let tool = Echo::default();
+
+    let result = block_on(run_with_options(
+        prompt,
+        &provider,
+        &[&tool],
+        RunOptions::new(4).with_context_budget(300),
+    ));
+
+    assert!(
+        matches!(&result, Err(RunError::DuplicateCallId { id }) if id == &"first".into()),
+        "{result:?}"
+    );
+    assert_eq!(tool.calls.load(Ordering::Relaxed), 2);
+}

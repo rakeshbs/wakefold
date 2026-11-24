@@ -12,10 +12,12 @@ use crate::{JsonValue, ToolCall, ToolResult, ToolSpec};
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
-    /// The prompt that starts the run.
+    /// A user message, including the prompt that starts the run.
     User(String),
     /// A completed model turn.
     Assistant(ModelResponse),
+    /// A model-written summary of preceding turns, presented as assistant text.
+    Summary(String),
     /// The result of a tool call.
     Tool(ToolResult),
 }
@@ -126,7 +128,7 @@ pub struct ModelRequest<'a> {
     pub messages: &'a [Message],
     /// Tools the model can request during this run.
     pub tools: &'a [ToolSpec],
-    /// Provider context for each assistant message, in chronological order.
+    /// Provider context for each [`Message::Assistant`], in chronological order.
     ///
     /// When context is unavailable, an entry can be `None` or the slice can be
     /// empty. The agent passes back the context from each completed model turn.
