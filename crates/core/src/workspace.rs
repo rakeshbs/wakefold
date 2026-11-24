@@ -1,0 +1,129 @@
+//! Persistent chat workspaces and their run metadata.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, TransactionBehavior, params};
+use thiserror::Error;
+
+/// A failure to open workspace metadata or materialize a directory.
+#[derive(Debug, Error)]
+pub enum WorkspaceError {
+    /// SQLite could not read or persist the workspace mapping.
+    #[error("workspace metadata: {0}")]
+    Database(#[from] rusqlite::Error),
+    /// A workspace directory could not be accessed.
+    #[error("workspace filesystem: {0}")]
+    Filesystem(#[from] std::io::Error),
+}
+
+/// Native paths available to trusted host tools for one agent run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunWorkspace {
+    root: PathBuf,
+    agent_id: i64,
+}
+
+impl RunWorkspace {
+    /// The shared chat directory against which artifact paths are resolved.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The stable ID assigned to this run's agent by the store.
+    pub fn agent_id(&self) -> i64 {
+        self.agent_id
+    }
+
+    /// The agent's directory relative to the chat root.
+    pub fn agent_directory(&self) -> PathBuf {
+        Path::new("agents").join(self.agent_id.to_string())
+    }
+}
+
+/// A blocking SQLite store. Open workspaces before entering the async agent loop.
+#[derive(Debug)]
+pub struct WorkspaceStore {
+    connection: Connection,
+    directories: PathBuf,
+}
+
+impl WorkspaceStore {
+    /// Open the runtime state directory, initializing its metadata if necessary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory or database cannot be initialized.
+    pub fn open(state_directory: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
+        let state = state_directory.as_ref();
+        fs::create_dir_all(state)?;
+        let state = fs::canonicalize(state)?;
+        let connection = Connection::open(state.join("wakefold.sqlite3"))?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS workspaces (
+                 id INTEGER PRIMARY KEY,
+                 chat_key TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE IF NOT EXISTS workspace_runs (
+                 agent_id INTEGER PRIMARY KEY,
+                 workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+                 run_key TEXT NOT NULL,
+                 UNIQUE(workspace_id, run_key)
+             );",
+        )?;
+        Ok(Self {
+            connection,
+            directories: state.join("workspaces"),
+        })
+    }
+
+    /// Open a new or existing run using the caller's stable chat and run keys.
+    ///
+    /// A new run receives its own agent directory. Reusing both keys restores
+    /// the same directories. Only database-generated IDs appear in host paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the mapping or directories cannot be opened.
+    /// Retrying with the same keys is safe after a partial failure.
+    pub fn open_run(
+        &mut self,
+        chat_key: &str,
+        run_key: &str,
+    ) -> Result<RunWorkspace, WorkspaceError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO workspaces(chat_key) VALUES (?1) ON CONFLICT(chat_key) DO NOTHING",
+            [chat_key],
+        )?;
+        let workspace_id: i64 = tx.query_row(
+            "SELECT id FROM workspaces WHERE chat_key = ?1",
+            [chat_key],
+            |row| row.get(0),
+        )?;
+        let keys = params![workspace_id, run_key];
+        tx.execute(
+            "INSERT INTO workspace_runs(workspace_id, run_key) VALUES (?1, ?2)
+             ON CONFLICT(workspace_id, run_key) DO NOTHING",
+            keys,
+        )?;
+        let agent_id = tx.query_row(
+            "SELECT agent_id FROM workspace_runs WHERE workspace_id = ?1 AND run_key = ?2",
+            keys,
+            |row| row.get(0),
+        )?;
+        // Reserve both IDs durably before creating files. An interrupted
+        // initialization can then finish without reassigning the directory.
+        tx.commit()?;
+        let workspace = RunWorkspace {
+            root: self.directories.join(workspace_id.to_string()),
+            agent_id,
+        };
+        fs::create_dir_all(workspace.root.join(workspace.agent_directory()))?;
+        Ok(workspace)
+    }
+}

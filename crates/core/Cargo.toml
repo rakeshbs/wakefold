@@ -17,6 +17,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
 httpdate = { version = "1", optional = true }
 rand = "0.10"
+rusqlite = { version = "0.38", features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, optional = true }
 schemars = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -27,6 +28,7 @@ tower = { version = "0.5", features = ["util"], optional = true }
 wakefold-macros = { version = "0.1.0", path = "../macros", optional = true }
 
 [dev-dependencies]
+tempfile = "3"
 futures-executor = "0.3"
 http = "1"
 tokio = { version = "1", features = ["macros", "rt", "test-util"] }
@@ -47,3 +49,7 @@ required-features = ["derive"]
 [[test]]
 name = "cancellation"
 required-features = ["test-util"]
+
+[[test]]
+name = "workspace"
+required-features = ["derive", "test-util"]

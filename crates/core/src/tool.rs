@@ -5,7 +5,7 @@ use std::fmt;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::{CancellationToken, JsonValue};
+use crate::{CancellationToken, JsonValue, RunWorkspace};
 
 /// Identifies a model-requested tool call within a run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -109,11 +109,23 @@ impl ToolResult {
 #[derive(Debug, Clone, Default)]
 pub struct ToolContext {
     cancellation: Option<CancellationToken>,
+    workspace: Option<RunWorkspace>,
 }
 
 impl ToolContext {
-    pub(crate) fn new(cancellation: Option<CancellationToken>) -> Self {
-        Self { cancellation }
+    pub(crate) fn new(
+        cancellation: Option<CancellationToken>,
+        workspace: Option<RunWorkspace>,
+    ) -> Self {
+        Self {
+            cancellation,
+            workspace,
+        }
+    }
+
+    /// The workspace supplied for this run, when configured.
+    pub fn workspace(&self) -> Option<&RunWorkspace> {
+        self.workspace.as_ref()
     }
 
     /// The caller's cancellation signal, when supplied.

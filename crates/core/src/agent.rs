@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     CallId, CancellationToken, Message, ModelRequest, ModelTurn, Provider, ProviderError,
-    RetryPolicy, TokenUsage, Tool, ToolCall, ToolContext, ToolError, ToolResult,
+    RetryPolicy, RunWorkspace, TokenUsage, Tool, ToolCall, ToolContext, ToolError, ToolResult,
 };
 
 /// Limits, retries, and cancellation for a single agent run.
@@ -20,6 +20,7 @@ pub struct RunOptions {
     token_budget: Option<u64>,
     context_budget: Option<usize>,
     retry_policy: RetryPolicy,
+    workspace: Option<RunWorkspace>,
     cancellation: Option<CancellationToken>,
 }
 
@@ -31,6 +32,7 @@ impl RunOptions {
             token_budget: None,
             context_budget: None,
             retry_policy: RetryPolicy::default(),
+            workspace: None,
             cancellation: None,
         }
     }
@@ -61,6 +63,12 @@ impl RunOptions {
     /// Attempts for the same model turn share one slot in the turn limit.
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
+        self
+    }
+
+    /// Make this persistent workspace available to the run's trusted host tools.
+    pub fn with_workspace(mut self, workspace: RunWorkspace) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 
@@ -351,7 +359,7 @@ pub async fn run_streaming_with_options(
                 let tool = tools_by_name
                     .get(call.name.as_str())
                     .expect("tool names are validated before the turn is scheduled");
-                let context = ToolContext::new(cancellation.cloned());
+                let context = ToolContext::new(cancellation.cloned(), options.workspace.clone());
                 let value = await_cancellable(
                     tool.call_with_context(context, &call.arguments),
                     cancellation,

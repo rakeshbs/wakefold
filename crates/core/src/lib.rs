@@ -6,6 +6,7 @@ mod provider;
 mod providers;
 mod retry;
 mod tool;
+mod workspace;
 
 #[cfg(feature = "derive")]
 mod typed_tool;
@@ -33,3 +34,4 @@ pub use tool::{CallId, Tool, ToolCall, ToolContext, ToolError, ToolResult, ToolS
 pub use typed_tool::{ToolInput, typed_tool, typed_tool_with_context};
 #[cfg(feature = "derive")]
 pub use wakefold_macros::WakefoldTool;
+pub use workspace::{RunWorkspace, WorkspaceError, WorkspaceStore};
