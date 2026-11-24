@@ -57,6 +57,22 @@ fn returns_the_tool_result_and_accumulates_usage_across_turns() -> Result<(), Ru
 }
 
 #[test]
+fn rejects_a_tool_turn_with_neither_calls_nor_text() {
+    for text in [None, Some(String::new())] {
+        let provider = ScriptedProvider::new([ScriptedTurn::new(
+            vec![Message::User("prompt".into())],
+            ModelResponse::ToolCalls {
+                text,
+                calls: vec![],
+            },
+        )]);
+        assert!(
+            matches!(block_on(run("prompt", &provider, &[], 1)), Err(RunError::Provider(error)) if error.to_string().contains("neither tool calls nor text"))
+        );
+    }
+}
+
+#[test]
 fn stops_before_running_a_tool_when_no_follow_up_turn_remains() {
     let prompt = "Echo the value";
     let provider = ScriptedProvider::new([ScriptedTurn::new(

@@ -15,6 +15,7 @@ use crate::{
 
 /// Limits, retries, and cancellation for a single agent run.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct RunOptions {
     max_model_turns: usize,
     token_budget: Option<u64>,
@@ -346,6 +347,15 @@ pub async fn run_streaming_with_options(
                     cancellation,
                 )
                 .await?;
+                if let crate::ModelResponse::ToolCalls { text, calls } = &response
+                    && calls.is_empty()
+                    && text.as_deref().is_none_or(str::is_empty)
+                {
+                    return Err(ProviderError::new(
+                        "provider returned neither tool calls nor text",
+                    )
+                    .into());
+                }
                 usage.record(turn_usage)?;
                 remaining_turns -= 1;
                 if remaining_turns > 0 && !response.tool_calls().is_empty() {
