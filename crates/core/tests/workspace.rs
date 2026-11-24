@@ -112,19 +112,20 @@ fn shared_workspace_survives_restart() {
 #[test]
 fn concurrent_first_runs_share_one_workspace() {
     let state = tempfile::tempdir().unwrap();
-    let mut first = WorkspaceStore::open(state.path()).unwrap();
-    let mut second = WorkspaceStore::open(state.path()).unwrap();
     let start = std::sync::Barrier::new(2);
     let (left, right) = std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
             start.wait();
+            let mut first = WorkspaceStore::open(state.path()).unwrap();
             first.open_run("new-chat", "first").unwrap()
         });
         start.wait();
+        let mut second = WorkspaceStore::open(state.path()).unwrap();
         let right = second.open_run("new-chat", "second").unwrap();
-        (worker.join().unwrap(), right)
+        let left = worker.join().unwrap();
+        assert_eq!(second.open_run("new-chat", "first").unwrap(), left);
+        (left, right)
     });
     assert_eq!(left.root(), right.root());
     assert_ne!(left.agent_id(), right.agent_id());
-    assert_eq!(second.open_run("new-chat", "first").unwrap(), left);
 }

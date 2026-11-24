@@ -2,8 +2,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use thiserror::Error;
 
 /// A failure to open workspace metadata or materialize a directory.
@@ -59,9 +60,25 @@ impl WorkspaceStore {
         fs::create_dir_all(state)?;
         let state = fs::canonicalize(state)?;
         let connection = Connection::open(state.join("wakefold.sqlite3"))?;
+        // Concurrent first opens can return SQLITE_BUSY immediately while
+        // upgrading the journal mode, even with SQLite's busy handler enabled.
+        let started = Instant::now();
+        loop {
+            match connection.execute_batch("PRAGMA journal_mode = WAL") {
+                Err(error)
+                    if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
+                        && started.elapsed() < Duration::from_secs(1) =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    result?;
+                    break;
+                }
+            }
+        }
         connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;
+            "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS workspaces (
                  id INTEGER PRIMARY KEY,
                  chat_key TEXT NOT NULL UNIQUE
