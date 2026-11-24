@@ -10,23 +10,25 @@ use thiserror::Error;
 
 use crate::{
     CallId, CancellationToken, Message, ModelRequest, ModelTurn, Provider, ProviderError,
-    TokenUsage, Tool, ToolCall, ToolContext, ToolError, ToolResult,
+    RetryPolicy, TokenUsage, Tool, ToolCall, ToolContext, ToolError, ToolResult,
 };
 
-/// Limits and cancellation for a single agent run.
+/// Limits, retries, and cancellation for a single agent run.
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     max_model_turns: usize,
     token_budget: Option<u64>,
+    retry_policy: RetryPolicy,
     cancellation: Option<CancellationToken>,
 }
 
 impl RunOptions {
-    /// Set the maximum number of model calls.
+    /// Set the maximum number of model turns with the default retry policy.
     pub fn new(max_model_turns: usize) -> Self {
         Self {
             max_model_turns,
             token_budget: None,
+            retry_policy: RetryPolicy::default(),
             cancellation: None,
         }
     }
@@ -40,11 +42,19 @@ impl RunOptions {
         self
     }
 
+    /// Configure retries for each model turn.
+    ///
+    /// Attempts for the same model turn share one slot in the turn limit.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
     /// Stop the run when the caller cancels this token.
     ///
     /// The token is also available to tools through [`ToolContext`]. The
-    /// driver drops in-flight provider and tool futures when cancellation
-    /// interrupts their wait.
+    /// driver drops an in-flight provider call, retry delay, or tool call when
+    /// cancellation interrupts it.
     pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
         self.cancellation = Some(token);
         self
@@ -145,7 +155,7 @@ pub enum RunError {
     /// The run used all its model turns without a final answer.
     #[error("agent reached its model turn limit of {limit}")]
     TurnLimitReached {
-        /// Maximum number of model calls allowed in the run.
+        /// Maximum number of model turns allowed in the run.
         limit: usize,
     },
 
@@ -274,18 +284,18 @@ pub async fn run_streaming_with_options(
                     response,
                     usage: turn_usage,
                     context,
-                } = await_cancellable(
-                    provider.complete_turn(
-                        ModelRequest {
-                            messages: &messages,
-                            tools: &specs,
-                            assistant_context: &assistant_context,
-                        },
-                        &mut emit_text,
-                    ),
+                } = crate::retry::complete_turn(
+                    provider,
+                    ModelRequest {
+                        messages: &messages,
+                        tools: &specs,
+                        assistant_context: &assistant_context,
+                    },
+                    &mut emit_text,
+                    options.retry_policy,
                     cancellation,
                 )
-                .await??;
+                .await?;
                 usage.record(turn_usage)?;
                 remaining_turns -= 1;
                 if remaining_turns > 0 && !response.tool_calls().is_empty() {
@@ -329,7 +339,7 @@ fn check_cancelled(cancellation: Option<&CancellationToken>) -> Result<(), RunEr
     Ok(())
 }
 
-async fn await_cancellable<T>(
+pub(crate) async fn await_cancellable<T>(
     operation: impl Future<Output = T>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<T, RunError> {

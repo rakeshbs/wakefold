@@ -19,6 +19,8 @@ use crate::{
 
 pub use async_openai::types::responses::ReasoningEffort;
 
+mod transport;
+
 #[cfg(test)]
 mod tests;
 
@@ -26,7 +28,8 @@ mod tests;
 ///
 /// Enable the `openai` Cargo feature and use a Tokio runtime with I/O enabled.
 /// The provider sends `store: false` and replays output items, including
-/// encrypted reasoning, with subsequent tool results.
+/// encrypted reasoning, with subsequent tool results. Agent runs apply
+/// [`RetryPolicy`](crate::RetryPolicy) to eligible failures before a stream opens.
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,7 +82,7 @@ impl OpenAiProvider {
             .with_org_id("")
             .with_project_id("");
         Ok(Self {
-            client: Client::with_config(config),
+            client: transport::client(config)?,
             model: model.into(),
             reasoning_effort: None,
         })
@@ -141,9 +144,7 @@ impl Provider for OpenAiProvider {
             .responses()
             .create_stream(request)
             .await
-            .map_err(|source| {
-                ProviderError::with_source("could not open Responses stream", source)
-            })?;
+            .map_err(transport::opening_error)?;
         while let Some(event) = stream.next().await {
             match event
                 .map_err(|source| ProviderError::with_source("Responses stream failed", source))?

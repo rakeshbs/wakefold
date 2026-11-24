@@ -3,6 +3,7 @@
 mod agent;
 mod provider;
 mod providers;
+mod retry;
 mod tool;
 
 #[cfg(feature = "derive")]
@@ -23,6 +24,7 @@ pub use provider::{
 };
 #[cfg(feature = "openai")]
 pub use providers::openai::{OpenAiProvider, ReasoningEffort};
+pub use retry::RetryPolicy;
 pub use serde_json::Value as JsonValue;
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{CallId, Tool, ToolCall, ToolContext, ToolError, ToolResult, ToolSpec};

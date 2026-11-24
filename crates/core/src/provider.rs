@@ -1,6 +1,7 @@
 //! Provider requests and the messages that make up a run.
 
 use std::error::Error;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -197,14 +198,30 @@ pub struct ProviderError {
     message: String,
     #[source]
     source: Option<Box<dyn Error + Send + Sync>>,
+    retry: RetryAdvice,
 }
 
 impl ProviderError {
+    /// Mark a failure as safe to retry before the model begins streaming.
+    ///
+    /// Supply the minimum delay requested by the provider when available.
+    /// Without a delay, the agent uses its backoff policy.
+    #[must_use]
+    pub fn with_retry(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry = retry_after.map_or(RetryAdvice::Backoff, RetryAdvice::After);
+        self
+    }
+
+    pub(crate) fn retry_advice(&self) -> RetryAdvice {
+        self.retry
+    }
+
     /// Create an error with a diagnostic message.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             source: None,
+            retry: RetryAdvice::Never,
         }
     }
 
@@ -216,6 +233,14 @@ impl ProviderError {
         Self {
             message: message.into(),
             source: Some(Box::new(source)),
+            retry: RetryAdvice::Never,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RetryAdvice {
+    Never,
+    Backoff,
+    After(Duration),
 }

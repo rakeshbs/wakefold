@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_openai::error::OpenAIError;
 use async_openai::middleware::HttpRequestFactory;
@@ -9,7 +10,7 @@ use tower::service_fn;
 
 use super::*;
 use crate::{
-    JsonValue, RunError, RunOptions, Tool as WakefoldTool, ToolError, ToolSpec,
+    JsonValue, RetryPolicy, RunError, RunOptions, Tool as WakefoldTool, ToolError, ToolSpec,
     run_streaming_with_options,
 };
 
@@ -52,24 +53,7 @@ fn offline_provider(
             assert_eq!(body["input"], exchange.input);
             assert_eq!(body.get("tools"), exchange.tools.as_ref());
 
-            let sse = exchange
-                .events
-                .into_iter()
-                .map(|event| {
-                    format!(
-                        "event: {}\ndata: {event}\n\n",
-                        event["type"].as_str().unwrap()
-                    )
-                })
-                .collect::<String>();
-            Ok::<_, OpenAIError>(
-                HttpResponse::builder()
-                    .status(200)
-                    .header("content-type", "text/event-stream")
-                    .body(sse)
-                    .unwrap()
-                    .into(),
-            )
+            Ok::<_, OpenAIError>(stream_response(exchange.events).into())
         }
     });
 
@@ -77,8 +61,25 @@ fn offline_provider(
     if let Some((effort, _)) = effort {
         provider = provider.with_reasoning_effort(effort);
     }
-    provider.client = provider.client.with_http_service(service);
+    provider.client = transport::with_transport(provider.client, service);
     Ok(provider)
+}
+
+fn stream_response(events: Vec<JsonValue>) -> HttpResponse<String> {
+    let body = events
+        .into_iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["type"].as_str().unwrap()
+            )
+        })
+        .collect::<String>();
+    HttpResponse::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .body(body)
+        .unwrap()
 }
 
 fn terminal_event(status: &str, output: Vec<JsonValue>) -> JsonValue {
@@ -317,5 +318,114 @@ async fn uses_model_defaults_for_text_only_requests() -> Result<(), ProviderErro
         ModelResponse::Final(String::from("Hello there."))
     );
     assert_eq!(turn.usage, None);
+    Ok(())
+}
+
+struct RetryFixture {
+    provider: OpenAiProvider,
+    responses: Arc<Mutex<VecDeque<HttpResponse<String>>>>,
+}
+
+fn retry_provider(responses: Vec<HttpResponse<String>>) -> Result<RetryFixture, ProviderError> {
+    let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+    let pending = Arc::clone(&responses);
+    let service = service_fn(move |_request: HttpRequestFactory| {
+        let response = pending
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected HTTP attempt");
+        std::future::ready(Ok::<_, OpenAIError>(response.into()))
+    });
+    let mut provider = OpenAiProvider::new("gpt-6-luna", "offline-key")?;
+    provider.client = transport::with_transport(provider.client, service);
+    Ok(RetryFixture {
+        provider,
+        responses,
+    })
+}
+
+fn rate_limited(code: &str, retry_after: &str) -> HttpResponse<String> {
+    HttpResponse::builder()
+        .status(429)
+        .header("retry-after", retry_after)
+        .header("content-type", "application/json")
+        .body(json!({"error": {"message": "limit reached", "code": code}}).to_string())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn retries_a_rate_limited_follow_up_without_replaying_the_tool() -> Result<(), RunError> {
+    let RetryFixture {
+        provider,
+        responses,
+    } = retry_provider(vec![
+        stream_response(vec![terminal_event("completed", vec![call()])]),
+        rate_limited("rate_limit_exceeded", "0"),
+        stream_response(vec![
+            text_delta("$3.50", 0),
+            terminal_event("completed", vec![output_message("$3.50")]),
+        ]),
+    ])?;
+    let tool = LookupPrice::default();
+    let mut streamed = String::new();
+    let report =
+        run_streaming_with_options(PROMPT, &provider, &[&tool], RunOptions::new(2), |text| {
+            streamed.push_str(text)
+        })
+        .await?;
+    assert_eq!(report.answer, "$3.50");
+    assert_eq!(streamed, "$3.50");
+    assert_eq!(*tool.0.lock().unwrap(), ["notebook"]);
+    assert_eq!(report.usage.reported, TokenUsage::new(40, 12));
+    assert!(responses.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn preserves_retry_after_and_stops_on_quota_errors() -> Result<(), ProviderError> {
+    for (rejection, expected_message) in [
+        (
+            rate_limited("rate_limit_exceeded", "120"),
+            "OpenAI rate limit reached",
+        ),
+        (
+            HttpResponse::builder()
+                .status(503)
+                .header("retry-after", "120")
+                .body(String::from("Service unavailable"))
+                .unwrap(),
+            "OpenAI server error before streaming",
+        ),
+        (
+            rate_limited("insufficient_quota", "0"),
+            "OpenAI quota or billing error",
+        ),
+    ] {
+        let RetryFixture {
+            provider,
+            responses,
+        } = retry_provider(vec![
+            rejection,
+            stream_response(vec![terminal_event(
+                "completed",
+                vec![output_message("Hi")],
+            )]),
+        ])?;
+        let error = run_streaming_with_options(
+            "Hello",
+            &provider,
+            &[],
+            RunOptions::new(1).with_retry_policy(RetryPolicy::new(1, Duration::from_secs(2))),
+            |_| {},
+        )
+        .await
+        .expect_err("no retry fits this request");
+        let RunError::Provider(error) = error else {
+            panic!("expected a provider failure, got {error:?}");
+        };
+        assert_eq!(error.to_string(), expected_message);
+        assert_eq!(responses.lock().unwrap().len(), 1);
+    }
     Ok(())
 }
