@@ -12,6 +12,7 @@ use async_openai::types::responses::{
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use serde::Deserialize;
 
 use crate::{
     Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError, TokenUsage, ToolCall,
@@ -194,10 +195,9 @@ fn input_items(request: ModelRequest<'_>) -> Result<Vec<InputItem>, ProviderErro
             Message::Summary(summary) => items.push(text_message(Role::Assistant, summary)),
             Message::Assistant(response) => {
                 if let Some(Some(context)) = context.next() {
-                    let output: Vec<OutputItem> =
-                        serde_json::from_value(context.clone()).map_err(|source| {
-                            ProviderError::with_source("invalid Responses turn context", source)
-                        })?;
+                    let output = Vec::<OutputItem>::deserialize(context).map_err(|source| {
+                        ProviderError::with_source("invalid Responses turn context", source)
+                    })?;
                     items.extend(output.into_iter().map(InputItem::from));
                     continue;
                 }

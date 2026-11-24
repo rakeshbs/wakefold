@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = ["derive"]
 derive = ["dep:schemars", "dep:serde", "dep:wakefold-macros"]
-openai = ["dep:async-openai", "dep:httpdate", "dep:reqwest", "dep:tower"]
+openai = ["dep:async-openai", "dep:httpdate", "dep:reqwest", "dep:serde", "dep:tower"]
 test-util = []
 
 [dependencies]
