@@ -171,6 +171,8 @@ pub trait Tool: Send + Sync {
 #[error("{message}")]
 pub struct ToolError {
     message: String,
+    #[source]
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 impl ToolError {
@@ -178,6 +180,18 @@ impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Create an error that preserves the underlying tool failure.
+    pub fn with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(Box::new(source)),
         }
     }
 }

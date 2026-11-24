@@ -94,8 +94,9 @@ where
         context: ToolContext,
         arguments: &JsonValue,
     ) -> Result<JsonValue, ToolError> {
-        let input = Input::deserialize(arguments)
-            .map_err(|error| ToolError::new(format!("invalid tool arguments: {error}")))?;
+        let input = Input::deserialize(arguments).map_err(|error| {
+            ToolError::with_source(format!("invalid tool arguments: {error}"), error)
+        })?;
         (self.handler)(input, context).await
     }
 }

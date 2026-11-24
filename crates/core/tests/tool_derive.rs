@@ -56,7 +56,12 @@ fn deserializes_before_invoking_the_typed_handler() -> Result<(), ToolError> {
         json!({"unitPrice": 350}),
         json!({"unitPrice": 350, "quantity": 3, "extra": true}),
     ] {
-        assert!(block_on(tool.call(&invalid)).is_err(), "accepted {invalid}");
+        let error = block_on(tool.call(&invalid)).expect_err("invalid arguments must fail");
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<serde_json::Error>()
+        );
     }
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 
