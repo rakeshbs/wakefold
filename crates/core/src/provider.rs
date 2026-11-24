@@ -5,7 +5,7 @@ use std::error::Error;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::{ToolCall, ToolResult, ToolSpec};
+use crate::{JsonValue, ToolCall, ToolResult, ToolSpec};
 
 /// A completed message in the agent's transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,12 +102,18 @@ pub struct ModelTurn {
     pub response: ModelResponse,
     /// Usage when reported by the provider.
     pub usage: Option<TokenUsage>,
+    /// Provider-specific data to replay alongside this assistant turn.
+    pub context: Option<JsonValue>,
 }
 
 impl ModelTurn {
     /// Create a completed model turn with the available usage.
     pub fn new(response: ModelResponse, usage: Option<TokenUsage>) -> Self {
-        Self { response, usage }
+        Self {
+            response,
+            usage,
+            context: None,
+        }
     }
 }
 
@@ -119,6 +125,22 @@ pub struct ModelRequest<'a> {
     pub messages: &'a [Message],
     /// Tools the model can request during this run.
     pub tools: &'a [ToolSpec],
+    /// Provider context for each assistant message, in chronological order.
+    ///
+    /// When context is unavailable, an entry can be `None` or the slice can be
+    /// empty. The agent passes back the context from each completed model turn.
+    pub assistant_context: &'a [Option<JsonValue>],
+}
+
+impl<'a> ModelRequest<'a> {
+    /// Create a model request from a transcript and its available tools.
+    pub fn new(messages: &'a [Message], tools: &'a [ToolSpec]) -> Self {
+        Self {
+            messages,
+            tools,
+            assistant_context: &[],
+        }
+    }
 }
 
 /// Supplies model turns to the agent loop.
@@ -150,10 +172,10 @@ pub trait Provider: Send + Sync {
         Ok(response)
     }
 
-    /// Produce a completed turn with streamed text and any reported usage.
+    /// Produce a completed turn with streamed text, usage, and provider context.
     ///
-    /// Providers with usage reporting can override this method. The default
-    /// delegates to [`Provider::complete_streaming`] and marks usage unreported.
+    /// The default delegates to [`Provider::complete_streaming`] without usage
+    /// or provider context.
     ///
     /// # Errors
     ///

@@ -22,7 +22,7 @@ pub use provider::{
     Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError, TokenUsage,
 };
 #[cfg(feature = "openai")]
-pub use providers::openai::OpenAiProvider;
+pub use providers::openai::{OpenAiProvider, ReasoningEffort};
 pub use serde_json::Value as JsonValue;
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{CallId, Tool, ToolCall, ToolContext, ToolError, ToolResult, ToolSpec};

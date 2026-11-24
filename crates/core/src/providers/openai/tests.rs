@@ -3,95 +3,115 @@ use std::sync::{Arc, Mutex};
 
 use async_openai::error::OpenAIError;
 use async_openai::middleware::HttpRequestFactory;
-use async_trait::async_trait;
-use http::Response;
+use http::Response as HttpResponse;
 use serde_json::json;
 use tower::service_fn;
 
-use super::OpenAiProvider;
+use super::*;
 use crate::{
-    JsonValue, Message, ModelRequest, ModelResponse, Provider, ProviderError, RunError, RunOptions,
-    TokenUsage, Tool, ToolError, ToolSpec, run_streaming, run_streaming_with_options,
+    JsonValue, RunError, RunOptions, Tool as WakefoldTool, ToolError, ToolSpec,
+    run_streaming_with_options,
 };
 
 struct Exchange {
-    messages: JsonValue,
+    input: JsonValue,
     tools: Option<JsonValue>,
-    stream_options: Option<JsonValue>,
-    chunks: Vec<JsonValue>,
+    events: Vec<JsonValue>,
 }
 
-fn offline_provider(exchanges: Vec<Exchange>) -> Result<OpenAiProvider, ProviderError> {
+fn offline_provider(
+    effort: Option<(ReasoningEffort, &'static str)>,
+    exchanges: Vec<Exchange>,
+) -> Result<OpenAiProvider, ProviderError> {
     let exchanges = Arc::new(Mutex::new(VecDeque::from(exchanges)));
+    let wire_effort = effort.as_ref().map(|(_, wire_effort)| *wire_effort);
     let service = service_fn(move |factory: HttpRequestFactory| {
         let exchanges = Arc::clone(&exchanges);
         async move {
             let exchange = exchanges
                 .lock()
-                .expect("only this test accesses its canned responses")
+                .expect("the test exchanges are available")
                 .pop_front()
                 .expect("the provider must make only the scripted requests");
             let request = factory.build().await?;
             assert_eq!(
                 request.url().as_str(),
-                "http://example.test/v1/chat/completions"
+                "https://api.openai.com/v1/responses"
             );
             assert_eq!(request.method(), "POST");
             assert_eq!(request.headers()["authorization"], "Bearer offline-key");
-            let bytes = request
-                .body()
-                .and_then(|body| body.as_bytes())
-                .expect("a chat request has a JSON body");
-            let body: JsonValue =
-                serde_json::from_slice(bytes).expect("the SDK must serialize valid JSON");
+            let bytes = request.body().and_then(|body| body.as_bytes()).unwrap();
+            let body: JsonValue = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(body["model"], "gpt-6-luna");
             assert_eq!(body["stream"], true);
-            assert_eq!(body["model"], "offline-model");
-            assert_eq!(body["messages"], exchange.messages);
+            let reasoning = wire_effort.map(|value| json!({"effort": value}));
+            assert_eq!(body.get("reasoning"), reasoning.as_ref());
+            assert_eq!(body["store"], false);
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+            assert_eq!(body.get("previous_response_id"), None);
+            assert_eq!(body["input"], exchange.input);
             assert_eq!(body.get("tools"), exchange.tools.as_ref());
-            assert_eq!(body.get("stream_options"), exchange.stream_options.as_ref());
 
-            let mut sse = String::new();
-            for chunk in exchange.chunks {
-                sse.push_str(&format!("data: {chunk}\n\n"));
-            }
-            sse.push_str("data: [DONE]\n\n");
-
+            let sse = exchange
+                .events
+                .into_iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["type"].as_str().unwrap()
+                    )
+                })
+                .collect::<String>();
             Ok::<_, OpenAIError>(
-                Response::builder()
+                HttpResponse::builder()
                     .status(200)
                     .header("content-type", "text/event-stream")
                     .body(sse)
-                    .expect("the canned SSE response is valid")
+                    .unwrap()
                     .into(),
             )
         }
     });
 
-    let mut provider =
-        OpenAiProvider::with_base_url("offline-model", "http://example.test/v1/", "offline-key")?;
+    let mut provider = OpenAiProvider::new("gpt-6-luna", "offline-key")?;
+    if let Some((effort, _)) = effort {
+        provider = provider.with_reasoning_effort(effort);
+    }
     provider.client = provider.client.with_http_service(service);
     Ok(provider)
 }
 
-fn chunk(delta: JsonValue, finish_reason: Option<&str>) -> JsonValue {
+fn terminal_event(status: &str, output: Vec<JsonValue>) -> JsonValue {
     json!({
-        "id": "chatcmpl-offline",
-        "object": "chat.completion.chunk",
-        "created": 0,
-        "model": "offline-model",
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+        "type": format!("response.{status}"),
+        "sequence_number": 2,
+        "response": {
+            "id": "resp_offline",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-6-luna",
+            "status": status,
+            "output": output,
+            "usage": {
+                "input_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 6,
+                "output_tokens_details": {"reasoning_tokens": 2},
+                "total_tokens": 26
+            }
+        }
     })
 }
 
-fn usage_chunk(input: u32, output: u32) -> JsonValue {
-    let mut chunk = chunk(json!({}), None);
-    chunk["choices"] = json!([]);
-    chunk["usage"] = json!({
-        "prompt_tokens": input,
-        "completion_tokens": output,
-        "total_tokens": input + output
-    });
-    chunk
+fn text_delta(delta: &str, sequence: u64) -> JsonValue {
+    json!({
+        "type": "response.output_text.delta",
+        "sequence_number": sequence,
+        "item_id": "msg_answer",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": delta
+    })
 }
 
 fn catalog_schema() -> JsonValue {
@@ -106,226 +126,196 @@ fn catalog_schema() -> JsonValue {
 fn advertised_tools() -> JsonValue {
     json!([{
         "type": "function",
-        "function": {
-            "name": "lookup_price",
-            "description": "Look up an item price",
-            "parameters": catalog_schema()
-        }
+        "name": "lookup_price",
+        "description": "Look up an item price",
+        "parameters": catalog_schema(),
+        "strict": false,
     }])
 }
 
-#[derive(Default)]
-struct LookupPrice {
-    items: Mutex<Vec<String>>,
+fn output_message(text: &str) -> JsonValue {
+    json!({
+        "type": "message",
+        "id": "msg_answer",
+        "role": "assistant",
+        "phase": "final_answer",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "annotations": [],
+            "text": text
+        }]
+    })
 }
 
+#[derive(Default)]
+struct LookupPrice(Mutex<Vec<String>>);
+
 #[async_trait]
-impl Tool for LookupPrice {
+impl WakefoldTool for LookupPrice {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new("lookup_price", "Look up an item price", catalog_schema())
     }
 
     async fn call(&self, arguments: &JsonValue) -> Result<JsonValue, ToolError> {
-        let item = arguments["item"]
-            .as_str()
-            .ok_or_else(|| ToolError::new("expected an item name"))?;
-        self.items
-            .lock()
-            .expect("only this test invokes the tool")
-            .push(item.to_owned());
-        let price = match item {
-            "notebook" => 350,
-            "pen" => 120,
-            _ => return Err(ToolError::new("unknown item")),
-        };
-        Ok(json!({"price_cents": price}))
+        let item = arguments["item"].as_str().unwrap();
+        self.0.lock().unwrap().push(item.to_owned());
+        Ok(json!({"price_cents": 350}))
     }
 }
 
-#[tokio::test]
-async fn streams_text_tracks_usage_and_round_trips_interleaved_tool_calls()
--> Result<(), Box<dyn std::error::Error>> {
-    let prompt = "What do a notebook and a pen cost?";
-    let user = json!({"role": "user", "content": prompt});
-    let tools = advertised_tools();
-    let provider = offline_provider(vec![
-        Exchange {
-            messages: json!([user]),
-            tools: Some(tools.clone()),
-            stream_options: Some(json!({"include_usage": true})),
-            chunks: vec![
-                chunk(
-                    json!({
-                        "content": "Checking. ",
-                        "tool_calls": [{
-                            "index": 1, "id": "price-pen", "type": "function",
-                            "function": {"name": "lookup_price", "arguments": "{\"item\":"}
-                        }]
-                    }),
-                    None,
-                ),
-                chunk(
-                    json!({
-                        "tool_calls": [
-                            {
-                                "index": 0, "id": "price-notebook", "type": "function",
-                                "function": {"name": "lookup_price", "arguments": "{\"item\":\"note"}
-                            },
-                            {"index": 1, "function": {"arguments": "\"pen\"}"}}
-                        ]
-                    }),
-                    None,
-                ),
-                chunk(
-                    json!({"tool_calls": [{"index": 0, "function": {"arguments": "book\"}"}}]}),
-                    None,
-                ),
-                chunk(json!({}), Some("tool_calls")),
-                usage_chunk(18, 7),
-            ],
-        },
-        Exchange {
-            messages: json!([
-                user,
-                {
-                    "role": "assistant",
-                    "content": "Checking. ",
-                    "tool_calls": [
-                        {
-                            "id": "price-notebook",
-                            "type": "function",
-                            "function": {"name": "lookup_price", "arguments": "{\"item\":\"notebook\"}"}
-                        },
-                        {
-                            "id": "price-pen",
-                            "type": "function",
-                            "function": {"name": "lookup_price", "arguments": "{\"item\":\"pen\"}"}
-                        }
-                    ]
-                },
-                {"role": "tool", "tool_call_id": "price-notebook", "content": "{\"price_cents\":350}"},
-                {"role": "tool", "tool_call_id": "price-pen", "content": "{\"price_cents\":120}"}
-            ]),
-            tools: Some(tools),
-            stream_options: Some(json!({"include_usage": true})),
-            chunks: vec![
-                chunk(json!({"content": "Notebook: $3.50. "}), None),
-                chunk(json!({"content": "Pen: $1.20."}), None),
-                chunk(json!({}), Some("stop")),
-                usage_chunk(36, 9),
-            ],
-        },
-    ])?
-    .with_usage_reporting();
-    let tool = LookupPrice::default();
-    let mut chunks = Vec::new();
+const PROMPT: &str = "How much is a notebook?";
 
-    let options = RunOptions::new(2).with_token_budget(100);
-    let report = run_streaming_with_options(prompt, &provider, &[&tool], options, |text| {
-        chunks.push(text.to_owned());
+fn prompt() -> JsonValue {
+    json!({"type": "message", "role": "user", "content": PROMPT})
+}
+
+fn call() -> JsonValue {
+    json!({
+        "type": "function_call",
+        "id": "fc_offline",
+        "call_id": "call_notebook",
+        "name": "lookup_price",
+        "arguments": "{\"item\":\"notebook\"}",
+        "status": "completed"
     })
-    .await?;
-
-    assert_eq!(report.answer, "Notebook: $3.50. Pen: $1.20.");
-    assert_eq!(report.usage.reported, TokenUsage::new(54, 16));
-    assert_eq!(report.usage.unreported_turns, 0);
-    assert_eq!(chunks, ["Checking. ", "Notebook: $3.50. ", "Pen: $1.20."]);
-    assert_eq!(
-        *tool.items.lock().expect("the tool call completed"),
-        ["notebook", "pen"]
-    );
-    Ok(())
 }
 
 #[tokio::test]
-async fn completes_a_plain_text_request_without_advertising_tools() -> Result<(), ProviderError> {
-    let provider = offline_provider(vec![Exchange {
-        messages: json!([{"role": "user", "content": "Hello"}]),
-        tools: None,
-        stream_options: None,
-        chunks: vec![
-            chunk(json!({"content": "Hello"}), None),
-            chunk(json!({"content": " there."}), Some("stop")),
-        ],
-    }])?;
-
-    let response = provider
-        .complete(ModelRequest {
-            messages: &[Message::User(String::from("Hello"))],
-            tools: &[],
-        })
+async fn streams_function_calls_and_replays_reasoning_at_every_effort() -> Result<(), RunError> {
+    for (effort, wire_effort) in [
+        (ReasoningEffort::None, "none"),
+        (ReasoningEffort::Low, "low"),
+        (ReasoningEffort::Medium, "medium"),
+        (ReasoningEffort::High, "high"),
+        (ReasoningEffort::Xhigh, "xhigh"),
+        (ReasoningEffort::Max, "max"),
+    ] {
+        let mut output = Vec::new();
+        if effort != ReasoningEffort::None {
+            output.push(json!({
+                "type": "reasoning",
+                "id": "rs_offline",
+                "summary": [],
+                "encrypted_content": "opaque-encrypted-reasoning"
+            }));
+        }
+        output.push(call());
+        let mut followup = vec![prompt()];
+        followup.extend(output.iter().cloned());
+        followup.push(json!({
+            "type": "function_call_output",
+            "call_id": "call_notebook",
+            "output": "{\"price_cents\":350}"
+        }));
+        let provider = offline_provider(
+            Some((effort, wire_effort)),
+            vec![
+                Exchange {
+                    input: json!([prompt()]),
+                    tools: Some(advertised_tools()),
+                    events: vec![terminal_event("completed", output)],
+                },
+                Exchange {
+                    input: json!(followup),
+                    tools: Some(advertised_tools()),
+                    events: vec![
+                        text_delta("A notebook ", 0),
+                        text_delta("costs $3.50.", 1),
+                        terminal_event(
+                            "completed",
+                            vec![output_message("A notebook costs $3.50.")],
+                        ),
+                    ],
+                },
+            ],
+        )?;
+        let tool = LookupPrice::default();
+        let mut chunks = Vec::new();
+        let report = run_streaming_with_options(
+            PROMPT,
+            &provider,
+            &[&tool],
+            RunOptions::new(2).with_token_budget(100),
+            |text| chunks.push(text.to_owned()),
+        )
         .await?;
 
-    assert_eq!(response, ModelResponse::Final(String::from("Hello there.")));
+        assert_eq!(*tool.0.lock().unwrap(), ["notebook"]);
+        assert_eq!(chunks, ["A notebook ", "costs $3.50."]);
+        assert_eq!(report.answer, "A notebook costs $3.50.");
+        assert_eq!(report.usage.reported, TokenUsage::new(40, 12));
+        assert_eq!(report.usage.unreported_turns, 0);
+    }
+
     Ok(())
 }
 
 #[tokio::test]
-async fn returns_a_completed_turn_when_the_endpoint_omits_requested_usage()
+async fn rejects_incomplete_turns_and_invalid_arguments_before_dispatch()
 -> Result<(), ProviderError> {
-    let provider = offline_provider(vec![Exchange {
-        messages: json!([{"role": "user", "content": "Hello"}]),
-        tools: None,
-        stream_options: Some(json!({"include_usage": true})),
-        chunks: vec![chunk(json!({"content": "Hello."}), Some("stop"))],
-    }])?
-    .with_usage_reporting();
+    let mut incomplete = terminal_event("incomplete", vec![call()]);
+    incomplete["response"]["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    let mut invalid_call = call();
+    invalid_call["arguments"] = json!("{");
+    for (events, expected_error) in [
+        (vec![incomplete], "incomplete"),
+        (
+            vec![terminal_event("completed", vec![invalid_call])],
+            "invalid JSON",
+        ),
+        (vec![], "ended before completion"),
+    ] {
+        let provider = offline_provider(
+            Some((ReasoningEffort::High, "high")),
+            vec![Exchange {
+                input: json!([prompt()]),
+                tools: Some(advertised_tools()),
+                events,
+            }],
+        )?;
+        let tool = LookupPrice::default();
+        let result =
+            run_streaming_with_options(PROMPT, &provider, &[&tool], RunOptions::new(2), |_| {})
+                .await;
+
+        let Err(RunError::Provider(error)) = result else {
+            panic!("expected a provider error, got {result:?}");
+        };
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert!(tool.0.lock().unwrap().is_empty());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn uses_model_defaults_for_text_only_requests() -> Result<(), ProviderError> {
+    let mut completed = terminal_event("completed", vec![output_message("Hello there.")]);
+    completed["response"]
+        .as_object_mut()
+        .unwrap()
+        .remove("usage");
+    let provider = offline_provider(
+        None,
+        vec![Exchange {
+            input: json!([{"type": "message", "role": "user", "content": "Hello"}]),
+            tools: None,
+            events: vec![text_delta("Hello there.", 0), completed],
+        }],
+    )?;
 
     let turn = provider
         .complete_turn(
-            ModelRequest {
-                messages: &[Message::User(String::from("Hello"))],
-                tools: &[],
-            },
+            ModelRequest::new(&[Message::User(String::from("Hello"))], &[]),
             &mut |_| {},
         )
         .await?;
 
-    assert_eq!(turn.response, ModelResponse::Final(String::from("Hello.")));
+    assert_eq!(
+        turn.response,
+        ModelResponse::Final(String::from("Hello there."))
+    );
     assert_eq!(turn.usage, None);
-    Ok(())
-}
-
-#[tokio::test]
-async fn interrupted_or_invalid_calls_do_not_dispatch_tools() -> Result<(), ProviderError> {
-    let prompt = "What does a notebook cost?";
-    for (arguments, finish, expected_error) in [
-        (
-            "{\"item\":\"notebook\"}",
-            None,
-            "ended before a finish reason",
-        ),
-        ("{\"item\":\"notebook\"}", Some("length"), "token limit"),
-        ("{\"item\":", Some("tool_calls"), "invalid JSON"),
-    ] {
-        let provider = offline_provider(vec![Exchange {
-            messages: json!([{"role": "user", "content": prompt}]),
-            tools: Some(advertised_tools()),
-            stream_options: None,
-            chunks: vec![chunk(
-                json!({
-                    "tool_calls": [{
-                        "index": 0, "id": "price-1", "type": "function",
-                        "function": {"name": "lookup_price", "arguments": arguments}
-                    }]
-                }),
-                finish,
-            )],
-        }])?;
-        let tool = LookupPrice::default();
-
-        let result = run_streaming(prompt, &provider, &[&tool], 2, |_| {}).await;
-
-        assert!(
-            matches!(&result, Err(RunError::Provider(error)) if error.to_string().contains(expected_error)),
-            "{result:?}"
-        );
-        assert!(
-            tool.items
-                .lock()
-                .expect("the tool was never called")
-                .is_empty()
-        );
-    }
     Ok(())
 }

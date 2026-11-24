@@ -259,6 +259,7 @@ pub async fn run_streaming_with_options(
     }
 
     let mut messages = vec![Message::User(prompt.into())];
+    let mut assistant_context = Vec::new();
     let mut remaining_turns = options.max_model_turns;
     let mut usage = RunUsage::default();
     loop {
@@ -272,11 +273,13 @@ pub async fn run_streaming_with_options(
                 let ModelTurn {
                     response,
                     usage: turn_usage,
+                    context,
                 } = await_cancellable(
                     provider.complete_turn(
                         ModelRequest {
                             messages: &messages,
                             tools: &specs,
+                            assistant_context: &assistant_context,
                         },
                         &mut emit_text,
                     ),
@@ -290,6 +293,7 @@ pub async fn run_streaming_with_options(
                     validate_calls(response.tool_calls(), &messages, &tools_by_name)?;
                 }
                 messages.push(Message::Assistant(response));
+                assistant_context.push(context);
             }
             Action::RunTool(call) => {
                 let tool = tools_by_name

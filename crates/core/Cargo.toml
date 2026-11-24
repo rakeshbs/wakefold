@@ -11,7 +11,7 @@ openai = ["dep:async-openai"]
 test-util = []
 
 [dependencies]
-async-openai = { version = "0.43", default-features = false, features = ["chat-completion", "middleware", "rustls"], optional = true }
+async-openai = { version = "0.43", default-features = false, features = ["middleware", "responses", "rustls"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
 schemars = { version = "1", optional = true }
