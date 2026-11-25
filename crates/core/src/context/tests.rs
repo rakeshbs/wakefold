@@ -28,7 +28,10 @@ fn prepares_a_bounded_summary_request_and_preserves_the_recent_exchange() -> Res
         current_reasoning.clone(),
     ];
 
-    let compaction = prepare(&messages, &context, 400)?.expect("the history exceeds the budget");
+    let mut sizes = ContextSizes::default();
+    let compaction = sizes
+        .prepare(&messages, &context, 400)?
+        .expect("the history exceeds the budget");
     let request = compaction.request();
     assert_eq!(
         request.messages[..4],
@@ -44,7 +47,7 @@ fn prepares_a_bounded_summary_request_and_preserves_the_recent_exchange() -> Res
     );
     assert!(request.tools.is_empty());
     assert!(request.assistant_context.is_empty());
-    assert!(context_bytes(request.messages, request.assistant_context) <= 400);
+    assert!(request.messages.iter().map(message_bytes).sum::<u128>() <= 400);
 
     let summary = String::from("The first notebook costs 350 cents.");
     compaction.apply(
@@ -57,7 +60,18 @@ fn prepares_a_bounded_summary_request_and_preserves_the_recent_exchange() -> Res
     expected.extend(latest);
     assert_eq!(messages, expected);
     assert_eq!(context, [current_reasoning]);
-    assert!(context_bytes(&messages, &context) <= 400);
+    let measured_bytes = |messages: &[Message], context: &[Option<JsonValue>]| {
+        messages.iter().map(message_bytes).sum::<u128>()
+            + context.iter().flatten().map(json_bytes).sum::<u128>()
+    };
+    assert_eq!(sizes.total, measured_bytes(&messages, &context));
+    assert!(sizes.total <= 400);
+
+    messages.extend(tool_turn("next", "é".repeat(300)));
+    context.push(Some(json!({"reasoning": "line one\nline two"})));
+    let exact = usize::try_from(measured_bytes(&messages, &context)).unwrap();
+    assert!(sizes.prepare(&messages, &context, exact)?.is_none());
+    assert!(sizes.prepare(&messages, &context, exact - 1)?.is_some());
     Ok(())
 }
 
@@ -71,7 +85,10 @@ fn rejects_an_oversized_summary_before_replacing_history() -> Result<(), RunErro
     ));
     let mut context = vec![None, None];
     let original = messages.clone();
-    let compaction = prepare(&messages, &context, 400)?.expect("the history exceeds the budget");
+    let mut sizes = ContextSizes::default();
+    let compaction = sizes
+        .prepare(&messages, &context, 400)?
+        .expect("the history exceeds the budget");
 
     let result = compaction.apply(
         ModelResponse::Final("too long ".repeat(100)),
@@ -95,7 +112,7 @@ fn an_oversized_current_exchange_cannot_be_compacted() {
     let context = [Some(json!({"reasoning": "current"}))];
 
     assert!(matches!(
-        prepare(&messages, &context, 100),
+        ContextSizes::default().prepare(&messages, &context, 100),
         Err(RunError::ContextBudgetExceeded { limit: 100, required }) if required > 500
     ));
 }

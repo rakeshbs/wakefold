@@ -394,6 +394,7 @@ async fn drive(
     let mut skills = RunSkills::new(skills)?;
     let mut journal = JournalWriter::new(journal);
     let (mut state, mut boundary) = journal.restore(prompt, &mut skills, &options)?;
+    let mut context_sizes = crate::context::ContextSizes::default();
     loop {
         check_cancelled(cancellation)?;
         let action = next_action(
@@ -409,7 +410,7 @@ async fn drive(
                 if matches!(boundary, Boundary::Ready)
                     && let Some(limit) = options.context_budget
                     && let Some(compaction) =
-                        crate::context::prepare(&state.messages, &state.assistant_context, limit)?
+                        context_sizes.prepare(&state.messages, &state.assistant_context, limit)?
                 {
                     let summary = crate::retry::complete_turn(
                         provider,

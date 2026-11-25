@@ -327,11 +327,32 @@ fn resumes_a_saved_tool_request_from_an_earlier_journal_without_a_checkpoint() {
     }
     let mut store = WorkspaceStore::open(dir.path()).unwrap();
     let mut journal = store.open_journal("chat", "old").unwrap();
+    let skills = [Skill::new("notes", "Manage notes", &[&WriteNote])];
+    // Include the recovered loader exchange and the newly completed write.
+    let loader_bytes = concat!(
+        "first",
+        "skills.load",
+        r#"{"name":"notes"}"#,
+        "first",
+        r#"{"loaded":"notes"}"#
+    )
+    .len();
+    let write_bytes = 200 + concat!("write", "notes.write", "{}", "write", r#""written""#).len();
+    let required = PROMPT.len() + loader_bytes + write_bytes;
+    let result = block_on(journal.run(
+        PROMPT,
+        &NoCalls,
+        &skills,
+        RunOptions::new(3).with_context_budget(1),
+    ));
+    assert!(matches!(result,
+        Err(RunError::ContextBudgetExceeded { required: bytes, .. }) if bytes == required as u128
+    ));
     let report = block_on(journal.run(
         PROMPT,
         &Finish,
-        &[Skill::new("notes", "Manage notes", &[&WriteNote])],
-        RunOptions::new(3),
+        &skills,
+        RunOptions::new(3).with_context_budget(required),
     ))
     .unwrap();
     assert_eq!(report.answer, "saved");

@@ -7,7 +7,17 @@ use crate::{JsonValue, Message, ModelRequest, ModelResponse, ProviderError, RunE
 #[cfg(test)]
 mod tests;
 
-pub(crate) struct Compaction {
+/// Mirrors the measured prefix of each transcript slice. Between compactions
+/// the driver only appends, so a budget check measures just the new entries.
+#[derive(Default)]
+pub(crate) struct ContextSizes {
+    messages: Vec<u128>,
+    assistant_context: Vec<u128>,
+    total: u128,
+}
+
+pub(crate) struct Compaction<'a> {
+    sizes: &'a mut ContextSizes,
     input: Vec<Message>,
     transcript_end: usize,
     assistant_turns: usize,
@@ -15,7 +25,7 @@ pub(crate) struct Compaction {
     limit: usize,
 }
 
-impl Compaction {
+impl Compaction<'_> {
     pub(crate) fn request(&self) -> ModelRequest<'_> {
         ModelRequest::new(&self.input, &[])
     }
@@ -46,78 +56,86 @@ impl Compaction {
             [Message::Summary(summary.to_owned())],
         );
         assistant_context.drain(..self.assistant_turns);
+        self.sizes
+            .messages
+            .splice(1..self.transcript_end, [summary.len() as u128]);
+        self.sizes.assistant_context.drain(..self.assistant_turns);
+        self.sizes.total = required;
         Ok(())
     }
 }
 
-pub(crate) fn prepare(
-    messages: &[Message],
-    assistant_context: &[Option<JsonValue>],
-    limit: usize,
-) -> Result<Option<Compaction>, RunError> {
-    let bytes = context_bytes(messages, assistant_context);
-    let budget = limit as u128;
-    if bytes <= budget {
-        return Ok(None);
-    }
-
-    // At a model-call boundary all tool calls are answered. Only consider
-    // prefixes ending before an assistant message to keep each exchange whole.
-    let latest = assistant_context.len().saturating_sub(1);
-    let mut input_bytes = messages.first().map_or(0, message_bytes);
-    let mut retained_bytes = bytes;
-    let mut assistant_turns = 0;
-    let mut candidate = None;
-    for (index, message) in messages.iter().enumerate().skip(1) {
-        if matches!(message, Message::Assistant(_)) {
-            if assistant_turns > 0 && retained_bytes < budget {
-                let instruction = summary_instruction(budget - retained_bytes);
-                if input_bytes + instruction.len() as u128 <= budget {
-                    candidate = Some((index, assistant_turns, retained_bytes, instruction));
-                }
-            }
-            if assistant_turns == latest {
-                break;
-            }
-            retained_bytes -= assistant_context[assistant_turns]
-                .as_ref()
-                .map_or(0, json_bytes);
-            assistant_turns += 1;
+impl ContextSizes {
+    pub(crate) fn prepare(
+        &mut self,
+        messages: &[Message],
+        assistant_context: &[Option<JsonValue>],
+        limit: usize,
+    ) -> Result<Option<Compaction<'_>>, RunError> {
+        for message in &messages[self.messages.len()..] {
+            let size = message_bytes(message);
+            self.messages.push(size);
+            self.total += size;
         }
-        let size = message_bytes(message);
-        input_bytes += size;
-        retained_bytes -= size;
-    }
+        for context in &assistant_context[self.assistant_context.len()..] {
+            let size = context.as_ref().map_or(0, json_bytes);
+            self.assistant_context.push(size);
+            self.total += size;
+        }
+        let budget = limit as u128;
+        if self.total <= budget {
+            return Ok(None);
+        }
 
-    let Some((transcript_end, assistant_turns, retained_bytes, instruction)) = candidate else {
-        return Err(RunError::ContextBudgetExceeded {
+        // At a model-call boundary all tool calls are answered. Only consider
+        // prefixes ending before an assistant message to keep each exchange whole.
+        let latest = assistant_context.len().saturating_sub(1);
+        let mut input_bytes = self.messages.first().copied().unwrap_or(0);
+        let mut retained_bytes = self.total;
+        let mut assistant_turns = 0;
+        let mut candidate = None;
+        for (index, message) in messages.iter().enumerate().skip(1) {
+            if matches!(message, Message::Assistant(_)) {
+                if assistant_turns > 0 && retained_bytes < budget {
+                    let instruction = summary_instruction(budget - retained_bytes);
+                    if input_bytes + instruction.len() as u128 <= budget {
+                        candidate = Some((index, assistant_turns, retained_bytes, instruction));
+                    }
+                }
+                if assistant_turns == latest {
+                    break;
+                }
+                retained_bytes -= self.assistant_context[assistant_turns];
+                assistant_turns += 1;
+            }
+            let size = self.messages[index];
+            input_bytes += size;
+            retained_bytes -= size;
+        }
+
+        let Some((transcript_end, assistant_turns, retained_bytes, instruction)) = candidate else {
+            return Err(RunError::ContextBudgetExceeded {
+                limit,
+                required: self.total,
+            });
+        };
+        let mut input = messages[..transcript_end].to_vec();
+        input.push(Message::User(instruction));
+        Ok(Some(Compaction {
+            sizes: self,
+            input,
+            transcript_end,
+            assistant_turns,
+            retained_bytes,
             limit,
-            required: bytes,
-        });
-    };
-    let mut input = messages[..transcript_end].to_vec();
-    input.push(Message::User(instruction));
-    Ok(Some(Compaction {
-        input,
-        transcript_end,
-        assistant_turns,
-        retained_bytes,
-        limit,
-    }))
+        }))
+    }
 }
 
 fn summary_instruction(max_bytes: u128) -> String {
     format!(
         "Summarize the earlier work for continuing the original task. Preserve relevant tool facts, decisions, and next steps. Return only the summary, up to {max_bytes} UTF-8 bytes."
     )
-}
-
-fn context_bytes(messages: &[Message], assistant_context: &[Option<JsonValue>]) -> u128 {
-    messages
-        .iter()
-        .map(message_bytes)
-        .chain(assistant_context.iter().flatten().map(json_bytes))
-        .sum()
 }
 
 fn message_bytes(message: &Message) -> u128 {
