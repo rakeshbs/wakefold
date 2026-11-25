@@ -11,6 +11,7 @@ use crate::{Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderE
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptedTurn {
     messages: Vec<Message>,
+    tools: Option<Vec<String>>,
     turn: ModelTurn,
 }
 
@@ -19,8 +20,15 @@ impl ScriptedTurn {
     pub fn new(messages: Vec<Message>, response: ModelResponse) -> Self {
         Self {
             messages,
+            tools: None,
             turn: ModelTurn::new(response, None),
         }
+    }
+
+    /// Require exactly these advertised tool names in the given order.
+    pub fn with_tools(mut self, names: &[&str]) -> Self {
+        self.tools = Some(names.iter().map(|name| (*name).to_owned()).collect());
+        self
     }
 
     /// Report these token counts when returning this turn.
@@ -67,6 +75,19 @@ impl Provider for ScriptedProvider {
             return Err(ProviderError::new(
                 "scripted provider received unexpected messages",
             ));
+        }
+
+        if let Some(names) = scripted.tools
+            && request.tools.iter().map(|spec| &spec.name).ne(&names)
+        {
+            return Err(ProviderError::new(format!(
+                "scripted provider expected tools {names:?}, received {:?}",
+                request
+                    .tools
+                    .iter()
+                    .map(|spec| &spec.name)
+                    .collect::<Vec<_>>()
+            )));
         }
 
         scripted.turn.response.emit_text(on_text);

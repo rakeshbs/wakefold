@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -8,8 +10,8 @@ use serde::Deserialize;
 use serde_json::json;
 use wakefold::testing::{ScriptedProvider, ScriptedTurn};
 use wakefold::{
-    Message, ModelResponse, RunOptions, RunWorkspace, ToolCall, ToolContext, ToolError, ToolResult,
-    WakefoldTool, WorkspaceStore, run_with_options, typed_tool_with_context,
+    Message, ModelResponse, RunOptions, RunWorkspace, Skill, ToolCall, ToolContext, ToolError,
+    ToolResult, WakefoldTool, WorkspaceStore, run_with_options, typed_tool_with_context,
 };
 
 const CONTENT: &str = "notes from the first agent";
@@ -35,24 +37,22 @@ fn run_note_tool(workspace: RunWorkspace, read_from: Option<&Path>) {
     let user = Message::User("use the note".into());
     let response = ModelResponse::ToolCalls {
         text: None,
-        calls: vec![ToolCall::new("1", "note", json!({}))],
+        calls: vec![ToolCall::new("1", "notes.note", json!({}))],
     };
+    let (load, mut messages) = common::load_skill(&user, "notes");
+    let note = ScriptedTurn::new(messages.clone(), response.clone());
+    messages.push(Message::Assistant(response));
+    messages.push(Message::Tool(ToolResult::new("1", json!(CONTENT))));
     let provider = ScriptedProvider::new([
-        ScriptedTurn::new(vec![user.clone()], response.clone()),
-        ScriptedTurn::new(
-            vec![
-                user,
-                Message::Assistant(response),
-                Message::Tool(ToolResult::new("1", json!(CONTENT))),
-            ],
-            ModelResponse::Final("done".into()),
-        ),
+        load,
+        note,
+        ScriptedTurn::new(messages, ModelResponse::Final("done".into())),
     ]);
     block_on(run_with_options(
         "use the note",
         &provider,
-        &[&tool],
-        RunOptions::new(2).with_workspace(workspace),
+        &[Skill::new("notes", "Access chat notes", &[&tool])],
+        RunOptions::new(3).with_workspace(workspace),
     ))
     .unwrap();
 }

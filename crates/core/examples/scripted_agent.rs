@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::json;
 use wakefold::testing::{ScriptedProvider, ScriptedTurn};
 use wakefold::{
-    JsonValue, Message, ModelResponse, RunError, RunOptions, RunReport, TokenUsage, ToolCall,
-    ToolError, ToolResult, WakefoldTool, run_with_options, typed_tool,
+    JsonValue, Message, ModelResponse, RunError, RunOptions, RunReport, Skill, TokenUsage,
+    ToolCall, ToolError, ToolResult, WakefoldTool, run_with_options, typed_tool,
 };
 
 #[derive(Deserialize, JsonSchema, WakefoldTool)]
@@ -57,7 +57,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
         )),
         calls: vec![ToolCall::new(
             "price-1",
-            "lookup_price",
+            "pricing.lookup_price",
             json!({"item": "notebook"}),
         )],
     };
@@ -69,18 +69,36 @@ fn notebook_total() -> Result<RunReport, RunError> {
         ))),
         calls: vec![ToolCall::new(
             "total-1",
-            "calculate_total",
+            "pricing.calculate_total",
             json!({"unit_price_cents": 350, "quantity": 3}),
         )],
     };
 
-    let lookup_turn = ScriptedTurn::new(vec![user.clone()], lookup.clone());
-    let earlier = vec![
-        user.clone(),
-        Message::Assistant(lookup),
-        Message::Tool(ToolResult::new("price-1", json!({"price_cents": 350}))),
+    let load = ModelResponse::ToolCall(ToolCall::new(
+        "load-1",
+        "skills.load",
+        json!({"name": "pricing"}),
+    ));
+    let load_turn =
+        ScriptedTurn::new(vec![user.clone()], load.clone()).with_tools(&["skills.load"]);
+    let loaded_tools = [
+        "skills.load",
+        "pricing.lookup_price",
+        "pricing.calculate_total",
     ];
-    let calculate_turn = ScriptedTurn::new(earlier.clone(), calculate.clone());
+    let mut earlier = vec![
+        user.clone(),
+        Message::Assistant(load),
+        Message::Tool(ToolResult::new("load-1", json!({"loaded": "pricing"}))),
+    ];
+    let lookup_turn = ScriptedTurn::new(earlier.clone(), lookup.clone()).with_tools(&loaded_tools);
+    earlier.push(Message::Assistant(lookup));
+    earlier.push(Message::Tool(ToolResult::new(
+        "price-1",
+        json!({"price_cents": 350}),
+    )));
+    let calculate_turn =
+        ScriptedTurn::new(earlier.clone(), calculate.clone()).with_tools(&loaded_tools);
 
     // The calculator exchange pushes the next request over budget. The model
     // summarizes the earlier lookup and keeps the calculator exchange intact.
@@ -88,7 +106,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
     summary_request.push(Message::User(String::from(concat!(
         "Summarize the earlier work for continuing the original task. ",
         "Preserve relevant tool facts, decisions, and next steps. ",
-        "Return only the summary, up to 66 UTF-8 bytes."
+        "Return only the summary, up to 98 UTF-8 bytes."
     ))));
     let summary = String::from("Catalog lookup confirmed 350 cents per notebook.");
     let summary_turn = ScriptedTurn::new(summary_request, ModelResponse::Final(summary.clone()))
@@ -101,16 +119,27 @@ fn notebook_total() -> Result<RunReport, RunError> {
             Message::Tool(ToolResult::new("total-1", json!({"total_cents": 1050}))),
         ],
         ModelResponse::Final(String::from("Three notebooks cost $10.50.")),
-    );
+    )
+    .with_tools(&loaded_tools);
 
-    let provider = ScriptedProvider::new([lookup_turn, calculate_turn, summary_turn, final_turn]);
+    let provider = ScriptedProvider::new([
+        load_turn,
+        lookup_turn,
+        calculate_turn,
+        summary_turn,
+        final_turn,
+    ]);
     let lookup_tool = typed_tool(lookup_price);
     let total_tool = typed_tool(calculate_total);
-    let options = RunOptions::new(3).with_context_budget(400);
+    let options = RunOptions::new(4).with_context_budget(440);
     block_on(run_with_options(
         prompt,
         &provider,
-        &[&lookup_tool, &total_tool],
+        &[Skill::new(
+            "pricing",
+            "Look up prices and calculate totals",
+            &[&lookup_tool, &total_tool],
+        )],
         options,
     ))
 }

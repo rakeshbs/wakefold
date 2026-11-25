@@ -1,6 +1,6 @@
 //! In-memory agent decisions and the driver that executes them.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::pin;
 
@@ -8,9 +8,10 @@ use futures_util::future::{Either, select};
 
 use thiserror::Error;
 
+use crate::skill::RunSkills;
 use crate::{
     CallId, CancellationToken, Message, ModelRequest, ModelTurn, Provider, ProviderError,
-    RetryPolicy, RunWorkspace, TokenUsage, Tool, ToolCall, ToolContext, ToolError, ToolResult,
+    RetryPolicy, RunWorkspace, Skill, TokenUsage, ToolCall, ToolContext, ToolError, ToolResult,
 };
 
 /// Limits, retries, and cancellation for a single agent run.
@@ -144,6 +145,20 @@ pub enum RunError {
     #[error("model call failed: {0}")]
     Provider(#[from] ProviderError),
 
+    /// Two skills have the same name, including the reserved built-in skill.
+    #[error("multiple skills registered as {name}")]
+    DuplicateSkillName {
+        /// The repeated skill name.
+        name: String,
+    },
+
+    /// A skill or tool name cannot be used as part of a qualified name.
+    #[error("invalid skill or tool name {name:?}")]
+    InvalidName {
+        /// The invalid name.
+        name: String,
+    },
+
     /// Two tools advertised the same name.
     #[error("multiple tools registered as {name}")]
     DuplicateToolName {
@@ -216,6 +231,9 @@ pub enum RunError {
 
 /// Run a single agent until it returns a final answer or reaches a limit.
 ///
+/// The model sees a description of each supplied skill and calls `skills.load`
+/// to activate its tools on subsequent turns.
+///
 /// If the last allowed model turn requests tools, the run stops before
 /// executing them because no follow-up turn remains.
 ///
@@ -226,10 +244,10 @@ pub enum RunError {
 pub async fn run(
     prompt: impl Into<String> + Send,
     provider: &dyn Provider,
-    tools: &[&dyn Tool],
+    skills: &[Skill<'_>],
     max_model_turns: usize,
 ) -> Result<String, RunError> {
-    run_streaming(prompt, provider, tools, max_model_turns, |_| {}).await
+    run_streaming(prompt, provider, skills, max_model_turns, |_| {}).await
 }
 
 /// Run an agent while delivering model text as it arrives.
@@ -244,13 +262,13 @@ pub async fn run(
 pub async fn run_streaming(
     prompt: impl Into<String> + Send,
     provider: &dyn Provider,
-    tools: &[&dyn Tool],
+    skills: &[Skill<'_>],
     max_model_turns: usize,
     on_text: impl FnMut(&str) + Send,
 ) -> Result<String, RunError> {
     let options = RunOptions::new(max_model_turns);
     Ok(
-        run_streaming_with_options(prompt, provider, tools, options, on_text)
+        run_streaming_with_options(prompt, provider, skills, options, on_text)
             .await?
             .answer,
     )
@@ -266,10 +284,10 @@ pub async fn run_streaming(
 pub async fn run_with_options(
     prompt: impl Into<String> + Send,
     provider: &dyn Provider,
-    tools: &[&dyn Tool],
+    skills: &[Skill<'_>],
     options: RunOptions,
 ) -> Result<RunReport, RunError> {
-    run_streaming_with_options(prompt, provider, tools, options, |_| {}).await
+    run_streaming_with_options(prompt, provider, skills, options, |_| {}).await
 }
 
 /// Run an agent with configured limits while reporting model text as it arrives.
@@ -280,7 +298,7 @@ pub async fn run_with_options(
 pub async fn run_streaming_with_options(
     prompt: impl Into<String> + Send,
     provider: &dyn Provider,
-    tools: &[&dyn Tool],
+    skills: &[Skill<'_>],
     options: RunOptions,
     mut on_text: impl FnMut(&str) + Send,
 ) -> Result<RunReport, RunError> {
@@ -292,16 +310,7 @@ pub async fn run_streaming_with_options(
         }
     };
 
-    let specs: Vec<_> = tools.iter().map(|tool| tool.spec()).collect();
-    let mut tools_by_name = BTreeMap::new();
-    for (spec, &tool) in specs.iter().zip(tools) {
-        if tools_by_name.insert(spec.name.as_str(), tool).is_some() {
-            return Err(RunError::DuplicateToolName {
-                name: spec.name.clone(),
-            });
-        }
-    }
-
+    let mut skills = RunSkills::new(skills)?;
     let mut messages = vec![Message::User(prompt.into())];
     let mut assistant_context = Vec::new();
     let mut used_call_ids = HashSet::new();
@@ -339,7 +348,7 @@ pub async fn run_streaming_with_options(
                     provider,
                     ModelRequest {
                         messages: &messages,
-                        tools: &specs,
+                        tools: &skills.advertised,
                         assistant_context: &assistant_context,
                     },
                     &mut emit_text,
@@ -360,25 +369,19 @@ pub async fn run_streaming_with_options(
                 remaining_turns -= 1;
                 if remaining_turns > 0 && !response.tool_calls().is_empty() {
                     usage.check_budget(options.token_budget)?;
-                    validate_calls(response.tool_calls(), &mut used_call_ids, &tools_by_name)?;
+                    validate_calls(response.tool_calls(), &mut used_call_ids, &skills)?;
                 }
                 messages.push(Message::Assistant(response));
                 assistant_context.push(context);
             }
             Action::RunTool(call) => {
-                let tool = tools_by_name
-                    .get(call.name.as_str())
-                    .expect("tool names are validated before the turn is scheduled");
                 let context = ToolContext::new(cancellation.cloned(), options.workspace.clone());
-                let value = await_cancellable(
-                    tool.call_with_context(context, &call.arguments),
-                    cancellation,
-                )
-                .await?
-                .map_err(|source| RunError::Tool {
-                    name: call.name.clone(),
-                    source,
-                })?;
+                let value = await_cancellable(skills.call(call, context), cancellation)
+                    .await?
+                    .map_err(|source| RunError::Tool {
+                        name: call.name.clone(),
+                        source,
+                    })?;
                 let result = ToolResult::new(call.id.clone(), value);
                 messages.push(Message::Tool(result));
             }
@@ -450,10 +453,10 @@ fn next_action(messages: &[Message], remaining_turns: usize) -> Option<Action<'_
 fn validate_calls(
     calls: &[ToolCall],
     used_call_ids: &mut HashSet<CallId>,
-    tools: &BTreeMap<&str, &dyn Tool>,
+    skills: &RunSkills<'_>,
 ) -> Result<(), RunError> {
     for call in calls {
-        if !tools.contains_key(call.name.as_str()) {
+        if !skills.can_call(&call.name) {
             return Err(RunError::UnknownTool {
                 name: call.name.clone(),
             });

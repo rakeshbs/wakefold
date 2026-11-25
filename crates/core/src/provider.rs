@@ -126,7 +126,7 @@ impl ModelTurn {
 pub struct ModelRequest<'a> {
     /// Messages in chronological order, including any tool results.
     pub messages: &'a [Message],
-    /// Tools the model can request during this run.
+    /// Tool schemas advertised for this turn, with skill-qualified names in agent runs.
     pub tools: &'a [ToolSpec],
     /// Provider context for each [`Message::Assistant`], in chronological order.
     ///

@@ -5,6 +5,7 @@ mod context;
 mod provider;
 mod providers;
 mod retry;
+mod skill;
 mod tool;
 mod workspace;
 
@@ -28,6 +29,7 @@ pub use provider::{
 pub use providers::openai::{OpenAiProvider, ReasoningEffort};
 pub use retry::RetryPolicy;
 pub use serde_json::Value as JsonValue;
+pub use skill::Skill;
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{CallId, Tool, ToolCall, ToolContext, ToolError, ToolResult, ToolSpec};
 #[cfg(feature = "derive")]

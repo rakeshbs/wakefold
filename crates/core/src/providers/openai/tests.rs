@@ -10,7 +10,7 @@ use tower::service_fn;
 
 use super::*;
 use crate::{
-    JsonValue, RetryPolicy, RunError, RunOptions, Tool as WakefoldTool, ToolError, ToolSpec,
+    JsonValue, RetryPolicy, RunError, RunOptions, Skill, Tool as WakefoldTool, ToolError, ToolSpec,
     run_streaming_with_options,
 };
 
@@ -124,14 +124,49 @@ fn catalog_schema() -> JsonValue {
     })
 }
 
+fn loader_tools() -> JsonValue {
+    json!([{
+        "type": "namespace", "name": "skills", "description": "Tools from the skills skill.",
+        "tools": [{
+            "type": "function", "name": "load",
+            "description": "Load a skill by name to enable its tools on the next turn.\ncatalog: Look up prices",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"], "additionalProperties": false
+            },
+            "strict": false
+        }]
+    }])
+}
+
 fn advertised_tools() -> JsonValue {
     json!([{
-        "type": "function",
-        "name": "lookup_price",
-        "description": "Look up an item price",
-        "parameters": catalog_schema(),
-        "strict": false,
-    }])
+        "type": "namespace", "name": "catalog", "description": "Tools from the catalog skill.",
+        "tools": [{
+            "type": "function", "name": "lookup_price", "description": "Look up an item price",
+            "parameters": catalog_schema(), "strict": false
+        }]
+    }, loader_tools()[0]])
+}
+
+fn load_call() -> JsonValue {
+    json!({
+        "type": "function_call", "namespace": "skills", "name": "load",
+        "id": "fc_load", "call_id": "load_catalog", "arguments": r#"{"name":"catalog"}"#,
+        "status": "completed"
+    })
+}
+
+fn loaded_transcript() -> Vec<JsonValue> {
+    vec![
+        prompt(),
+        load_call(),
+        json!({
+            "type": "function_call_output", "call_id": "load_catalog",
+            "output": r#"{"loaded":"catalog"}"#
+        }),
+    ]
 }
 
 fn output_message(text: &str) -> JsonValue {
@@ -177,6 +212,7 @@ fn call() -> JsonValue {
         "id": "fc_offline",
         "call_id": "call_notebook",
         "name": "lookup_price",
+        "namespace": "catalog",
         "arguments": "{\"item\":\"notebook\"}",
         "status": "completed"
     })
@@ -202,7 +238,7 @@ async fn streams_function_calls_and_replays_reasoning_at_every_effort() -> Resul
             }));
         }
         output.push(call());
-        let mut followup = vec![prompt()];
+        let mut followup = loaded_transcript();
         followup.extend(output.iter().cloned());
         followup.push(json!({
             "type": "function_call_output",
@@ -214,6 +250,11 @@ async fn streams_function_calls_and_replays_reasoning_at_every_effort() -> Resul
             vec![
                 Exchange {
                     input: json!([prompt()]),
+                    tools: Some(loader_tools()),
+                    events: vec![terminal_event("completed", vec![load_call()])],
+                },
+                Exchange {
+                    input: json!(loaded_transcript()),
                     tools: Some(advertised_tools()),
                     events: vec![terminal_event("completed", output)],
                 },
@@ -236,8 +277,8 @@ async fn streams_function_calls_and_replays_reasoning_at_every_effort() -> Resul
         let report = run_streaming_with_options(
             PROMPT,
             &provider,
-            &[&tool],
-            RunOptions::new(2).with_token_budget(100),
+            &[Skill::new("catalog", "Look up prices", &[&tool])],
+            RunOptions::new(3).with_token_budget(100),
             |text| chunks.push(text.to_owned()),
         )
         .await?;
@@ -245,7 +286,7 @@ async fn streams_function_calls_and_replays_reasoning_at_every_effort() -> Resul
         assert_eq!(*tool.0.lock().unwrap(), ["notebook"]);
         assert_eq!(chunks, ["A notebook ", "costs $3.50."]);
         assert_eq!(report.answer, "A notebook costs $3.50.");
-        assert_eq!(report.usage.reported, TokenUsage::new(40, 12));
+        assert_eq!(report.usage.reported, TokenUsage::new(60, 18));
         assert_eq!(report.usage.unreported_turns, 0);
     }
 
@@ -271,14 +312,19 @@ async fn rejects_incomplete_turns_and_invalid_arguments_before_dispatch()
             Some((ReasoningEffort::High, "high")),
             vec![Exchange {
                 input: json!([prompt()]),
-                tools: Some(advertised_tools()),
+                tools: Some(loader_tools()),
                 events,
             }],
         )?;
         let tool = LookupPrice::default();
-        let result =
-            run_streaming_with_options(PROMPT, &provider, &[&tool], RunOptions::new(2), |_| {})
-                .await;
+        let result = run_streaming_with_options(
+            PROMPT,
+            &provider,
+            &[Skill::new("catalog", "Look up prices", &[&tool])],
+            RunOptions::new(3),
+            |_| {},
+        )
+        .await;
 
         let Err(RunError::Provider(error)) = result else {
             panic!("expected a provider error, got {result:?}");
@@ -360,6 +406,7 @@ async fn retries_a_rate_limited_follow_up_without_replaying_the_tool() -> Result
         provider,
         responses,
     } = retry_provider(vec![
+        stream_response(vec![terminal_event("completed", vec![load_call()])]),
         stream_response(vec![terminal_event("completed", vec![call()])]),
         rate_limited("rate_limit_exceeded", "0"),
         stream_response(vec![
@@ -369,15 +416,18 @@ async fn retries_a_rate_limited_follow_up_without_replaying_the_tool() -> Result
     ])?;
     let tool = LookupPrice::default();
     let mut streamed = String::new();
-    let report =
-        run_streaming_with_options(PROMPT, &provider, &[&tool], RunOptions::new(2), |text| {
-            streamed.push_str(text)
-        })
-        .await?;
+    let report = run_streaming_with_options(
+        PROMPT,
+        &provider,
+        &[Skill::new("catalog", "Look up prices", &[&tool])],
+        RunOptions::new(3),
+        |text| streamed.push_str(text),
+    )
+    .await?;
     assert_eq!(report.answer, "$3.50");
     assert_eq!(streamed, "$3.50");
     assert_eq!(*tool.0.lock().unwrap(), ["notebook"]);
-    assert_eq!(report.usage.reported, TokenUsage::new(40, 12));
+    assert_eq!(report.usage.reported, TokenUsage::new(60, 18));
     assert!(responses.lock().unwrap().is_empty());
     Ok(())
 }

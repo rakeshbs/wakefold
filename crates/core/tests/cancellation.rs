@@ -1,3 +1,5 @@
+mod common;
+
 use std::future::{Future, pending};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +11,7 @@ use serde_json::json;
 use wakefold::testing::{ScriptedProvider, ScriptedTurn};
 use wakefold::{
     CancellationToken, JsonValue, Message, ModelRequest, ModelResponse, Provider, ProviderError,
-    RunError, RunOptions, Tool, ToolCall, ToolContext, ToolError, ToolSpec,
+    RunError, RunOptions, Skill, Tool, ToolCall, ToolContext, ToolError, ToolSpec,
     run_streaming_with_options, run_with_options,
 };
 
@@ -120,21 +122,26 @@ impl Tool for PendingTool {
 }
 
 fn scripted_tool_call(prompt: &str, name: &str) -> ScriptedProvider {
-    ScriptedProvider::new([ScriptedTurn::new(
-        vec![Message::User(prompt.to_owned())],
-        ModelResponse::ToolCall(ToolCall::new("call-1", name, json!({}))),
-    )])
+    let (load, messages) = common::load_skill(&Message::User(prompt.to_owned()), "util");
+    ScriptedProvider::new([
+        load,
+        ScriptedTurn::new(
+            messages,
+            ModelResponse::ToolCall(ToolCall::new("call-1", name, json!({}))),
+        ),
+    ])
 }
 
 #[test]
 fn in_flight_tool_can_observe_cancellation_before_it_is_dropped() {
     let prompt = "Wait for an event";
-    let provider = scripted_tool_call(prompt, "wait");
+    let provider = scripted_tool_call(prompt, "util.wait");
     let tool = PendingTool::default();
     let tools: [&dyn Tool; 1] = [&tool];
+    let skills = [Skill::new("util", "Utility tools", &tools)];
     let cancellation = CancellationToken::new();
-    let options = RunOptions::new(2).with_cancellation(cancellation.clone());
-    let mut run = pin!(run_with_options(prompt, &provider, &tools, options));
+    let options = RunOptions::new(3).with_cancellation(cancellation.clone());
+    let mut run = pin!(run_with_options(prompt, &provider, &skills, options));
     let mut context = Context::from_waker(Waker::noop());
 
     assert!(run.as_mut().poll(&mut context).is_pending());
@@ -162,9 +169,9 @@ fn typed_tool_receives_the_run_cancellation_signal() {
     struct Stop {}
 
     let prompt = "Stop the current run";
-    let provider = scripted_tool_call(prompt, "stop");
+    let provider = scripted_tool_call(prompt, "util.stop");
     let cancellation = CancellationToken::new();
-    let options = RunOptions::new(2).with_cancellation(cancellation.clone());
+    let options = RunOptions::new(3).with_cancellation(cancellation.clone());
     let tool = typed_tool_with_context(|_input: Stop, context| async move {
         context
             .cancellation_token()
@@ -173,7 +180,12 @@ fn typed_tool_receives_the_run_cancellation_signal() {
         Ok(json!({}))
     });
 
-    let result = block_on(run_with_options(prompt, &provider, &[&tool], options));
+    let result = block_on(run_with_options(
+        prompt,
+        &provider,
+        &[Skill::new("util", "Utility tools", &[&tool])],
+        options,
+    ));
 
     assert!(matches!(result, Err(RunError::Cancelled)), "{result:?}");
     assert!(cancellation.is_cancelled());

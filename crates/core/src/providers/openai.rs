@@ -1,14 +1,14 @@
 //! Streaming Responses API adapter with stateless reasoning replay.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use async_openai::Client;
 use async_openai::config::{OPENAI_API_BASE, OpenAIConfig};
 use async_openai::types::responses::{
     CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
-    FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, IncludeEnum, InputItem,
-    InputParam, Item, OutputItem, OutputMessageContent, Reasoning, Response, ResponseStreamEvent,
-    Role, Tool,
+    FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, FunctionToolParam, IncludeEnum,
+    InputItem, InputParam, Item, NamespaceToolParam, NamespaceToolParamTool, OutputItem,
+    OutputMessageContent, Reasoning, Response, ResponseStreamEvent, Role, Tool,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -118,15 +118,6 @@ impl Provider for OpenAiProvider {
         request: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelTurn, ProviderError> {
-        let tools = request.tools.iter().map(|spec| {
-            Tool::Function(FunctionTool {
-                name: spec.name.clone(),
-                description: Some(spec.description.clone()),
-                parameters: Some(spec.parameters.clone()),
-                strict: Some(false),
-                ..Default::default()
-            })
-        });
         let request = CreateResponse {
             model: Some(self.model.clone()),
             reasoning: self.reasoning_effort.clone().map(|effort| Reasoning {
@@ -136,7 +127,7 @@ impl Provider for OpenAiProvider {
             include: Some(vec![IncludeEnum::ReasoningEncryptedContent]),
             store: Some(false),
             input: InputParam::Items(input_items(request)?),
-            tools: (!request.tools.is_empty()).then(|| tools.collect()),
+            tools: (!request.tools.is_empty()).then(|| response_tools(request.tools)),
             ..Default::default()
         };
 
@@ -186,6 +177,42 @@ impl Provider for OpenAiProvider {
     }
 }
 
+fn response_tools(specs: &[crate::ToolSpec]) -> Vec<Tool> {
+    let mut tools = Vec::new();
+    let mut namespaces = BTreeMap::<&str, Vec<NamespaceToolParamTool>>::new();
+    for spec in specs {
+        if let Some((skill, local)) = spec.name.split_once('.') {
+            namespaces
+                .entry(skill)
+                .or_default()
+                .push(NamespaceToolParamTool::Function(FunctionToolParam {
+                    name: local.to_owned(),
+                    description: Some(spec.description.clone()),
+                    parameters: Some(spec.parameters.clone()),
+                    strict: Some(false),
+                    ..Default::default()
+                }));
+        } else {
+            // Direct provider clients can also supply ordinary function schemas.
+            tools.push(Tool::Function(FunctionTool {
+                name: spec.name.clone(),
+                description: Some(spec.description.clone()),
+                parameters: Some(spec.parameters.clone()),
+                strict: Some(false),
+                ..Default::default()
+            }));
+        }
+    }
+    tools.extend(namespaces.into_iter().map(|(skill, tools)| {
+        Tool::Namespace(NamespaceToolParam {
+            name: skill.to_owned(),
+            description: format!("Tools from the {skill} skill."),
+            tools,
+        })
+    }));
+    tools
+}
+
 fn input_items(request: ModelRequest<'_>) -> Result<Vec<InputItem>, ProviderError> {
     let mut items = Vec::new();
     let mut context = request.assistant_context.iter();
@@ -206,9 +233,14 @@ fn input_items(request: ModelRequest<'_>) -> Result<Vec<InputItem>, ProviderErro
                     items.push(text_message(Role::Assistant, text));
                 }
                 items.extend(response.tool_calls().iter().map(|call| {
+                    let (namespace, name) = match call.name.split_once('.') {
+                        Some((skill, name)) => (Some(skill.to_owned()), name),
+                        None => (None, call.name.as_str()),
+                    };
                     Item::FunctionCall(FunctionToolCall {
                         call_id: call.id.to_string(),
-                        name: call.name.clone(),
+                        namespace,
+                        name: name.to_owned(),
                         arguments: call.arguments.to_string(),
                         ..Default::default()
                     })
@@ -265,7 +297,10 @@ fn completed_turn(response: Response) -> Result<ModelTurn, ProviderError> {
                 })?;
                 calls.push(ToolCall::new(
                     call.call_id.clone(),
-                    call.name.clone(),
+                    match &call.namespace {
+                        Some(namespace) => format!("{namespace}.{}", call.name),
+                        None => call.name.clone(),
+                    },
                     arguments,
                 ));
             }
