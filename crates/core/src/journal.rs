@@ -4,7 +4,7 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ModelTurn, ToolCall, ToolResult};
+use crate::{ModelTurn, RunCheckpoint, RunWorkspace, ToolCall, ToolResult};
 
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS run_events (
@@ -12,7 +12,9 @@ pub(crate) const SCHEMA: &str = "
         sequence INTEGER NOT NULL CHECK(sequence > 0),
         event_json TEXT NOT NULL,
         PRIMARY KEY (agent_id, sequence)
-    ) WITHOUT ROWID;";
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS run_compactions ON run_events(agent_id, sequence)
+    WHERE json_extract(event_json, '$.kind') = 'compacted';";
 
 /// A completed storage boundary in the life of one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +31,10 @@ pub enum RunEvent {
     ToolCallStarted(ToolCall),
     /// The tool returned a result for its call ID.
     ToolCallCompleted(ToolResult),
+    /// A skill became available with the loader result in the same transaction.
+    SkillLoaded(String),
+    /// State at a model-call boundary after transcript compaction.
+    Compacted(RunCheckpoint),
     /// The run returned its final answer.
     RunFinished(String),
 }
@@ -66,14 +72,14 @@ pub enum JournalError {
 #[derive(Debug)]
 pub struct RunJournal<'a> {
     connection: &'a mut Connection,
-    agent_id: i64,
+    pub(crate) workspace: RunWorkspace,
 }
 
 impl<'a> RunJournal<'a> {
-    pub(crate) fn new(connection: &'a mut Connection, agent_id: i64) -> Self {
+    pub(crate) fn new(connection: &'a mut Connection, workspace: RunWorkspace) -> Self {
         Self {
             connection,
-            agent_id,
+            workspace,
         }
     }
 
@@ -91,7 +97,7 @@ impl<'a> RunJournal<'a> {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut sequence: u64 = tx.query_row(
             "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE agent_id = ?1",
-            [self.agent_id],
+            [self.workspace.agent_id()],
             |row| row.get(0),
         )?;
         if sequence != expected {
@@ -107,7 +113,7 @@ impl<'a> RunJournal<'a> {
             for event in events {
                 sequence += 1;
                 insert.execute(params![
-                    self.agent_id,
+                    self.workspace.agent_id(),
                     sequence,
                     serde_json::to_string(event)?
                 ])?;
@@ -117,6 +123,20 @@ impl<'a> RunJournal<'a> {
         Ok(sequence)
     }
 
+    pub(crate) fn recovery_entries(&mut self) -> Result<Vec<JournalEntry>, JournalError> {
+        // Read the checkpoint and its tail from a single SQLite snapshot.
+        let tx = self.connection.transaction()?;
+        let start: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM run_events
+             WHERE agent_id = ?1 AND json_extract(event_json, '$.kind') = 'compacted'",
+            [self.workspace.agent_id()],
+            |row| row.get(0),
+        )?;
+        let entries = read_entries(&tx, self.workspace.agent_id(), start.saturating_sub(1))?;
+        tx.commit()?;
+        Ok(entries)
+    }
+
     /// Load committed entries strictly after the supplied position in order.
     /// Pass zero to read the complete journal.
     ///
@@ -124,23 +144,29 @@ impl<'a> RunJournal<'a> {
     ///
     /// Returns an error if the query fails or a stored event cannot be decoded.
     pub fn load_after(&self, sequence: u64) -> Result<Vec<JournalEntry>, JournalError> {
-        if sequence >= i64::MAX as u64 {
-            return Ok(Vec::new());
-        }
-        let mut stmt = self.connection.prepare_cached(
-            "SELECT sequence, event_json FROM run_events
-             WHERE agent_id = ?1 AND sequence > ?2 ORDER BY sequence",
-        )?;
-        let mut rows = stmt.query(params![self.agent_id, sequence])?;
-        let mut entries = Vec::new();
-        while let Some(row) = rows.next()? {
-            entries.push(JournalEntry {
-                sequence: row.get(0)?,
-                event: serde_json::from_str(
-                    row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?,
-                )?,
-            });
-        }
-        Ok(entries)
+        read_entries(self.connection, self.workspace.agent_id(), sequence)
     }
+}
+
+fn read_entries(
+    connection: &Connection,
+    agent_id: i64,
+    sequence: u64,
+) -> Result<Vec<JournalEntry>, JournalError> {
+    if sequence >= i64::MAX as u64 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = connection.prepare_cached(
+        "SELECT sequence, event_json FROM run_events
+             WHERE agent_id = ?1 AND sequence > ?2 ORDER BY sequence",
+    )?;
+    let mut rows = stmt.query(params![agent_id, sequence])?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next()? {
+        entries.push(JournalEntry {
+            sequence: row.get(0)?,
+            event: serde_json::from_str(row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?)?,
+        });
+    }
+    Ok(entries)
 }

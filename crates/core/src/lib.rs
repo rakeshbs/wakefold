@@ -20,8 +20,8 @@ pub mod testing;
 extern crate self as wakefold;
 
 pub use agent::{
-    RunError, RunOptions, RunReport, RunUsage, run, run_streaming, run_streaming_with_options,
-    run_with_options,
+    RunCheckpoint, RunError, RunOptions, RunReport, RunUsage, run, run_streaming,
+    run_streaming_with_options, run_with_options,
 };
 pub use journal::{JournalEntry, JournalError, RunEvent, RunJournal};
 pub use provider::{

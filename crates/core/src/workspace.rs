@@ -78,7 +78,8 @@ impl WorkspaceStore {
             }
         }
         connection.execute_batch(
-            "PRAGMA foreign_keys = ON;
+            "PRAGMA synchronous = FULL;
+             PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS workspaces (
                  id INTEGER PRIMARY KEY,
                  chat_key TEXT NOT NULL UNIQUE
@@ -108,7 +109,7 @@ impl WorkspaceStore {
         run_key: &str,
     ) -> Result<crate::RunJournal<'_>, WorkspaceError> {
         let run = self.open_run(chat_key, run_key)?;
-        Ok(crate::RunJournal::new(&mut self.connection, run.agent_id()))
+        Ok(crate::RunJournal::new(&mut self.connection, run))
     }
 
     /// Open a new or existing run using the caller's stable chat and run keys.

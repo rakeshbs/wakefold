@@ -41,11 +41,12 @@ impl fmt::Debug for Skill<'_> {
     }
 }
 
-const LOADER: &str = "skills.load";
+pub(crate) const LOADER: &str = "skills.load";
 
 pub(crate) struct RunSkills<'a> {
     // Activation moves each skill's entries into the advertised set exactly once.
     available: BTreeMap<&'a str, Vec<(ToolSpec, &'a dyn Tool)>>,
+    loaded: Vec<String>,
     pub(crate) advertised: Vec<ToolSpec>,
     handlers: BTreeMap<String, &'a dyn Tool>,
 }
@@ -88,9 +89,14 @@ impl<'a> RunSkills<'a> {
         );
         Ok(Self {
             available,
+            loaded: Vec::new(),
             advertised: vec![loader],
             handlers: BTreeMap::new(),
         })
+    }
+
+    pub(crate) fn loaded(&self) -> &[String] {
+        &self.loaded
     }
 
     pub(crate) fn can_call(&self, name: &str) -> bool {
@@ -121,15 +127,24 @@ impl<'a> RunSkills<'a> {
             .ok_or_else(|| {
                 ToolError::new("expected an object with a single string field `name`")
             })?;
+        self.activate(name)?;
+        Ok(json!({"loaded": name}))
+    }
+
+    pub(crate) fn activate(&mut self, name: &str) -> Result<(), ToolError> {
+        if name == "skills" || self.loaded.iter().any(|loaded| loaded == name) {
+            return Ok(());
+        }
         let tools = self
             .available
-            .get_mut(name)
+            .remove(name)
             .ok_or_else(|| ToolError::new(format!("skill {name} is unavailable to this agent")))?;
-        for (spec, tool) in tools.drain(..) {
+        for (spec, tool) in tools {
             self.handlers.insert(spec.name.clone(), tool);
             self.advertised.push(spec);
         }
-        Ok(json!({"loaded": name}))
+        self.loaded.push(name.to_owned());
+        Ok(())
     }
 }
 

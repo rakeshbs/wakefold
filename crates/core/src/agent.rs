@@ -1,4 +1,8 @@
-//! In-memory agent decisions and the driver that executes them.
+//! Agent decisions and the driver that executes or resumes a run.
+
+mod recovery;
+pub use recovery::RunCheckpoint;
+use recovery::{Boundary, JournalWriter};
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -10,8 +14,9 @@ use thiserror::Error;
 
 use crate::skill::RunSkills;
 use crate::{
-    CallId, CancellationToken, Message, ModelRequest, ModelTurn, Provider, ProviderError,
-    RetryPolicy, RunWorkspace, Skill, TokenUsage, ToolCall, ToolContext, ToolError, ToolResult,
+    CallId, CancellationToken, Message, ModelRequest, Provider, ProviderError, RetryPolicy,
+    RunEvent, RunJournal, RunWorkspace, Skill, TokenUsage, ToolCall, ToolContext, ToolError,
+    ToolResult,
 };
 
 /// Limits, retries, and cancellation for a single agent run.
@@ -86,7 +91,7 @@ impl RunOptions {
 }
 
 /// The provider-reported usage accumulated during a run.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RunUsage {
     /// Sum of counts reported by completed model turns.
@@ -137,6 +142,23 @@ pub struct RunReport {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunError {
+    /// The journal could not be read or advanced at the expected sequence.
+    #[error(transparent)]
+    Journal(#[from] crate::JournalError),
+
+    /// The recorded history is inconsistent with the requested run.
+    #[error("cannot resume run: {0}")]
+    InvalidJournal(&'static str),
+
+    /// Recovery found an application tool start without its committed result.
+    #[error("outcome of tool {name} (call {id}) is unknown")]
+    ToolOutcomeUnknown {
+        /// The interrupted call.
+        id: CallId,
+        /// The tool whose effects may have occurred.
+        name: String,
+    },
+
     /// The run was cancelled.
     #[error("agent run was cancelled")]
     Cancelled,
@@ -300,7 +322,64 @@ pub async fn run_streaming_with_options(
     provider: &dyn Provider,
     skills: &[Skill<'_>],
     options: RunOptions,
+    on_text: impl FnMut(&str) + Send,
+) -> Result<RunReport, RunError> {
+    drive(prompt.into(), provider, skills, options, on_text, None).await
+}
+
+impl RunJournal<'_> {
+    /// Start or resume this run with its persistent workspace and skill catalog.
+    ///
+    /// Supply the original prompt and skill definitions on restart. Turn limits
+    /// and usage apply to the entire run. A finished run returns its saved answer.
+    /// SQLite reads and writes are synchronous at step boundaries. A model request
+    /// interrupted before its response was committed may be sent again.
+    ///
+    /// ```no_run
+    /// # async fn example(provider: &dyn wakefold::Provider, skills: &[wakefold::Skill<'_>])
+    /// # -> Result<(), Box<dyn std::error::Error>> {
+    /// use wakefold::{RunOptions, WorkspaceStore};
+    ///
+    /// let mut store = WorkspaceStore::open("state")?;
+    /// let mut journal = store.open_journal("chat-7", "run-1")?;
+    /// let report = journal.run("Set a timer", provider, skills, RunOptions::new(6)).await?;
+    /// println!("{}", report.answer);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::ToolOutcomeUnknown`] if an application tool started
+    /// without a committed result. Other failures are reported as in [`run_with_options`].
+    pub async fn run(
+        &mut self,
+        prompt: impl Into<String> + Send,
+        provider: &dyn Provider,
+        skills: &[Skill<'_>],
+        options: RunOptions,
+    ) -> Result<RunReport, RunError> {
+        if options
+            .workspace
+            .as_ref()
+            .is_some_and(|other| other != &self.workspace)
+        {
+            return Err(RunError::InvalidJournal(
+                "workspace belongs to a different run",
+            ));
+        }
+        let options = options.with_workspace(self.workspace.clone());
+        drive(prompt.into(), provider, skills, options, |_| {}, Some(self)).await
+    }
+}
+
+async fn drive(
+    prompt: String,
+    provider: &dyn Provider,
+    skills: &[Skill<'_>],
+    options: RunOptions,
     mut on_text: impl FnMut(&str) + Send,
+    journal: Option<&mut RunJournal<'_>>,
 ) -> Result<RunReport, RunError> {
     let cancellation = options.cancellation.as_ref();
     check_cancelled(cancellation)?;
@@ -311,22 +390,24 @@ pub async fn run_streaming_with_options(
     };
 
     let mut skills = RunSkills::new(skills)?;
-    let mut messages = vec![Message::User(prompt.into())];
-    let mut assistant_context = Vec::new();
-    let mut used_call_ids = HashSet::new();
-    let mut remaining_turns = options.max_model_turns;
-    let mut usage = RunUsage::default();
+    let mut journal = JournalWriter::new(journal);
+    let (mut state, mut boundary) = journal.restore(prompt, &mut skills, &options)?;
     loop {
         check_cancelled(cancellation)?;
-        let action = next_action(&messages, remaining_turns).ok_or(RunError::TurnLimitReached {
+        let action = next_action(
+            &state.messages,
+            options.max_model_turns.saturating_sub(state.model_turns),
+        )
+        .ok_or(RunError::TurnLimitReached {
             limit: options.max_model_turns,
         })?;
         match action {
             Action::CallModel => {
-                usage.check_budget(options.token_budget)?;
-                if let Some(limit) = options.context_budget
+                state.usage.check_budget(options.token_budget)?;
+                if matches!(boundary, Boundary::Ready)
+                    && let Some(limit) = options.context_budget
                     && let Some(compaction) =
-                        crate::context::prepare(&messages, &assistant_context, limit)?
+                        crate::context::prepare(&state.messages, &state.assistant_context, limit)?
                 {
                     let summary = crate::retry::complete_turn(
                         provider,
@@ -336,45 +417,41 @@ pub async fn run_streaming_with_options(
                         cancellation,
                     )
                     .await?;
-                    usage.record(summary.usage)?;
-                    usage.check_budget(options.token_budget)?;
-                    compaction.apply(summary.response, &mut messages, &mut assistant_context)?;
+                    state.usage.record(summary.usage)?;
+                    compaction.apply(
+                        summary.response,
+                        &mut state.messages,
+                        &mut state.assistant_context,
+                    )?;
+                    journal
+                        .record(|| [RunEvent::Compacted(RunCheckpoint::new(&state, &skills))])?;
+                    state.usage.check_budget(options.token_budget)?;
                 }
-                let ModelTurn {
-                    response,
-                    usage: turn_usage,
-                    context,
-                } = crate::retry::complete_turn(
+                if !matches!(boundary, Boundary::ModelRequested) {
+                    journal.record(|| [RunEvent::ModelCallRequested])?;
+                }
+                let turn = crate::retry::complete_turn(
                     provider,
                     ModelRequest {
-                        messages: &messages,
+                        messages: &state.messages,
                         tools: &skills.advertised,
-                        assistant_context: &assistant_context,
+                        assistant_context: &state.assistant_context,
                     },
                     &mut emit_text,
                     options.retry_policy,
                     cancellation,
                 )
                 .await?;
-                if let crate::ModelResponse::ToolCalls { text, calls } = &response
-                    && calls.is_empty()
-                    && text.as_deref().is_none_or(str::is_empty)
-                {
-                    return Err(ProviderError::new(
-                        "provider returned neither tool calls nor text",
-                    )
-                    .into());
-                }
-                usage.record(turn_usage)?;
-                remaining_turns -= 1;
-                if remaining_turns > 0 && !response.tool_calls().is_empty() {
-                    usage.check_budget(options.token_budget)?;
-                    validate_calls(response.tool_calls(), &mut used_call_ids, &skills)?;
-                }
-                messages.push(Message::Assistant(response));
-                assistant_context.push(context);
+                journal.record(|| [RunEvent::ModelCallCompleted(turn.clone())])?;
+                state.complete_turn(turn, &skills, &options)?;
+                boundary = Boundary::Ready;
             }
             Action::RunTool(call) => {
+                state.usage.check_budget(options.token_budget)?;
+                if !matches!(boundary, Boundary::ToolStarted(_)) {
+                    journal.record(|| [RunEvent::ToolCallStarted(call.clone())])?;
+                }
+                let loaded_before = skills.loaded().len();
                 let context = ToolContext::new(cancellation.cloned(), options.workspace.clone());
                 let value = await_cancellable(skills.call(call, context), cancellation)
                     .await?
@@ -383,12 +460,26 @@ pub async fn run_streaming_with_options(
                         source,
                     })?;
                 let result = ToolResult::new(call.id.clone(), value);
-                messages.push(Message::Tool(result));
+                if let Some(name) = skills.loaded().get(loaded_before) {
+                    journal.record(|| {
+                        [
+                            RunEvent::SkillLoaded(name.clone()),
+                            RunEvent::ToolCallCompleted(result.clone()),
+                        ]
+                    })?;
+                } else {
+                    journal.record(|| [RunEvent::ToolCallCompleted(result.clone())])?;
+                }
+                state.messages.push(Message::Tool(result));
+                boundary = Boundary::Ready;
             }
             Action::Finish(answer) => {
+                if !matches!(boundary, Boundary::Finished) {
+                    journal.record(|| [RunEvent::RunFinished(answer.to_owned())])?;
+                }
                 return Ok(RunReport {
                     answer: answer.to_owned(),
-                    usage,
+                    usage: state.usage,
                 });
             }
         }

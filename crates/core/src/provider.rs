@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::{JsonValue, ToolCall, ToolResult, ToolSpec};
 
 /// A completed message in the agent's transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
     /// A user message, including the prompt that starts the run.
