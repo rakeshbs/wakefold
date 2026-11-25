@@ -336,3 +336,80 @@ fn resumes_a_saved_tool_request_from_an_earlier_journal_without_a_checkpoint() {
     .unwrap();
     assert_eq!(report.answer, "saved");
 }
+
+#[test]
+fn concurrent_driver_is_excluded_until_the_owner_dies() {
+    const CHILD: &str = "WAKEFOLD_RUN_OWNER_TEST";
+    struct HoldAtModel<'a>(&'a Path);
+    #[async_trait]
+    impl Provider for HoldAtModel<'_> {
+        async fn complete(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+            fs::write(self.0.join("waiting"), b"").unwrap();
+            // Bound the lifetime even if the parent test fails.
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            panic!("parent did not terminate the test worker")
+        }
+    }
+    struct Answer;
+    #[async_trait]
+    impl Provider for Answer {
+        async fn complete(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+            Ok(ModelResponse::Final("done".into()))
+        }
+    }
+
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let path = Path::new(&dir);
+        let mut store = WorkspaceStore::open(path).unwrap();
+        let mut journal = store.open_journal("chat", "one").unwrap();
+        block_on(journal.run(PROMPT, &HoldAtModel(path), &[], RunOptions::new(1))).unwrap();
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut owner = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "concurrent_driver_is_excluded_until_the_owner_dies",
+        ])
+        .env(CHILD, dir.path())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while !dir.path().join("waiting").exists() {
+        assert!(
+            start.elapsed().as_secs() < 10,
+            "child did not enter its provider"
+        );
+        assert!(owner.try_wait().unwrap().is_none(), "child exited early");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let mut store = WorkspaceStore::open(dir.path()).unwrap();
+    let mut competing = store.open_journal("chat", "one").unwrap();
+    let result = block_on(competing.run(PROMPT, &NoCalls, &[], RunOptions::new(1)));
+    let other = block_on(store.open_journal("chat", "two").unwrap().run(
+        PROMPT,
+        &Answer,
+        &[],
+        RunOptions::new(1),
+    ));
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(RunError::Journal(
+                wakefold::JournalError::AlreadyRunning { .. }
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(other.unwrap().answer, "done");
+    let mut recovered = store.open_journal("chat", "one").unwrap();
+    assert_eq!(
+        block_on(recovered.run(PROMPT, &Answer, &[], RunOptions::new(1)))
+            .unwrap()
+            .answer,
+        "done"
+    );
+}

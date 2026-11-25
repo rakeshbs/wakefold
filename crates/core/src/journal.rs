@@ -1,5 +1,10 @@
 //! Ordered, append-only storage for agent run transitions.
 
+use std::{
+    fs::{File, TryLockError},
+    path::PathBuf,
+};
+
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -60,6 +65,15 @@ pub enum JournalError {
         /// Last committed sequence, or zero for an empty journal.
         actual: u64,
     },
+    /// A live driver already owns this run.
+    #[error("run {agent_id} is already active")]
+    AlreadyRunning {
+        /// The stable agent ID of the active run.
+        agent_id: i64,
+    },
+    /// The operating system could not open or lock the run's lock file.
+    #[error("run lock: {0}")]
+    Lock(#[from] std::io::Error),
     /// SQLite could not complete the operation.
     #[error("run journal database: {0}")]
     Database(#[from] rusqlite::Error),
@@ -73,13 +87,37 @@ pub enum JournalError {
 pub struct RunJournal<'a> {
     connection: &'a mut Connection,
     pub(crate) workspace: RunWorkspace,
+    lock_path: PathBuf,
 }
 
 impl<'a> RunJournal<'a> {
-    pub(crate) fn new(connection: &'a mut Connection, workspace: RunWorkspace) -> Self {
+    pub(crate) fn new(
+        connection: &'a mut Connection,
+        workspace: RunWorkspace,
+        lock_path: PathBuf,
+    ) -> Self {
         Self {
             connection,
             workspace,
+            lock_path,
+        }
+    }
+
+    pub(crate) fn lock_driver(&self) -> Result<File, JournalError> {
+        // Keep a stable inode across runs. The OS releases its lock when the
+        // driver drops this descriptor or the owning process exits.
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lock_path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => Err(JournalError::AlreadyRunning {
+                agent_id: self.workspace.agent_id(),
+            }),
+            Err(TryLockError::Error(e)) => Err(e.into()),
         }
     }
 

@@ -350,7 +350,8 @@ impl RunJournal<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::ToolOutcomeUnknown`] if an application tool started
+    /// A concurrent driver receives [`crate::JournalError::AlreadyRunning`] inside
+    /// [`RunError::Journal`]. Returns [`RunError::ToolOutcomeUnknown`] if an application tool started
     /// without a committed result. Other failures are reported as in [`run_with_options`].
     pub async fn run(
         &mut self,
@@ -368,6 +369,7 @@ impl RunJournal<'_> {
                 "workspace belongs to a different run",
             ));
         }
+        let _driver_lock = self.lock_driver()?;
         let options = options.with_workspace(self.workspace.clone());
         drive(prompt.into(), provider, skills, options, |_| {}, Some(self)).await
     }

@@ -46,7 +46,7 @@ impl RunWorkspace {
 #[derive(Debug)]
 pub struct WorkspaceStore {
     connection: Connection,
-    directories: PathBuf,
+    state: PathBuf,
 }
 
 impl WorkspaceStore {
@@ -92,10 +92,7 @@ impl WorkspaceStore {
              );",
         )?;
         connection.execute_batch(crate::journal::SCHEMA)?;
-        Ok(Self {
-            connection,
-            directories: state.join("workspaces"),
-        })
+        Ok(Self { connection, state })
     }
 
     /// Open the journal for a chat and run, creating their metadata on first use.
@@ -109,7 +106,10 @@ impl WorkspaceStore {
         run_key: &str,
     ) -> Result<crate::RunJournal<'_>, WorkspaceError> {
         let run = self.open_run(chat_key, run_key)?;
-        Ok(crate::RunJournal::new(&mut self.connection, run))
+        let locks = self.state.join("run-locks");
+        fs::create_dir_all(&locks)?;
+        let lock_path = locks.join(run.agent_id().to_string());
+        Ok(crate::RunJournal::new(&mut self.connection, run, lock_path))
     }
 
     /// Open a new or existing run using the caller's stable chat and run keys.
@@ -153,7 +153,7 @@ impl WorkspaceStore {
         // initialization can then finish without reassigning the directory.
         tx.commit()?;
         let workspace = RunWorkspace {
-            root: self.directories.join(workspace_id.to_string()),
+            root: self.state.join("workspaces").join(workspace_id.to_string()),
             agent_id,
         };
         fs::create_dir_all(workspace.root.join(workspace.agent_directory()))?;
