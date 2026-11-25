@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{CancellationToken, JsonValue, RunWorkspace};
 
 /// Identifies a model-requested tool call within a run.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallId(String);
 
 impl CallId {
@@ -63,7 +63,7 @@ impl ToolSpec {
 }
 
 /// A request from the model to invoke a named tool.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ToolCall {
     /// Identifier assigned by the provider.
@@ -86,7 +86,7 @@ impl ToolCall {
 }
 
 /// The output of a tool call and the ID it answers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ToolResult {
     /// ID copied from the original call.

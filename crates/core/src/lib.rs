@@ -2,6 +2,7 @@
 
 mod agent;
 mod context;
+mod journal;
 mod provider;
 mod providers;
 mod retry;
@@ -22,6 +23,7 @@ pub use agent::{
     RunError, RunOptions, RunReport, RunUsage, run, run_streaming, run_streaming_with_options,
     run_with_options,
 };
+pub use journal::{JournalEntry, JournalError, RunEvent, RunJournal};
 pub use provider::{
     Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError, TokenUsage,
 };

@@ -23,7 +23,7 @@ pub enum Message {
 }
 
 /// A completed model turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ModelResponse {
     /// The final answer to the user.
@@ -66,7 +66,7 @@ impl ModelResponse {
 }
 
 /// Model input and output token counts reported by a provider.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TokenUsage {
     /// Tokens in requests sent to the model.
@@ -98,7 +98,7 @@ impl TokenUsage {
 }
 
 /// The response and optional token counts for a completed model turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ModelTurn {
     /// The completed response used to advance the agent.

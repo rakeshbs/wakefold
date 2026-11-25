@@ -90,10 +90,25 @@ impl WorkspaceStore {
                  UNIQUE(workspace_id, run_key)
              );",
         )?;
+        connection.execute_batch(crate::journal::SCHEMA)?;
         Ok(Self {
             connection,
             directories: state.join("workspaces"),
         })
+    }
+
+    /// Open the journal for a chat and run, creating their metadata on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workspace error if the run cannot be opened.
+    pub fn open_journal(
+        &mut self,
+        chat_key: &str,
+        run_key: &str,
+    ) -> Result<crate::RunJournal<'_>, WorkspaceError> {
+        let run = self.open_run(chat_key, run_key)?;
+        Ok(crate::RunJournal::new(&mut self.connection, run.agent_id()))
     }
 
     /// Open a new or existing run using the caller's stable chat and run keys.

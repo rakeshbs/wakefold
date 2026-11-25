@@ -6,8 +6,8 @@ license.workspace = true
 
 [features]
 default = ["derive"]
-derive = ["dep:schemars", "dep:serde", "dep:wakefold-macros"]
-openai = ["dep:async-openai", "dep:httpdate", "dep:reqwest", "dep:serde", "dep:tower"]
+derive = ["dep:schemars", "dep:wakefold-macros"]
+openai = ["dep:async-openai", "dep:httpdate", "dep:reqwest", "dep:tower"]
 test-util = []
 
 [dependencies]
@@ -17,10 +17,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
 httpdate = { version = "1", optional = true }
 rand = "0.10"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled", "fallible_uint"] }
 reqwest = { version = "0.13", default-features = false, optional = true }
 schemars = { version = "1", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio-util = "0.7"
