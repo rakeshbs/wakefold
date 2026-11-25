@@ -1,4 +1,5 @@
 # Wakefold repository guidance
 
 Follow the [commit message convention](CONTRIBUTING.md#commit-messages).
-After each completed change, check the Git diff and report whether the change is ready to commit.
+After each atomic implementation, verify the change, review the staged diff,
+and commit it before starting the next implementation.
