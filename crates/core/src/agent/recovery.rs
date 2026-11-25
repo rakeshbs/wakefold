@@ -1,10 +1,11 @@
-//! Rebuild the driver state from committed transitions before executing new work.
+//! Apply run events and resume execution from the latest journal checkpoint.
 
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
 use super::{Action, RunError, RunOptions, RunUsage, next_action, validate_calls};
+use crate::context::Compaction;
 use crate::skill::{LOADER, RunSkills};
 use crate::{CallId, JsonValue, Message, ModelTurn, RunEvent, RunJournal, ToolCall};
 
@@ -15,16 +16,7 @@ pub struct RunCheckpoint {
     loaded_skills: Vec<String>,
 }
 
-impl RunCheckpoint {
-    pub(super) fn new(state: &RunState, skills: &RunSkills<'_>) -> Self {
-        Self {
-            state: state.clone(),
-            loaded_skills: skills.loaded().to_vec(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct RunState {
     pub messages: Vec<Message>,
     pub assistant_context: Vec<Option<JsonValue>>,
@@ -34,17 +26,7 @@ pub(super) struct RunState {
 }
 
 impl RunState {
-    fn new(prompt: String) -> Self {
-        Self {
-            messages: vec![Message::User(prompt)],
-            assistant_context: Vec::new(),
-            used_call_ids: HashSet::new(),
-            model_turns: 0,
-            usage: RunUsage::default(),
-        }
-    }
-
-    pub fn complete_turn(
+    fn complete_turn(
         &mut self,
         turn: ModelTurn,
         skills: &RunSkills<'_>,
@@ -71,117 +53,63 @@ impl RunState {
     }
 }
 
-#[derive(Default)]
 pub(super) enum Boundary {
-    #[default]
     Ready,
     ModelRequested,
     ToolStarted(ToolCall),
-    Finished,
+    Finished(String),
 }
 
-/// Writes transitions against the last sequence observed by this driver.
-pub(super) struct JournalWriter<'a, 'db> {
+/// Fresh and resumed runs advance through the same event transitions.
+pub(super) struct Driver<'a, 'db, 'skills> {
     journal: Option<&'a mut RunJournal<'db>>,
     tail: u64,
+    options: &'a RunOptions,
+    pub state: RunState,
+    pub skills: RunSkills<'skills>,
+    pub boundary: Boundary,
 }
 
-impl<'a, 'db> JournalWriter<'a, 'db> {
-    pub fn new(journal: Option<&'a mut RunJournal<'db>>) -> Self {
-        Self { journal, tail: 0 }
-    }
-
-    pub fn record<const N: usize>(
-        &mut self,
-        events: impl FnOnce() -> [RunEvent; N],
-    ) -> Result<(), RunError> {
-        if let Some(journal) = &mut self.journal {
-            self.tail = journal.append(self.tail, &events())?;
-        }
-        Ok(())
-    }
-
-    pub fn restore(
-        &mut self,
+impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
+    pub fn open(
         prompt: String,
-        skills: &mut RunSkills<'_>,
-        options: &RunOptions,
-    ) -> Result<(RunState, Boundary), RunError> {
-        let mut boundary = Boundary::Ready;
-        let Some(journal) = &mut self.journal else {
-            return Ok((RunState::new(prompt), boundary));
+        mut journal: Option<&'a mut RunJournal<'db>>,
+        skills: RunSkills<'skills>,
+        options: &'a RunOptions,
+    ) -> Result<Self, RunError> {
+        let entries = match &mut journal {
+            Some(journal) => journal.recovery_entries()?,
+            None => Vec::new(),
         };
-        let mut entries = journal.recovery_entries()?.into_iter();
-        let Some(first) = entries.next() else {
-            self.record(|| [RunEvent::RunStarted(prompt.clone())])?;
-            return Ok((RunState::new(prompt), boundary));
+        let mut run = Self {
+            journal,
+            tail: 0,
+            options,
+            state: RunState::default(),
+            skills,
+            boundary: Boundary::Ready,
         };
-        self.tail = first.sequence;
-        let mut state = match first.event {
-            RunEvent::RunStarted(original) if original == prompt => RunState::new(prompt),
-            RunEvent::Compacted(snapshot) if matches!(snapshot.state.messages.first(), Some(Message::User(original)) if original == &prompt) =>
-            {
-                for name in snapshot.loaded_skills {
-                    restore_skill(skills, &name)?;
-                }
-                snapshot.state
+        let Some(first) = entries.first() else {
+            run.commit([RunEvent::RunStarted(prompt)])?;
+            return Ok(run);
+        };
+        let matches_prompt = match &first.event {
+            RunEvent::RunStarted(original) => original == &prompt,
+            RunEvent::Compacted(snapshot) => {
+                matches!(snapshot.state.messages.first(), Some(Message::User(original)) if original == &prompt)
             }
-            _ => {
-                return Err(RunError::InvalidJournal(
-                    "initial prompt or checkpoint does not match",
-                ));
-            }
+            _ => false,
         };
-
-        for entry in entries {
-            self.tail = entry.sequence;
-            let action = next_action(&state.messages, usize::MAX);
-            boundary = match (&boundary, action, entry.event) {
-                (Boundary::Ready, Some(Action::CallModel), RunEvent::ModelCallRequested) => {
-                    Boundary::ModelRequested
-                }
-                (Boundary::ModelRequested, _, RunEvent::ModelCallCompleted(turn)) => {
-                    state.complete_turn(turn, skills, options)?;
-                    Boundary::Ready
-                }
-                (
-                    Boundary::Ready,
-                    Some(Action::RunTool(expected)),
-                    RunEvent::ToolCallStarted(call),
-                ) if expected == &call => Boundary::ToolStarted(call),
-                (Boundary::ToolStarted(call), _, RunEvent::SkillLoaded(name))
-                    if call.name == LOADER && call.arguments["name"].as_str() == Some(&name) =>
-                {
-                    restore_skill(skills, &name)?;
-                    continue;
-                }
-                (Boundary::ToolStarted(call), _, RunEvent::ToolCallCompleted(result))
-                    if call.id == result.call_id =>
-                {
-                    // Earlier journals could contain a completed loader call without
-                    // a separate activation event. Its successful result names the skill.
-                    if call.name == LOADER {
-                        let name = call.arguments["name"]
-                            .as_str()
-                            .filter(|name| result.value["loaded"].as_str() == Some(*name))
-                            .ok_or(RunError::InvalidJournal(
-                                "loader result does not match its call",
-                            ))?;
-                        restore_skill(skills, name)?;
-                    }
-                    state.messages.push(Message::Tool(result));
-                    Boundary::Ready
-                }
-                (
-                    Boundary::Ready,
-                    Some(Action::Finish(expected)),
-                    RunEvent::RunFinished(answer),
-                ) if expected == answer => Boundary::Finished,
-                _ => return Err(RunError::InvalidJournal("unexpected event at run boundary")),
-            };
+        if !matches_prompt {
+            return Err(RunError::InvalidJournal(
+                "initial prompt or checkpoint does not match",
+            ));
         }
-
-        if let Boundary::ToolStarted(call) = &boundary
+        for entry in entries {
+            run.apply(entry.event)?;
+            run.tail = entry.sequence;
+        }
+        if let Boundary::ToolStarted(call) = &run.boundary
             && call.name != LOADER
         {
             return Err(RunError::ToolOutcomeUnknown {
@@ -189,11 +117,99 @@ impl<'a, 'db> JournalWriter<'a, 'db> {
                 name: call.name.clone(),
             });
         }
-        Ok((state, boundary))
+        Ok(run)
+    }
+
+    pub fn compact(
+        &mut self,
+        compaction: Compaction<'_>,
+        summary: ModelTurn,
+    ) -> Result<(), RunError> {
+        // Move the transcript into the checkpoint so compaction needs no second copy.
+        let mut state = std::mem::take(&mut self.state);
+        state.usage.record(summary.usage)?;
+        compaction.apply(
+            summary.response,
+            &mut state.messages,
+            &mut state.assistant_context,
+        )?;
+        self.commit([RunEvent::Compacted(RunCheckpoint {
+            state,
+            loaded_skills: self.skills.loaded().to_vec(),
+        })])
+    }
+
+    pub fn commit(
+        &mut self,
+        events: impl AsRef<[RunEvent]> + IntoIterator<Item = RunEvent>,
+    ) -> Result<(), RunError> {
+        if let Some(journal) = &mut self.journal {
+            self.tail = journal.append(self.tail, events.as_ref())?;
+        }
+        for event in events {
+            self.apply(event)?;
+        }
+        Ok(())
+    }
+
+    fn apply(&mut self, event: RunEvent) -> Result<(), RunError> {
+        let action = || next_action(&self.state.messages, usize::MAX);
+        self.boundary = match (&self.boundary, event) {
+            (Boundary::Ready, RunEvent::RunStarted(prompt)) if self.state.messages.is_empty() => {
+                self.state.messages.push(Message::User(prompt));
+                Boundary::Ready
+            }
+            (Boundary::Ready, RunEvent::Compacted(snapshot)) => {
+                for name in snapshot.loaded_skills {
+                    activate_skill(&mut self.skills, &name)?;
+                }
+                self.state = snapshot.state;
+                Boundary::Ready
+            }
+            (Boundary::Ready, RunEvent::ModelCallRequested)
+                if matches!(action(), Some(Action::CallModel)) =>
+            {
+                Boundary::ModelRequested
+            }
+            (Boundary::ModelRequested, RunEvent::ModelCallCompleted(turn)) => {
+                self.state.complete_turn(turn, &self.skills, self.options)?;
+                Boundary::Ready
+            }
+            (Boundary::Ready, RunEvent::ToolCallStarted(call)) if matches!(action(), Some(Action::RunTool(expected)) if expected == &call) => {
+                Boundary::ToolStarted(call)
+            }
+            (Boundary::ToolStarted(call), RunEvent::SkillLoaded(name))
+                if call.name == LOADER && call.arguments["name"].as_str() == Some(&name) =>
+            {
+                activate_skill(&mut self.skills, &name)?;
+                return Ok(());
+            }
+            (Boundary::ToolStarted(call), RunEvent::ToolCallCompleted(result))
+                if call.id == result.call_id =>
+            {
+                // Earlier journals recorded successful loader calls without a SkillLoaded event.
+                if call.name == LOADER {
+                    let name = call.arguments["name"]
+                        .as_str()
+                        .filter(|name| result.value["loaded"].as_str() == Some(*name))
+                        .ok_or(RunError::InvalidJournal(
+                            "loader result does not match its call",
+                        ))?;
+                    activate_skill(&mut self.skills, name)?;
+                }
+                self.state.messages.push(Message::Tool(result));
+                Boundary::Ready
+            }
+            (Boundary::Ready, RunEvent::RunFinished(answer)) if matches!(action(), Some(Action::Finish(expected)) if expected == answer) => {
+                Boundary::Finished(answer)
+            }
+            _ => return Err(RunError::InvalidJournal("unexpected event at run boundary")),
+        };
+        Ok(())
     }
 }
 
-fn restore_skill(skills: &mut RunSkills<'_>, name: &str) -> Result<(), RunError> {
+fn activate_skill(skills: &mut RunSkills<'_>, name: &str) -> Result<(), RunError> {
     skills.activate(name).map_err(|source| RunError::Tool {
         name: LOADER.to_owned(),
         source,

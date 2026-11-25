@@ -5,7 +5,9 @@ use std::fmt::{self, Write};
 
 use serde_json::json;
 
-use crate::{JsonValue, RunError, Tool, ToolCall, ToolContext, ToolError, ToolSpec};
+use crate::{
+    JsonValue, RunError, RunEvent, Tool, ToolCall, ToolContext, ToolError, ToolResult, ToolSpec,
+};
 
 /// A named group of tools the agent can load together.
 ///
@@ -104,41 +106,46 @@ impl<'a> RunSkills<'a> {
     }
 
     pub(crate) async fn call(
-        &mut self,
+        &self,
         call: &ToolCall,
         context: ToolContext,
-    ) -> Result<JsonValue, ToolError> {
-        if call.name == LOADER {
-            return self.load(&call.arguments);
-        }
-        let handler = self
-            .handlers
-            .get(&call.name)
-            .expect("tool names are validated before dispatch");
-        handler.call_with_context(context, &call.arguments).await
+    ) -> Result<Vec<RunEvent>, ToolError> {
+        let mut events = Vec::new();
+        let value = if call.name == LOADER {
+            let name = load_name(&call.arguments)?;
+            if !self.is_loaded(name) {
+                if !self.available.contains_key(name) {
+                    return Err(unavailable(name));
+                }
+                events.push(RunEvent::SkillLoaded(name.to_owned()));
+            }
+            json!({"loaded": name})
+        } else {
+            let handler = self
+                .handlers
+                .get(&call.name)
+                .expect("tool names are validated before dispatch");
+            handler.call_with_context(context, &call.arguments).await?
+        };
+        events.push(RunEvent::ToolCallCompleted(ToolResult::new(
+            call.id.clone(),
+            value,
+        )));
+        Ok(events)
     }
 
-    fn load(&mut self, arguments: &JsonValue) -> Result<JsonValue, ToolError> {
-        let name = arguments
-            .as_object()
-            .filter(|fields| fields.len() == 1)
-            .and_then(|fields| fields.get("name"))
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| {
-                ToolError::new("expected an object with a single string field `name`")
-            })?;
-        self.activate(name)?;
-        Ok(json!({"loaded": name}))
+    fn is_loaded(&self, name: &str) -> bool {
+        name == "skills" || self.loaded.iter().any(|loaded| loaded == name)
     }
 
     pub(crate) fn activate(&mut self, name: &str) -> Result<(), ToolError> {
-        if name == "skills" || self.loaded.iter().any(|loaded| loaded == name) {
+        if self.is_loaded(name) {
             return Ok(());
         }
         let tools = self
             .available
             .remove(name)
-            .ok_or_else(|| ToolError::new(format!("skill {name} is unavailable to this agent")))?;
+            .ok_or_else(|| unavailable(name))?;
         for (spec, tool) in tools {
             self.handlers.insert(spec.name.clone(), tool);
             self.advertised.push(spec);
@@ -146,6 +153,19 @@ impl<'a> RunSkills<'a> {
         self.loaded.push(name.to_owned());
         Ok(())
     }
+}
+
+fn load_name(arguments: &JsonValue) -> Result<&str, ToolError> {
+    arguments
+        .as_object()
+        .filter(|fields| fields.len() == 1)
+        .and_then(|fields| fields.get("name"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| ToolError::new("expected an object with a single string field `name`"))
+}
+
+fn unavailable(name: &str) -> ToolError {
+    ToolError::new(format!("skill {name} is unavailable to this agent"))
 }
 
 fn validate_name(name: &str) -> Result<(), RunError> {

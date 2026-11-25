@@ -2,7 +2,7 @@
 
 mod recovery;
 pub use recovery::RunCheckpoint;
-use recovery::{Boundary, JournalWriter};
+use recovery::{Boundary, Driver};
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -16,7 +16,6 @@ use crate::skill::RunSkills;
 use crate::{
     CallId, CancellationToken, Message, ModelRequest, Provider, ProviderError, RetryPolicy,
     RunEvent, RunJournal, RunWorkspace, Skill, TokenUsage, ToolCall, ToolContext, ToolError,
-    ToolResult,
 };
 
 /// Limits, retries, and cancellation for a single agent run.
@@ -391,26 +390,35 @@ async fn drive(
         }
     };
 
-    let mut skills = RunSkills::new(skills)?;
-    let mut journal = JournalWriter::new(journal);
-    let (mut state, mut boundary) = journal.restore(prompt, &mut skills, &options)?;
+    let mut run = Driver::open(prompt, journal, RunSkills::new(skills)?, &options)?;
     let mut context_sizes = crate::context::ContextSizes::default();
     loop {
         check_cancelled(cancellation)?;
+        if let Boundary::Finished(answer) = run.boundary {
+            return Ok(RunReport {
+                answer,
+                usage: run.state.usage,
+            });
+        }
         let action = next_action(
-            &state.messages,
-            options.max_model_turns.saturating_sub(state.model_turns),
+            &run.state.messages,
+            options
+                .max_model_turns
+                .saturating_sub(run.state.model_turns),
         )
         .ok_or(RunError::TurnLimitReached {
             limit: options.max_model_turns,
         })?;
         match action {
             Action::CallModel => {
-                state.usage.check_budget(options.token_budget)?;
-                if matches!(boundary, Boundary::Ready)
+                run.state.usage.check_budget(options.token_budget)?;
+                if matches!(run.boundary, Boundary::Ready)
                     && let Some(limit) = options.context_budget
-                    && let Some(compaction) =
-                        context_sizes.prepare(&state.messages, &state.assistant_context, limit)?
+                    && let Some(compaction) = context_sizes.prepare(
+                        &run.state.messages,
+                        &run.state.assistant_context,
+                        limit,
+                    )?
                 {
                     let summary = crate::retry::complete_turn(
                         provider,
@@ -420,71 +428,42 @@ async fn drive(
                         cancellation,
                     )
                     .await?;
-                    state.usage.record(summary.usage)?;
-                    compaction.apply(
-                        summary.response,
-                        &mut state.messages,
-                        &mut state.assistant_context,
-                    )?;
-                    journal
-                        .record(|| [RunEvent::Compacted(RunCheckpoint::new(&state, &skills))])?;
-                    state.usage.check_budget(options.token_budget)?;
+                    run.compact(compaction, summary)?;
+                    run.state.usage.check_budget(options.token_budget)?;
                 }
-                if !matches!(boundary, Boundary::ModelRequested) {
-                    journal.record(|| [RunEvent::ModelCallRequested])?;
+                if !matches!(run.boundary, Boundary::ModelRequested) {
+                    run.commit([RunEvent::ModelCallRequested])?;
                 }
                 let turn = crate::retry::complete_turn(
                     provider,
                     ModelRequest {
-                        messages: &state.messages,
-                        tools: &skills.advertised,
-                        assistant_context: &state.assistant_context,
+                        messages: &run.state.messages,
+                        tools: &run.skills.advertised,
+                        assistant_context: &run.state.assistant_context,
                     },
                     &mut emit_text,
                     options.retry_policy,
                     cancellation,
                 )
                 .await?;
-                journal.record(|| [RunEvent::ModelCallCompleted(turn.clone())])?;
-                state.complete_turn(turn, &skills, &options)?;
-                boundary = Boundary::Ready;
+                run.commit([RunEvent::ModelCallCompleted(turn)])?;
             }
             Action::RunTool(call) => {
-                state.usage.check_budget(options.token_budget)?;
-                if !matches!(boundary, Boundary::ToolStarted(_)) {
-                    journal.record(|| [RunEvent::ToolCallStarted(call.clone())])?;
+                run.state.usage.check_budget(options.token_budget)?;
+                if matches!(run.boundary, Boundary::Ready) {
+                    run.commit([RunEvent::ToolCallStarted(call.clone())])?;
+                    continue;
                 }
-                let loaded_before = skills.loaded().len();
                 let context = ToolContext::new(cancellation.cloned(), options.workspace.clone());
-                let value = await_cancellable(skills.call(call, context), cancellation)
+                let events = await_cancellable(run.skills.call(call, context), cancellation)
                     .await?
                     .map_err(|source| RunError::Tool {
                         name: call.name.clone(),
                         source,
                     })?;
-                let result = ToolResult::new(call.id.clone(), value);
-                if let Some(name) = skills.loaded().get(loaded_before) {
-                    journal.record(|| {
-                        [
-                            RunEvent::SkillLoaded(name.clone()),
-                            RunEvent::ToolCallCompleted(result.clone()),
-                        ]
-                    })?;
-                } else {
-                    journal.record(|| [RunEvent::ToolCallCompleted(result.clone())])?;
-                }
-                state.messages.push(Message::Tool(result));
-                boundary = Boundary::Ready;
+                run.commit(events)?;
             }
-            Action::Finish(answer) => {
-                if !matches!(boundary, Boundary::Finished) {
-                    journal.record(|| [RunEvent::RunFinished(answer.to_owned())])?;
-                }
-                return Ok(RunReport {
-                    answer: answer.to_owned(),
-                    usage: state.usage,
-                });
-            }
+            Action::Finish(answer) => run.commit([RunEvent::RunFinished(answer.to_owned())])?,
         }
     }
 }
