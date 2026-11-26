@@ -50,6 +50,10 @@ pub(crate) fn record_transition(
             if inserted == 0 {
                 return Err(JournalError::InvalidWait("run already has a pending wait"));
             }
+            crate::delegation::clear_start(tx, agent_id)?;
+            if let WaitOn::Delegation { worker, prompt } = &wait.on {
+                crate::delegation::start_worker(tx, agent_id, &wait.id, worker, prompt)?;
+            }
         }
         RunEvent::Woken { wait_id, .. } => {
             let updated = tx.execute(
@@ -61,8 +65,9 @@ pub(crate) fn record_transition(
                 return Err(JournalError::InvalidWait("no matching pending wait"));
             }
         }
-        RunEvent::RunFinished(_) => {
+        RunEvent::RunFinished(answer) => {
             tx.execute("DELETE FROM run_waits WHERE agent_id = ?1", [agent_id])?;
+            crate::delegation::finish_worker(tx, agent_id, answer)?;
         }
         _ => {}
     }

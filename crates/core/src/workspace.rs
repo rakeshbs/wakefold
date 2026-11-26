@@ -93,6 +93,7 @@ impl WorkspaceStore {
         )?;
         connection.execute_batch(crate::journal::SCHEMA)?;
         connection.execute_batch(crate::wait::SCHEMA)?;
+        connection.execute_batch(crate::delegation::SCHEMA)?;
         Ok(Self { connection, state })
     }
 

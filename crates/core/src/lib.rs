@@ -2,6 +2,7 @@
 
 mod agent;
 mod context;
+mod delegation;
 mod journal;
 mod provider;
 mod providers;
@@ -25,6 +26,7 @@ pub use agent::{
     RunCheckpoint, RunError, RunOptions, RunOutcome, RunReport, RunUsage, run, run_streaming,
     run_streaming_with_options, run_with_options,
 };
+pub use delegation::{DelegateTool, DelegatedRun};
 pub use journal::{JournalEntry, JournalError, RunEvent, RunJournal};
 pub use provider::{
     Message, ModelRequest, ModelResponse, ModelToolSpec, ModelTurn, Provider, ProviderError,

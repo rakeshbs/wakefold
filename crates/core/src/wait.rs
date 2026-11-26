@@ -26,6 +26,13 @@ pub enum WaitOn {
     Webhook,
     /// Resume with a human decision delivered by the host.
     Approval,
+    /// Start a worker in this chat and resume with its saved answer.
+    Delegation {
+        /// Worker name registered by the host.
+        worker: String,
+        /// Task prompt sent to the worker.
+        prompt: String,
+    },
 }
 
 impl WaitOn {
@@ -35,6 +42,7 @@ impl WaitOn {
             Self::Message => "message",
             Self::Webhook => "webhook",
             Self::Approval => "approval",
+            Self::Delegation { .. } => "delegation",
         }
     }
 }

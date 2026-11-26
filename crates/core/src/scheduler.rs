@@ -16,15 +16,15 @@ use thiserror::Error;
 
 use crate::wait::current_millis;
 use crate::{
-    CancellationToken, JournalError, Provider, RunError, RunOptions, RunOutcome, Skill,
-    WorkspaceError, WorkspaceStore,
+    CancellationToken, DelegatedRun, JournalError, Provider, RunError, RunOptions, RunOutcome,
+    Skill, WorkspaceError, WorkspaceStore,
 };
 
 // Independent store handles and wall-clock adjustments can change the next wake time.
 const MAX_IDLE_DELAY: Duration = Duration::from_millis(250);
 const MIN_IDLE_DELAY: Duration = Duration::from_millis(1);
 
-/// Identity of a durable run whose wait has resolved.
+/// Identity of a durable run ready to start or resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ScheduledRun {
@@ -34,6 +34,8 @@ pub struct ScheduledRun {
     pub chat_key: String,
     /// Run key used to open the journal.
     pub run_key: String,
+    /// Parent and worker configuration for a delegated run.
+    pub delegation: Option<DelegatedRun>,
 }
 
 /// Configuration the host supplies when the scheduler resumes a run.
@@ -103,7 +105,7 @@ struct Schedule {
 }
 
 impl WorkspaceStore {
-    /// Drive resolved waits until cancelled or a scheduled run fails.
+    /// Drive resolved waits and delegated runs until cancelled or a run fails.
     ///
     /// Startup finds overdue timers and wakes already committed before a restart.
     /// Supply the original provider, skill catalog and limits for each run from
@@ -210,13 +212,19 @@ impl WorkspaceStore {
             self.wake_due_timers(now, limit)?;
         }
         let mut query = self.connection.prepare_cached(
-            "SELECT rw.agent_id, w.chat_key, wr.run_key, e.event_json
-            FROM run_waits rw
+            "WITH ready(agent_id) AS (
+                SELECT agent_id FROM run_waits WHERE resolved = 1
+                UNION ALL
+                SELECT child_agent_id FROM delegated_runs WHERE needs_start = 1
+                ORDER BY 1 LIMIT ?1
+            )
+            SELECT ready.agent_id, w.chat_key, wr.run_key, e.event_json, d.parent_agent_id, d.worker
+            FROM ready
             JOIN workspace_runs wr USING (agent_id)
             JOIN workspaces w ON w.id = wr.workspace_id
-            JOIN run_events e ON e.agent_id = rw.agent_id AND e.sequence = 1
-            WHERE rw.resolved = 1
-            ORDER BY rw.agent_id LIMIT ?1",
+            JOIN run_events e ON e.agent_id = ready.agent_id AND e.sequence = 1
+            LEFT JOIN delegated_runs d ON d.child_agent_id = ready.agent_id
+            ORDER BY ready.agent_id",
         )?;
         let limit = i64::try_from(limit.get()).unwrap_or(i64::MAX);
         let mut rows = query.query([limit])?;
@@ -228,11 +236,20 @@ impl WorkspaceStore {
                     "scheduled run is missing its original prompt",
                 ));
             };
+            let delegation = if let Some(parent_agent_id) = row.get(4)? {
+                Some(DelegatedRun {
+                    parent_agent_id,
+                    worker: row.get(5)?,
+                })
+            } else {
+                None
+            };
             ready.push(ReadyRun {
                 run: ScheduledRun {
                     agent_id: row.get(0)?,
                     chat_key: row.get(1)?,
                     run_key: row.get(2)?,
+                    delegation,
                 },
                 prompt,
             });
