@@ -53,3 +53,7 @@ required-features = ["test-util"]
 [[test]]
 name = "workspace"
 required-features = ["derive", "test-util"]
+
+[[test]]
+name = "tool_recovery"
+required-features = ["test-util"]

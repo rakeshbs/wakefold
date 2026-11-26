@@ -8,7 +8,7 @@ use super::{Action, RunError, RunOptions, RunUsage, next_action, validate_calls}
 use crate::context::Compaction;
 use crate::skill::{LOADER, RunSkills, is_loader};
 use crate::{
-    CallId, JsonValue, Message, ModelResponse, ModelTurn, RunEvent, RunJournal, ToolCall,
+    CallId, Effect, JsonValue, Message, ModelResponse, ModelTurn, RunEvent, RunJournal, ToolCall,
     ToolResult,
 };
 
@@ -59,7 +59,11 @@ impl RunState {
 pub(super) enum Boundary {
     Ready,
     ModelRequested,
-    ToolStarted(ToolCall),
+    ToolStarted {
+        call: ToolCall,
+        effect: Effect,
+        idempotency_key: Option<String>,
+    },
     Finished(String),
 }
 
@@ -112,8 +116,15 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
             run.apply(entry.event)?;
             run.tail = entry.sequence;
         }
-        if let Boundary::ToolStarted(call) = &run.boundary
+        if let Boundary::ToolStarted {
+            call,
+            effect,
+            idempotency_key,
+        } = &run.boundary
             && !is_loader(&call.name)
+            && (!matches!(effect, Effect::ReadOnly | Effect::Idempotent)
+                || idempotency_key.is_none()
+                || run.skills.effect(call).ok() != Some(*effect))
         {
             return Err(RunError::ToolOutcomeUnknown {
                 id: call.id.clone(),
@@ -127,6 +138,27 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
         }
         run.restore_definitions()?;
         Ok(run)
+    }
+
+    pub fn start_tool(&mut self, call: ToolCall) -> Result<(), RunError> {
+        let effect = self.skills.effect(&call).map_err(|source| RunError::Tool {
+            name: call.name.clone(),
+            source,
+        })?;
+        self.commit([RunEvent::ToolCallStartedWithRecovery {
+            call,
+            effect,
+            idempotency_key: format!("wakefold-{:032x}", rand::random::<u128>()),
+        }])
+    }
+
+    pub fn idempotency_key(&self) -> Option<&str> {
+        match &self.boundary {
+            Boundary::ToolStarted {
+                idempotency_key, ..
+            } => idempotency_key.as_deref(),
+            _ => None,
+        }
     }
 
     fn restore_definitions(&mut self) -> Result<(), RunError> {
@@ -239,15 +271,35 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
                 Boundary::Ready
             }
             (Boundary::Ready, RunEvent::ToolCallStarted(call)) if matches!(action(), Some(Action::RunTool(expected)) if expected == &call) => {
-                Boundary::ToolStarted(call)
+                Boundary::ToolStarted {
+                    call,
+                    effect: Effect::NonIdempotent,
+                    idempotency_key: None,
+                }
             }
-            (Boundary::ToolStarted(call), RunEvent::SkillLoaded(name))
+            (
+                Boundary::Ready,
+                RunEvent::ToolCallStartedWithRecovery {
+                    call,
+                    effect,
+                    idempotency_key,
+                },
+            ) if !idempotency_key.is_empty()
+                && matches!(action(), Some(Action::RunTool(expected)) if expected == &call) =>
+            {
+                Boundary::ToolStarted {
+                    call,
+                    effect,
+                    idempotency_key: Some(idempotency_key),
+                }
+            }
+            (Boundary::ToolStarted { call, .. }, RunEvent::SkillLoaded(name))
                 if is_loader(&call.name) && call.arguments["name"].as_str() == Some(&name) =>
             {
                 activate_skill(&mut self.skills, &name)?;
                 return Ok(());
             }
-            (Boundary::ToolStarted(call), RunEvent::ToolCallCompleted(result))
+            (Boundary::ToolStarted { call, .. }, RunEvent::ToolCallCompleted(result))
                 if call.id == result.call_id =>
             {
                 // Earlier journals recorded successful loader calls without a SkillLoaded event.

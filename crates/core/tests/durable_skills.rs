@@ -289,7 +289,7 @@ fn failed_loader_commit_rolls_back_activation_and_can_be_retried() {
     let entries = journal.load_after(0).unwrap();
     assert!(matches!(
         entries.last().unwrap().event,
-        RunEvent::ToolCallStarted(_)
+        RunEvent::ToolCallStartedWithRecovery { .. }
     ));
     assert!(
         !entries

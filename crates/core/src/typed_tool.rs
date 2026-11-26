@@ -7,15 +7,18 @@ use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 
-use crate::{JsonValue, Tool, ToolContext, ToolError, ToolSpec};
+use crate::{Effect, JsonValue, Tool, ToolContext, ToolError, ToolSpec};
 
-/// Model-facing metadata for the argument type of a tool.
+/// Registration metadata for the argument type and recovery policy of a tool.
 pub trait ToolInput {
     /// Name the model uses to select the tool.
     const NAME: &'static str;
 
     /// Description of what the tool does.
     const DESCRIPTION: &'static str;
+
+    /// Recovery policy implemented by the handler.
+    const EFFECT: Effect = Effect::NonIdempotent;
 }
 
 /// Register an asynchronous handler using its input type as the tool schema.
@@ -82,6 +85,7 @@ where
             Input::DESCRIPTION,
             schema_for!(Input).to_value(),
         )
+        .with_effect(Input::EFFECT)
     }
 
     async fn call(&self, arguments: &JsonValue) -> Result<JsonValue, ToolError> {

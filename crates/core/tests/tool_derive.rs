@@ -5,11 +5,15 @@ use futures_executor::block_on;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
-use wakefold::{Tool, ToolError, WakefoldTool, typed_tool};
+use wakefold::{Effect, Tool, ToolError, WakefoldTool, typed_tool};
 
 #[derive(Deserialize, JsonSchema, WakefoldTool)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-#[tool(name = "calculate", description = "Calculate an order total")]
+#[tool(
+    name = "calculate",
+    description = "Calculate an order total",
+    effect = "read_only"
+)]
 struct Order<Input> {
     unit_price: Input,
     quantity: NonZeroU64,
@@ -22,6 +26,7 @@ fn derives_metadata_and_schema_from_the_argument_type() {
 
     let spec = tool.spec();
     assert_eq!(spec.name, "calculate");
+    assert_eq!(spec.effect, Effect::ReadOnly);
     assert_eq!(spec.description, "Calculate an order total");
     assert_eq!(spec.parameters["type"], "object");
     assert_eq!(spec.parameters["additionalProperties"], false);

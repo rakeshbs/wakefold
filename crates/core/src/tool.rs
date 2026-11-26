@@ -35,6 +35,26 @@ impl fmt::Display for CallId {
     }
 }
 
+/// Declares whether an interrupted tool call can safely execute again during recovery.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Effect {
+    /// Reads external state and can safely repeat after an interrupted call.
+    ReadOnly,
+    /// Uses the context's idempotency key to deduplicate effects and return the original result.
+    Idempotent,
+    /// An interrupted call requires reconciliation before another attempt.
+    #[default]
+    NonIdempotent,
+}
+
+impl Effect {
+    fn is_non_idempotent(&self) -> bool {
+        *self == Self::NonIdempotent
+    }
+}
+
 /// A registered tool and the shape of its accepted arguments.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -45,6 +65,9 @@ pub struct ToolSpec {
     pub description: String,
     /// JSON Schema describing the tool's arguments.
     pub parameters: JsonValue,
+    /// Recovery policy for interrupted calls. The handler must uphold this declaration.
+    #[serde(default, skip_serializing_if = "Effect::is_non_idempotent")]
+    pub effect: Effect,
 }
 
 impl ToolSpec {
@@ -58,7 +81,18 @@ impl ToolSpec {
             name: name.into(),
             description: description.into(),
             parameters,
+            effect: Effect::NonIdempotent,
         }
+    }
+
+    /// Declare how this tool can be retried after a crash.
+    ///
+    /// An idempotent handler must use [`ToolContext::idempotency_key`] to deduplicate
+    /// external effects and recover the original result when called again.
+    #[must_use]
+    pub fn with_effect(mut self, effect: Effect) -> Self {
+        self.effect = effect;
+        self
     }
 }
 
@@ -110,16 +144,19 @@ impl ToolResult {
 pub struct ToolContext {
     cancellation: Option<CancellationToken>,
     workspace: Option<RunWorkspace>,
+    idempotency_key: Option<String>,
 }
 
 impl ToolContext {
     pub(crate) fn new(
         cancellation: Option<CancellationToken>,
         workspace: Option<RunWorkspace>,
+        idempotency_key: Option<String>,
     ) -> Self {
         Self {
             cancellation,
             workspace,
+            idempotency_key,
         }
     }
 
@@ -131,6 +168,16 @@ impl ToolContext {
     /// The caller's cancellation signal, when supplied.
     pub fn cancellation_token(&self) -> Option<&CancellationToken> {
         self.cancellation.as_ref()
+    }
+
+    /// The stable key assigned to this call before the agent executes its handler.
+    ///
+    /// Journaled runs persist this key and reuse it after restart. Idempotent
+    /// handlers must pass it to their backing service or record it with their
+    /// effects in one transaction. Direct tool calls using the default context
+    /// have no assigned key.
+    pub fn idempotency_key(&self) -> Option<&str> {
+        self.idempotency_key.as_deref()
     }
 }
 

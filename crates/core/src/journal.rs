@@ -9,7 +9,7 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ModelTurn, RunCheckpoint, RunWorkspace, ToolCall, ToolResult};
+use crate::{Effect, ModelTurn, RunCheckpoint, RunWorkspace, ToolCall, ToolResult};
 
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS run_events (
@@ -32,8 +32,17 @@ pub enum RunEvent {
     ModelCallRequested,
     /// A full model response, including usage and provider replay context.
     ModelCallCompleted(ModelTurn),
-    /// The tool call is about to be dispatched.
+    /// A tool start recorded by an earlier version without recovery metadata.
     ToolCallStarted(ToolCall),
+    /// A tool is about to execute with a durable recovery policy and key.
+    ToolCallStartedWithRecovery {
+        /// The original model request, including its dispatcher arguments.
+        call: ToolCall,
+        /// The recovery policy declared before the first attempt.
+        effect: Effect,
+        /// Stable key reused by all recovery attempts for this call.
+        idempotency_key: String,
+    },
     /// The tool returned a result for its call ID.
     ToolCallCompleted(ToolResult),
     /// A skill became available with the loader result in the same transaction.
@@ -88,6 +97,7 @@ pub struct RunJournal<'a> {
     connection: &'a mut Connection,
     pub(crate) workspace: RunWorkspace,
     lock_path: PathBuf,
+    commit_hook: Option<fn(u64, &[RunEvent])>,
 }
 
 impl<'a> RunJournal<'a> {
@@ -100,7 +110,17 @@ impl<'a> RunJournal<'a> {
             connection,
             workspace,
             lock_path,
+            commit_hook: None,
         }
+    }
+
+    /// Install a test hook called after each nonempty event batch commits.
+    ///
+    /// The callback runs before `append` returns, allowing a test to stop a
+    /// worker process at an exact durable boundary.
+    #[cfg(feature = "test-util")]
+    pub fn set_commit_hook(&mut self, hook: fn(u64, &[RunEvent])) {
+        self.commit_hook = Some(hook);
     }
 
     pub(crate) fn lock_driver(&self) -> Result<File, JournalError> {
@@ -158,6 +178,11 @@ impl<'a> RunJournal<'a> {
             }
         }
         tx.commit()?;
+        if !events.is_empty()
+            && let Some(hook) = self.commit_hook
+        {
+            hook(sequence, events);
+        }
         Ok(sequence)
     }
 

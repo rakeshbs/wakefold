@@ -332,7 +332,8 @@ impl RunJournal<'_> {
     /// Supply the original prompt and skill definitions on restart. Turn limits
     /// and usage apply to the entire run. A finished run returns its saved answer.
     /// SQLite reads and writes are synchronous at step boundaries. A model request
-    /// interrupted before its response was committed may be sent again.
+    /// interrupted before its response was committed may be sent again. Interrupted
+    /// read-only and idempotent tools can retry with their saved idempotency key.
     ///
     /// ```no_run
     /// # async fn example(provider: &dyn wakefold::Provider, skills: &[wakefold::Skill<'_>])
@@ -350,8 +351,9 @@ impl RunJournal<'_> {
     /// # Errors
     ///
     /// A concurrent driver receives [`crate::JournalError::AlreadyRunning`] inside
-    /// [`RunError::Journal`]. Returns [`RunError::ToolOutcomeUnknown`] if an application tool started
-    /// without a committed result. Other failures are reported as in [`run_with_options`].
+    /// [`RunError::Journal`]. Returns [`RunError::ToolOutcomeUnknown`] if an interrupted
+    /// tool cannot safely retry under its recorded and current recovery policies.
+    /// Other failures are reported as in [`run_with_options`].
     pub async fn run(
         &mut self,
         prompt: impl Into<String> + Send,
@@ -451,10 +453,14 @@ async fn drive(
             Action::RunTool(call) => {
                 run.state.usage.check_budget(options.token_budget)?;
                 if matches!(run.boundary, Boundary::Ready) {
-                    run.commit([RunEvent::ToolCallStarted(call.clone())])?;
+                    run.start_tool(call.clone())?;
                     continue;
                 }
-                let context = ToolContext::new(cancellation.cloned(), options.workspace.clone());
+                let context = ToolContext::new(
+                    cancellation.cloned(),
+                    options.workspace.clone(),
+                    run.idempotency_key().map(str::to_owned),
+                );
                 let events = await_cancellable(run.skills.call(call, context), cancellation)
                     .await?
                     .map_err(|source| RunError::Tool {

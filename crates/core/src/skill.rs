@@ -6,7 +6,8 @@ use std::fmt::{self, Write};
 use serde_json::json;
 
 use crate::{
-    JsonValue, RunError, RunEvent, Tool, ToolCall, ToolContext, ToolError, ToolResult, ToolSpec,
+    Effect, JsonValue, RunError, RunEvent, Tool, ToolCall, ToolContext, ToolError, ToolResult,
+    ToolSpec,
 };
 
 /// A named group of tools the agent can load together.
@@ -54,7 +55,7 @@ pub(crate) struct RunSkills<'a> {
     available: BTreeMap<&'a str, Vec<(ToolSpec, &'a dyn Tool)>>,
     loaded: Vec<String>,
     pub(crate) advertised: Vec<ToolSpec>,
-    handlers: BTreeMap<String, &'a dyn Tool>,
+    handlers: BTreeMap<String, (Effect, &'a dyn Tool)>,
 }
 
 impl<'a> RunSkills<'a> {
@@ -143,6 +144,17 @@ impl<'a> RunSkills<'a> {
         }))
     }
 
+    pub(crate) fn effect(&self, call: &ToolCall) -> Result<Effect, ToolError> {
+        if is_loader(&call.name) {
+            return Ok(Effect::ReadOnly);
+        }
+        let (name, _) = self.resolve(call)?;
+        self.handlers
+            .get(name)
+            .map(|(effect, _)| *effect)
+            .ok_or_else(|| ToolError::new(format!("tool {name} is unavailable to this agent")))
+    }
+
     pub(crate) fn resolve<'call>(
         &self,
         call: &'call ToolCall,
@@ -181,7 +193,7 @@ impl<'a> RunSkills<'a> {
             definitions
         } else {
             let (name, arguments) = self.resolve(call)?;
-            let handler = self.handlers.get(name).ok_or_else(|| {
+            let (_, handler) = self.handlers.get(name).ok_or_else(|| {
                 ToolError::new(format!("tool {name} is unavailable to this agent"))
             })?;
             handler.call_with_context(context, arguments).await?
@@ -203,7 +215,8 @@ impl<'a> RunSkills<'a> {
         }
         let tools = self.available.get(name).ok_or_else(|| unavailable(name))?;
         for (spec, tool) in tools {
-            self.handlers.insert(spec.name.clone(), *tool);
+            self.handlers
+                .insert(spec.name.clone(), (spec.effect, *tool));
         }
         self.loaded.push(name.to_owned());
         Ok(())
