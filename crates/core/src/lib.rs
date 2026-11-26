@@ -29,7 +29,7 @@ pub use agent::{
     run_streaming_with_options, run_with_options,
 };
 pub use delegation::{DelegateTool, DelegatedRun};
-pub use journal::{JournalEntry, JournalError, RunEvent, RunEventPage, RunJournal};
+pub use journal::{JournalEntry, JournalError, JournalReplay, RunEvent, RunEventPage, RunJournal};
 pub use mailbox::{ClientMessageError, SendMessage, WaitForMessage};
 pub use provider::{
     Message, ModelRequest, ModelResponse, ModelToolSpec, ModelTurn, Provider, ProviderError,

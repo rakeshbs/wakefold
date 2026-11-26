@@ -16,7 +16,7 @@ use wakefold::{
 };
 
 use crate::config::{Config, RegisteredSkill, Runtime};
-use crate::{DaemonError, server};
+use crate::{DaemonError, replay, server};
 
 const CHILD_CONFIG: &str = "WAKEFOLD_DAEMON_TEST_CONFIG";
 const ORDER_TEST: &str = "tests::http_workflow_survives_daemon_restart";
@@ -261,6 +261,16 @@ async fn approvals(client: &Client, address: SocketAddr) -> Vec<Value> {
         .unwrap()
 }
 
+fn saved_replay(state: &Path, agent_id: i64) -> Vec<Value> {
+    let mut output = Vec::new();
+    replay::write(state, agent_id, &mut output).unwrap();
+    String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 #[tokio::test]
 async fn http_workflow_survives_daemon_restart() {
     if let Some(config) = std::env::var_os(CHILD_CONFIG) {
@@ -331,6 +341,13 @@ async fn http_workflow_survives_daemon_restart() {
         assert_eq!(pending[0]["wait"]["on"]["ToolApproval"]["tool_name"], "orders.review");
         assert!(directory.path().join("lookup").exists());
         assert!(!directory.path().join("review").exists());
+        let state = directory.path().join("state");
+        let review_id = pending[0]["agent_id"].as_i64().unwrap();
+        let waiting = saved_replay(&state, id);
+        assert!(waiting.iter().any(|frame| frame["agent_id"] == review_id
+            && frame["event"]["kind"] == "wait_started" && frame["event"]["data"]["id"] == wait));
+        assert!(!waiting.iter().any(|frame| frame["event"]["kind"] == "woken"
+            && frame["event"]["data"]["wait_id"] == wait));
 
         // Kill the serving process with a WebSocket open and the review still pending.
         drop(daemon);
@@ -356,6 +373,21 @@ async fn http_workflow_survives_daemon_restart() {
         }
         assert!(directory.path().join("review").exists());
         assert!(approvals(&client, address).await.is_empty());
+        let events = saved_replay(&state, id);
+        let approval_requested = events.iter().position(|frame| frame["agent_id"] == review_id
+            && frame["event"]["kind"] == "wait_started" && frame["event"]["data"]["id"] == wait).unwrap();
+        let approval_granted = events.iter().position(|frame| frame["agent_id"] == review_id
+            && frame["event"]["kind"] == "woken" && frame["event"]["data"]["wait_id"] == wait
+            && frame["event"]["data"]["payload"]["approved"] == true).unwrap();
+        let worker_finished = events.iter().position(|frame| frame["agent_id"] == review_id
+            && frame["event"]["kind"] == "run_finished" && frame["event"]["data"] == "reviewed").unwrap();
+        let worker_result = events.iter().position(|frame| frame["agent_id"] == id
+            && frame["event"]["kind"] == "woken" && frame["event"]["data"]["payload"]
+                == json!({ "worker": "reviewer", "answer": "reviewed" })).unwrap();
+        let coordinator_finished = events.iter().position(|frame| frame["agent_id"] == id
+            && frame["event"]["kind"] == "run_finished" && frame["event"]["data"] == FINAL_ANSWER).unwrap();
+        assert!(approval_requested < approval_granted && approval_granted < worker_finished
+            && worker_finished < worker_result && worker_result < coordinator_finished);
         let repeated = client.post(format!("http://{address}/approvals/{wait}"))
             .json(&json!({"approved": true})).send().await.unwrap();
         assert_eq!(repeated.status(), StatusCode::NOT_FOUND);

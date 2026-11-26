@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod replay;
 mod server;
 
 #[cfg(test)]
@@ -17,17 +18,27 @@ use wakefold::{CancellationToken, OpenAiProvider};
 use crate::config::{Config, Runtime};
 
 type DaemonError = Box<dyn Error + Send + Sync>;
+const USAGE: &str =
+    "Usage: wakefold serve <config.json>\n       wakefold replay <state-directory> <agent-id>";
 
 #[tokio::main]
 async fn main() -> Result<(), DaemonError> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     match args.as_slice() {
-        [] => println!("Usage: wakefold serve <config.json>"),
+        [] => println!("{USAGE}"),
         [flag] if flag == "--help" || flag == "-h" => {
-            println!("Usage: wakefold serve <config.json>")
+            println!("{USAGE}")
         }
         [flag] if flag == "--version" || flag == "-V" => {
             println!("Wakefold {}", env!("CARGO_PKG_VERSION"));
+        }
+        [command, state, id] if command == "replay" => {
+            let id = id
+                .to_str()
+                .and_then(|id| id.parse::<i64>().ok())
+                .filter(|&id| id > 0)
+                .ok_or("agent-id must be a positive integer")?;
+            replay::write(Path::new(state), id, std::io::stdout().lock())?;
         }
         [command, path] if command == "serve" => {
             let config = Config::load(Path::new(path))?;
@@ -47,7 +58,7 @@ async fn main() -> Result<(), DaemonError> {
             });
             server::serve(listener, runtime, stop).await?;
         }
-        _ => return Err("usage: wakefold serve <config.json>".into()),
+        _ => return Err(USAGE.into()),
     }
     Ok(())
 }

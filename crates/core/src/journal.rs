@@ -3,10 +3,10 @@
 use std::{
     fs::{File, TryLockError},
     num::NonZeroUsize,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -320,22 +320,91 @@ impl WorkspaceStore {
         // Read the completion marker and page from the same snapshot so that
         // a finishing run cannot close a stream before its final event is sent.
         let tx = self.connection.unchecked_transaction()?;
-        let Some((last, terminal)) = tail(&tx, agent_id)? else {
-            return Ok(None);
-        };
-        let entries = read_entry_page(
-            &tx,
-            agent_id,
-            after,
-            i64::try_from(limit.get()).unwrap_or(i64::MAX),
-        )?;
-        let through = entries.last().map_or(after, |entry| entry.sequence);
+        let page = read_run_page(&tx, agent_id, after, limit)?;
         tx.commit()?;
-        Ok(Some(RunEventPage {
-            entries,
-            complete: terminal && through >= last,
-        }))
+        Ok(page)
     }
+}
+
+/// A read-only snapshot for inspecting one or more run journals.
+#[derive(Debug)]
+pub struct JournalReplay {
+    connection: Connection,
+}
+
+impl JournalReplay {
+    /// Open the saved journal database for replay.
+    ///
+    /// Reads share one snapshot, including when the daemon is still writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a journal error if the database cannot be opened for reading.
+    pub fn open(state_directory: impl AsRef<Path>) -> Result<Self, JournalError> {
+        let connection = Connection::open_with_flags(
+            state_directory.as_ref().join("wakefold.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        connection.execute_batch("BEGIN")?;
+        Ok(Self { connection })
+    }
+
+    /// Read events after the requested sequence, or `None` for an unknown run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a journal error if the events cannot be read or decoded.
+    pub fn run_event_page(
+        &self,
+        agent_id: i64,
+        after: u64,
+        limit: NonZeroUsize,
+    ) -> Result<Option<RunEventPage>, JournalError> {
+        read_run_page(&self.connection, agent_id, after, limit)
+    }
+
+    /// Find the worker run linked to a parent's delegation wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns a journal error if the relationship cannot be read.
+    pub fn worker_id(
+        &self,
+        parent_agent_id: i64,
+        wait_id: &str,
+    ) -> Result<Option<i64>, JournalError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT child_agent_id FROM delegated_runs
+             WHERE parent_agent_id = ?1 AND parent_wait_id = ?2",
+                params![parent_agent_id, wait_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+}
+
+fn read_run_page(
+    connection: &Connection,
+    agent_id: i64,
+    after: u64,
+    limit: NonZeroUsize,
+) -> Result<Option<RunEventPage>, JournalError> {
+    let Some((last, terminal)) = tail(connection, agent_id)? else {
+        return Ok(None);
+    };
+    let entries = read_entry_page(
+        connection,
+        agent_id,
+        after,
+        i64::try_from(limit.get()).unwrap_or(i64::MAX),
+    )?;
+    let through = entries.last().map_or(after, |entry| entry.sequence);
+    Ok(Some(RunEventPage {
+        entries,
+        complete: terminal && through >= last,
+    }))
 }
 
 pub(crate) fn tail(

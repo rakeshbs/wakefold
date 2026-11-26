@@ -1,7 +1,46 @@
 use std::num::NonZeroUsize;
 
 use futures_executor::block_on;
-use wakefold::{CancellationToken, QueueRunError, RunEvent, SchedulerError, WorkspaceStore};
+use wakefold::{
+    CancellationToken, JournalReplay, QueueRunError, RunEvent, SchedulerError, WorkspaceStore,
+};
+
+#[test]
+fn journal_replay_keeps_a_snapshot_while_the_run_advances() {
+    let state = tempfile::tempdir().unwrap();
+    let mut store = WorkspaceStore::open(state.path()).unwrap();
+    let id = store
+        .queue_run("chat", "job", "agent", "Inspect an order.")
+        .unwrap();
+    let replay = JournalReplay::open(state.path()).unwrap();
+    let first = replay
+        .run_event_page(id, 0, NonZeroUsize::MIN)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.entries.len(), 1);
+    assert!(!first.complete);
+
+    assert!(
+        store
+            .open_journal("chat", "job")
+            .unwrap()
+            .record_failure("stopped".into())
+            .unwrap()
+    );
+    let old = replay
+        .run_event_page(id, 1, NonZeroUsize::MIN)
+        .unwrap()
+        .unwrap();
+    assert!(old.entries.is_empty());
+    assert!(!old.complete);
+    let fresh = JournalReplay::open(state.path())
+        .unwrap()
+        .run_event_page(id, 1, NonZeroUsize::MIN)
+        .unwrap()
+        .unwrap();
+    assert!(fresh.complete);
+    assert!(matches!(&fresh.entries[0].event, RunEvent::RunFailed(error) if error == "stopped"));
+}
 
 #[test]
 fn queued_run_retains_its_identity_and_terminal_failure_after_reopening() {

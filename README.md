@@ -106,3 +106,15 @@ cargo run --locked -p wakefold-daemon -- serve wakefold.json
 A grant can be `allow` or `require_approval`. Other built-in tool kinds are
 `send_message`, `wait_for_message`, and `delegate`. A delegate tool takes a
 local `name`, a `description`, and the target `agent` from the configuration.
+
+## Replaying a run
+
+```sh
+cargo run --locked -p wakefold-daemon -- replay state 1
+```
+
+Pass the state directory and the `agent_id` returned by `POST /runs`.
+Replay opens a read-only SQLite snapshot and writes one JSON object per event
+with its `agent_id`, `sequence`, and `event`. A delegation shows the worker's
+journal after the parent's wait and before its result. The command works on
+both finished and still-pending runs.
