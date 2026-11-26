@@ -6,6 +6,7 @@ mod journal;
 mod provider;
 mod providers;
 mod retry;
+mod scheduler;
 mod skill;
 mod tool;
 mod wait;
@@ -32,6 +33,7 @@ pub use provider::{
 #[cfg(feature = "openai")]
 pub use providers::openai::{OpenAiProvider, ReasoningEffort};
 pub use retry::ModelRetryPolicy;
+pub use scheduler::{ScheduledRun, ScheduledRunConfig, SchedulerError};
 pub use serde_json::Value as JsonValue;
 pub use skill::Skill;
 pub use tokio_util::sync::CancellationToken;

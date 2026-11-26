@@ -1,13 +1,17 @@
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_executor::block_on;
 use serde_json::json;
 use wakefold::{
-    JsonValue, Message, ModelRequest, ModelResponse, PendingWait, Provider, ProviderError,
-    RunError, RunEvent, RunOptions, RunOutcome, Skill, TimerWait, Tool, ToolCall, ToolContext,
-    ToolError, ToolOutput, ToolSpec, WaitOn, WakeEvent, WorkspaceStore,
+    CancellationToken, JsonValue, Message, ModelRequest, ModelResponse, PendingWait, Provider,
+    ProviderError, RunError, RunEvent, RunOptions, RunOutcome, ScheduledRunConfig, Skill,
+    TimerWait, Tool, ToolCall, ToolContext, ToolError, ToolOutput, ToolSpec, WaitOn, WakeEvent,
+    WorkspaceStore,
 };
 
 const PROMPT: &str = "Wait and report the result.";
@@ -236,4 +240,273 @@ fn a_wait_requires_a_durable_run() {
         4,
     ));
     assert!(matches!(result, Err(RunError::WaitRequiresJournal { name }) if name == "test.wait"));
+}
+
+fn start_timer(store: &mut WorkspaceStore, key: &str, wake_at: SystemTime) {
+    let provider = Workflow {
+        tool: "test.wait",
+        result: None,
+    };
+    let tool = ExternalWait(WaitOn::Timer { wake_at });
+    let tools: [&dyn Tool; 1] = [&tool];
+    let skill = Skill::new("test", "Test waits", &tools);
+    let mut journal = store.open_journal("chat", key).unwrap();
+    let outcome =
+        block_on(journal.run_until_blocked(PROMPT, &provider, &[skill], RunOptions::new(4)))
+            .unwrap();
+    assert_eq!(suspended(outcome).on, WaitOn::Timer { wake_at });
+}
+
+fn timer_result(wake_at: SystemTime) -> JsonValue {
+    let ms = wake_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .div_ceil(1_000_000);
+    json!({"wake_at_unix_ms": ms})
+}
+
+struct TimedWork {
+    provider: Workflow,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for TimedWork {
+    async fn complete_response(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        // Keep this turn pending so a second run can enter its model request.
+        futures_timer::Delay::new(Duration::from_millis(50)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.provider.complete_response(request).await
+    }
+}
+
+#[test]
+fn scheduler_wakes_timers_with_bounded_concurrency() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let wake_at = SystemTime::now() + Duration::from_millis(300);
+    const RUNS: usize = 5;
+    for run in 0..RUNS {
+        start_timer(&mut store, &run.to_string(), wake_at);
+    }
+    let provider = TimedWork {
+        provider: Workflow {
+            tool: "test.wait",
+            result: Some(timer_result(wake_at)),
+        },
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    };
+    let tool = ExternalWait(WaitOn::Timer { wake_at });
+    let tools: [&dyn Tool; 1] = [&tool];
+    let skills = [Skill::new("test", "Test waits", &tools)];
+    let cancellation = CancellationToken::new();
+    let mut finished = std::collections::HashSet::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            store.run_scheduler(
+                NonZeroUsize::new(2).unwrap(),
+                &cancellation,
+                |_| ScheduledRunConfig::new(&provider, &skills, RunOptions::new(4)),
+                |run, outcome| {
+                    assert!(SystemTime::now() >= wake_at);
+                    assert!(matches!(outcome, RunOutcome::Finished(_)));
+                    assert!(finished.insert(run.agent_id), "the run must finish once");
+                    if finished.len() == RUNS {
+                        cancellation.cancel();
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    });
+    assert_eq!(finished.len(), RUNS);
+    assert_eq!(provider.peak.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn scheduler_retries_a_resolved_wait_after_a_driver_error() {
+    let root = tempfile::tempdir().unwrap();
+    let store_path = root.path();
+    let mut store = WorkspaceStore::open(store_path).unwrap();
+    let tool = ExternalWait(WaitOn::Webhook);
+    let waiting = Workflow {
+        tool: "test.wait",
+        result: None,
+    };
+    let wait = suspended(run(&mut store, &waiting, &tool).unwrap());
+    let payload = json!({"status": "done"});
+    assert!(
+        store
+            .resolve_wait(&wait.id, WakeEvent::Webhook(payload.clone()))
+            .unwrap()
+    );
+
+    // Missing configuration stops this scheduler. The ready run must stay on disk.
+    let cancellation = CancellationToken::new();
+    let failed = block_on(store.run_scheduler(
+        ONE,
+        &cancellation,
+        |_| ScheduledRunConfig::new(&NoModel, &[], RunOptions::new(4)),
+        |_, _| panic!("the first scheduler omitted the previously loaded skill"),
+    ));
+    assert!(
+        matches!(failed, Err(wakefold::SchedulerError::Resume { source, .. })
+        if matches!(source.as_ref(), RunError::MissingSkillOnResume { name } if name == "test"))
+    );
+
+    let resumed = Workflow {
+        tool: "test.wait",
+        result: Some(payload),
+    };
+    let tools: [&dyn Tool; 1] = [&tool];
+    let skills = [Skill::new("test", "Test waits", &tools)];
+    let mut finished = false;
+    block_on(WorkspaceStore::open(store_path).unwrap().run_scheduler(
+        ONE,
+        &cancellation,
+        |_| ScheduledRunConfig::new(&resumed, &skills, RunOptions::new(4)),
+        |_, outcome| {
+            assert!(matches!(outcome, RunOutcome::Finished(_)));
+            finished = true;
+            cancellation.cancel();
+        },
+    ))
+    .unwrap();
+    assert!(finished);
+}
+
+const SCALE_STATE: &str = "WAKEFOLD_TIMER_SCALE_STATE";
+const RUNS: usize = 1_000;
+
+fn resident_kib() -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+#[test]
+#[ignore = "scale benchmark starts a child process and waits for timers to become due"]
+fn a_thousand_timers_survive_restart() {
+    if let Some(path) = std::env::var_os(SCALE_STATE) {
+        let path = Path::new(&path);
+        let mut store = WorkspaceStore::open(path).unwrap();
+        let before = resident_kib();
+        let wake_at = SystemTime::now() + Duration::from_secs(8);
+        let started = Instant::now();
+        for run in 0..RUNS {
+            start_timer(&mut store, &run.to_string(), wake_at);
+        }
+        let registration_time = started.elapsed();
+        std::fs::write(path.join("deadline"), timer_result(wake_at).to_string()).unwrap();
+        let cancellation = CancellationToken::new();
+        block_on(async {
+            let sample = async {
+                futures_timer::Delay::new(Duration::from_millis(300)).await;
+                assert!(
+                    SystemTime::now() < wake_at,
+                    "timers should be pending at sample time"
+                );
+                eprintln!(
+                    "timer benchmark: registered {RUNS} in {registration_time:?}, RSS before {before:?} KiB, idle RSS {:?} KiB",
+                    resident_kib()
+                );
+                cancellation.cancel();
+            };
+            let scheduler = store.run_scheduler(
+                ONE,
+                &cancellation,
+                |_| panic!("future timers must not be active"),
+                |_, _| unreachable!(),
+            );
+            let ((), result) = futures_util::future::join(sample, scheduler).await;
+            result.unwrap();
+        });
+        // Leave all waits pending and simulate exiting without closing application state.
+        std::process::exit(73);
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "a_thousand_timers_survive_restart",
+            "--nocapture",
+        ])
+        .env(SCALE_STATE, root.path())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(73));
+    let result: JsonValue =
+        serde_json::from_str(&std::fs::read_to_string(root.path().join("deadline")).unwrap())
+            .unwrap();
+    let wake_at = UNIX_EPOCH + Duration::from_millis(result["wake_at_unix_ms"].as_u64().unwrap());
+    std::thread::sleep(
+        wake_at
+            .duration_since(SystemTime::now())
+            .unwrap_or_default(),
+    );
+
+    let provider = Workflow {
+        tool: "test.wait",
+        result: Some(result),
+    };
+    let tool = ExternalWait(WaitOn::Timer { wake_at });
+    let tools: [&dyn Tool; 1] = [&tool];
+    let skills = [Skill::new("test", "Test waits", &tools)];
+    let store = WorkspaceStore::open(root.path()).unwrap();
+    let cancellation = CancellationToken::new();
+    let started = Instant::now();
+    let mut finished = std::collections::HashSet::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            store.run_scheduler(
+                NonZeroUsize::new(16).unwrap(),
+                &cancellation,
+                |_| ScheduledRunConfig::new(&provider, &skills, RunOptions::new(4)),
+                |run, outcome| {
+                    assert!(
+                        matches!(outcome, RunOutcome::Finished(report) if report.answer == "done")
+                    );
+                    assert!(finished.insert(run.agent_id), "the run must finish once");
+                    if finished.len() == RUNS {
+                        cancellation.cancel();
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    });
+    assert_eq!(finished.len(), RUNS);
+    eprintln!(
+        "timer benchmark: resumed all {RUNS} overdue runs in {:?}",
+        started.elapsed()
+    );
 }

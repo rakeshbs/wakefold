@@ -46,7 +46,7 @@ impl RunWorkspace {
 #[derive(Debug)]
 pub struct WorkspaceStore {
     pub(crate) connection: Connection,
-    state: PathBuf,
+    pub(crate) state: PathBuf,
 }
 
 impl WorkspaceStore {
