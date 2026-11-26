@@ -19,11 +19,14 @@ use crate::config::{Config, RegisteredSkill, Runtime};
 use crate::{DaemonError, server};
 
 const CHILD_CONFIG: &str = "WAKEFOLD_DAEMON_TEST_CONFIG";
+const ORDER_TEST: &str = "tests::http_workflow_survives_daemon_restart";
+const MAILBOX_TEST: &str = "tests::http_messages_survive_daemon_restart";
 const PROMPT: &str = "Find the notebook price and record an approved review.";
 const FINAL_ANSWER: &str = "The notebook costs 350 cents and its review was recorded.";
+const MAILBOX_PROMPT: &str = "After approval, receive two client messages.";
 type EventSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-struct OrderProvider;
+struct WorkflowProvider;
 
 fn dispatch(id: &str, name: &str, arguments: Value) -> ToolCall {
     ToolCall::new(
@@ -34,7 +37,7 @@ fn dispatch(id: &str, name: &str, arguments: Value) -> ToolCall {
 }
 
 #[async_trait]
-impl Provider for OrderProvider {
+impl Provider for WorkflowProvider {
     async fn complete_response(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
         unreachable!("the driver requests token usage with each turn")
     }
@@ -47,6 +50,12 @@ impl Provider for OrderProvider {
         let Some(Message::User(prompt)) = request.messages.first() else {
             panic!("the original prompt must survive");
         };
+        if prompt == MAILBOX_PROMPT {
+            return Ok(ModelTurn::new(
+                mailbox_response(request.messages.last().unwrap()),
+                Some(TokenUsage::new(2, 1)),
+            ));
+        }
         let skill = if prompt == PROMPT {
             "delegate"
         } else {
@@ -105,6 +114,38 @@ impl Provider for OrderProvider {
     }
 }
 
+fn mailbox_response(message: &Message) -> ModelResponse {
+    match message {
+        Message::User(_) => {
+            ToolCall::new("load", "load_skill", json!({ "name": "mailbox" })).into()
+        }
+        Message::Tool(result) if result.call_id == "load".into() => {
+            dispatch("timer", "mailbox.wait", json!({ "seconds": 0 })).into()
+        }
+        Message::Tool(result) if result.call_id == "timer".into() => {
+            dispatch("first", "mailbox.receive", json!({})).into()
+        }
+        Message::Tool(result) if result.call_id == "first".into() => {
+            assert_eq!(
+                result.value["payload"],
+                json!({"status": "queued before waiting"})
+            );
+            assert_eq!(result.value.get("from_agent_id"), Some(&Value::Null));
+            dispatch("second", "mailbox.receive", json!({})).into()
+        }
+        Message::Tool(result) => {
+            assert_eq!(result.call_id, "second".into());
+            assert_eq!(
+                result.value["payload"],
+                json!({"status": "arrived while waiting"})
+            );
+            assert_eq!(result.value.get("from_agent_id"), Some(&Value::Null));
+            ModelResponse::Final("Received both messages".into())
+        }
+        other => panic!("unexpected mailbox message {other:?}"),
+    }
+}
+
 struct OrderTool {
     state: PathBuf,
     name: &'static str,
@@ -148,8 +189,8 @@ async fn daemon_process(config: &Path) -> Result<(), DaemonError> {
             },
         )]),
         |model| {
-            assert_eq!(model, "scripted-order-provider");
-            Ok(Box::new(OrderProvider))
+            assert_eq!(model, "scripted-workflow-provider");
+            Ok(Box::new(WorkflowProvider))
         },
     )?;
     let listener = TcpListener::bind(runtime.bind).await?;
@@ -168,18 +209,14 @@ impl Drop for RunningDaemon {
     }
 }
 
-async fn launch(config: &Path) -> (RunningDaemon, SocketAddr) {
+async fn launch(config: &Path, test: &str) -> (RunningDaemon, SocketAddr) {
     let ready = config.parent().unwrap().join("listen");
     if ready.exists() {
         std::fs::remove_file(&ready).unwrap();
     }
     let mut daemon = RunningDaemon {
         child: Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tests::http_workflow_survives_daemon_restart",
-                "--nocapture",
-            ])
+            .args(["--exact", test, "--nocapture"])
             .env(CHILD_CONFIG, config)
             .spawn()
             .unwrap(),
@@ -248,24 +285,24 @@ async fn http_workflow_survives_daemon_restart() {
             },
             "agents": {
                 "coordinator": {
-                    "model": "scripted-order-provider", "max_model_turns": 5, "token_budget": 19,
+                    "model": "scripted-workflow-provider", "max_model_turns": 5, "token_budget": 19,
                     "skills": ["delegate"], "tool_grants": { "delegate.catalog": "allow", "delegate.review": "allow" }
                 },
                 "catalog": {
-                    "model": "scripted-order-provider", "max_model_turns": 4, "token_budget": 10,
+                    "model": "scripted-workflow-provider", "max_model_turns": 4, "token_budget": 10,
                     "skills": ["orders"], "tool_grants": { "orders.lookup": "allow" }
                 },
                 "reviewer": {
-                    "model": "scripted-order-provider", "max_model_turns": 4, "token_budget": 13,
+                    "model": "scripted-workflow-provider", "max_model_turns": 4, "token_budget": 13,
                     "skills": ["orders"], "tool_grants": { "orders.review": "require_approval" }
                 },
-                "no_budget": { "model": "scripted-order-provider", "max_model_turns": 1, "token_budget": 0 }
+                "no_budget": { "model": "scripted-workflow-provider", "max_model_turns": 1, "token_budget": 0 }
             }
         }).to_string()).unwrap();
 
         let client = Client::builder().no_proxy().build().unwrap();
         let request = json!({ "chat_key": "notebook-order", "run_key": "check", "agent": "coordinator", "prompt": PROMPT });
-        let (daemon, address) = launch(&config).await;
+        let (daemon, address) = launch(&config, ORDER_TEST).await;
         let response = client.post(format!("http://{address}/runs")).json(&request).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let started: Value = response.json().await.unwrap();
@@ -298,7 +335,7 @@ async fn http_workflow_survives_daemon_restart() {
         // Kill the serving process with a WebSocket open and the review still pending.
         drop(daemon);
         drop(socket);
-        let (_daemon, address) = launch(&config).await;
+        let (_daemon, address) = launch(&config, ORDER_TEST).await;
         assert_eq!(approvals(&client, address).await, pending);
         let retry = client.post(format!("http://{address}/runs")).json(&request).send().await.unwrap();
         assert_eq!(retry.status(), StatusCode::ACCEPTED);
@@ -333,4 +370,112 @@ async fn http_workflow_survives_daemon_restart() {
         assert_eq!(failure["event"]["kind"], "run_failed");
         assert!(failure["event"]["data"].as_str().unwrap().contains("token budget"));
     }).await.expect("the API workflow must finish");
+}
+
+#[tokio::test]
+async fn http_messages_survive_daemon_restart() {
+    if let Some(config) = std::env::var_os(CHILD_CONFIG) {
+        daemon_process(Path::new(&config)).await.unwrap();
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("wakefold.json");
+        std::fs::write(&config, json!({
+            "state_directory": "state",
+            "bind": "127.0.0.1:0",
+            "skills": {
+                "mailbox": {
+                    "description": "Receive a message after approval",
+                    "tools": [
+                        { "kind": "timer_wait" },
+                        { "kind": "wait_for_message" }
+                    ]
+                }
+            },
+            "agents": {
+                "receiver": {
+                    "model": "scripted-workflow-provider", "max_model_turns": 6, "token_budget": 30,
+                    "skills": ["mailbox"],
+                    "tool_grants": { "mailbox.wait": "require_approval", "mailbox.receive": "allow" }
+                }
+            }
+        }).to_string()).unwrap();
+
+        let client = Client::builder().no_proxy().build().unwrap();
+        let (daemon, address) = launch(&config, MAILBOX_TEST).await;
+        let response = client.post(format!("http://{address}/runs")).json(&json!({
+            "chat_key": "chat", "run_key": "mailbox-check", "agent": "receiver", "prompt": MAILBOX_PROMPT
+        })).send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
+        let agent_id = response["agent_id"].as_i64().unwrap();
+        let pending = loop {
+            let pending = approvals(&client, address).await;
+            if !pending.is_empty() {
+                break pending;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["agent_id"], agent_id);
+        assert_eq!(pending[0]["wait"]["on"]["ToolApproval"]["tool_name"], "mailbox.wait");
+        let wait = pending[0]["wait"]["id"].as_str().unwrap();
+
+        // The approval guarantees there is no mailbox wait yet.
+        let first = json!({ "message_key": "notice-1", "payload": { "status": "queued before waiting" } });
+        let posted = client.post(format!("http://{address}/runs/{agent_id}/messages"))
+            .json(&first).send().await.unwrap();
+        assert_eq!(posted.status(), StatusCode::ACCEPTED);
+        let first_id = posted.json::<Value>().await.unwrap()["message_id"].as_str().unwrap().to_owned();
+        drop(daemon);
+
+        let (_daemon, address) = launch(&config, MAILBOX_TEST).await;
+        let messages = format!("http://{address}/runs/{agent_id}/messages");
+        let duplicate = client.post(&messages).json(&first).send().await.unwrap();
+        assert_eq!(duplicate.status(), StatusCode::ACCEPTED);
+        assert_eq!(duplicate.json::<Value>().await.unwrap()["message_id"], first_id);
+        let conflict = client.post(&messages).json(&json!({ "message_key": "notice-1", "payload": "changed" }))
+            .send().await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let (mut socket, _) = connect_async(format!("ws://{address}/runs/{agent_id}/events")).await.unwrap();
+        let decision = client.post(format!("http://{address}/approvals/{wait}"))
+            .json(&json!({"approved": true})).send().await.unwrap();
+        assert_eq!(decision.status(), StatusCode::NO_CONTENT);
+        let mut mailbox_waits = 0;
+        let mut received = Vec::new();
+        while mailbox_waits < 2 {
+            let frame = next_event(&mut socket).await;
+            let event = &frame["event"];
+            if event["kind"] == "wait_started" && event["data"]["on"].get("MailboxMessage").is_some() {
+                mailbox_waits += 1;
+            }
+            if event["kind"] == "woken"
+                && let Some(id) = event["data"]["payload"]["message_id"].as_str()
+            {
+                received.push(id.to_owned());
+            }
+            assert_ne!(event["kind"], "run_failed", "{event}");
+        }
+        assert_eq!(received, [first_id.as_str()]);
+
+        let second = client.post(&messages)
+            .json(&json!({ "message_key": "notice-2", "payload": { "status": "arrived while waiting" } }))
+            .send().await.unwrap();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        let second_id = second.json::<Value>().await.unwrap()["message_id"].as_str().unwrap().to_owned();
+        loop {
+            let frame = next_event(&mut socket).await;
+            let event = &frame["event"];
+            if event["kind"] == "woken"
+                && let Some(id) = event["data"]["payload"]["message_id"].as_str()
+            {
+                received.push(id.to_owned());
+            }
+            if event["kind"] == "run_finished" {
+                assert_eq!(event["data"], "Received both messages");
+                break;
+            }
+            assert_ne!(event["kind"], "run_failed", "{event}");
+        }
+        assert_eq!(received, [first_id, second_id]);
+    }).await.expect("the HTTP mailbox workflow must finish");
 }

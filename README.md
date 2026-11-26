@@ -93,6 +93,11 @@ cargo run --locked -p wakefold-daemon -- serve wakefold.json
 - Connect to `ws://127.0.0.1:8700/runs/{agent_id}/events` for journal events
   with `sequence` and `event` fields. Reconnect with `?after=<last sequence>`
   to continue after the last event you received.
+- `POST /runs/{agent_id}/messages` takes a client-chosen `message_key` and a
+  JSON `payload`. It returns `202` with a `message_id`. Retrying with the same
+  key and payload returns the same ID. The agent receives the message through
+  `mailbox.receive` with no sender filter and sees `from_agent_id: null`.
+  Messages stay queued until received.
 - `GET /approvals` lists pending requests. Each response includes the
   `agent_id` and the saved `wait` with its ID and tool arguments.
 - `POST /approvals/{wait_id}` accepts `{"approved":true}` or

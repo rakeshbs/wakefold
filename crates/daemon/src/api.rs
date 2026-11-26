@@ -15,8 +15,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wakefold::{
-    CancellationToken, PendingWait, QueueRunError, RunEvent, RunEventPage, WakeEvent,
-    WorkspaceStore,
+    CancellationToken, ClientMessageError, PendingWait, QueueRunError, RunEvent, RunEventPage,
+    WakeEvent, WorkspaceStore,
 };
 
 const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(128).expect("page size is nonzero");
@@ -72,6 +72,7 @@ pub(crate) fn router(
         .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
         .route("/runs", post(start_run))
         .route("/runs/{agent_id}/events", get(events))
+        .route("/runs/{agent_id}/messages", post(post_message))
         .route("/approvals", get(pending_approvals))
         .route("/approvals/{wait_id}", post(resolve_approval))
         .layer(middleware::from_fn(require_local_origin))
@@ -80,6 +81,43 @@ pub(crate) fn router(
             agents: Arc::new(agents),
             stop,
         })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostMessage {
+    message_key: String,
+    payload: serde_json::Value,
+}
+
+async fn post_message(
+    Path(agent_id): Path<i64>,
+    State(state): State<AppState>,
+    Json(request): Json<PostMessage>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let id = state
+        .database(move |store| {
+            store
+                .post_client_message(agent_id, &request.message_key, &request.payload)
+                .map_err(|error| match error {
+                    ClientMessageError::EmptyKey => {
+                        ApiError(StatusCode::BAD_REQUEST, "message_key must be nonempty")
+                    }
+                    ClientMessageError::UnknownRun => {
+                        ApiError(StatusCode::NOT_FOUND, "unknown run")
+                    }
+                    ClientMessageError::RunEnded => {
+                        ApiError(StatusCode::CONFLICT, "the run has already ended")
+                    }
+                    ClientMessageError::KeyConflict => ApiError(
+                        StatusCode::CONFLICT,
+                        "message_key already identifies a different payload",
+                    ),
+                    _ => ApiError::internal(error),
+                })
+        })
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "message_id": id }))))
 }
 
 async fn require_local_origin(request: Request, next: Next) -> Result<Response, ApiError> {
