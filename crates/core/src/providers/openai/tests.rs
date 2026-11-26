@@ -10,8 +10,8 @@ use tower::service_fn;
 
 use super::*;
 use crate::{
-    JsonValue, RetryPolicy, RunError, RunOptions, Skill, Tool as WakefoldTool, ToolError, ToolSpec,
-    run_streaming_with_options,
+    JsonValue, ModelRetryPolicy, RunError, RunOptions, Skill, Tool as HostTool, ToolError,
+    ToolSpec, run_streaming_with_options,
 };
 
 struct Exchange {
@@ -190,7 +190,7 @@ fn output_message(text: &str) -> JsonValue {
 struct LookupPrice(Mutex<Vec<String>>);
 
 #[async_trait]
-impl WakefoldTool for LookupPrice {
+impl HostTool for LookupPrice {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new("lookup_price", "Look up an item price", catalog_schema())
     }
@@ -467,7 +467,8 @@ async fn preserves_retry_after_and_stops_on_quota_errors() -> Result<(), Provide
             "Hello",
             &provider,
             &[],
-            RunOptions::new(1).with_retry_policy(RetryPolicy::new(1, Duration::from_secs(2))),
+            RunOptions::new(1)
+                .with_model_retry_policy(ModelRetryPolicy::new(1, Duration::from_secs(2))),
             |_| {},
         )
         .await

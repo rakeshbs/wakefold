@@ -17,12 +17,12 @@ mod tests;
 /// By default, a turn can be retried up to three times within 30 seconds of
 /// its first attempt. Once an attempt starts, it can run to completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetryPolicy {
+pub struct ModelRetryPolicy {
     max_retries: u32,
     retry_window: Duration,
 }
 
-impl RetryPolicy {
+impl ModelRetryPolicy {
     /// Set the maximum additional attempts and the time window for starting them.
     ///
     /// Either limit can be set to zero to disable retries.
@@ -34,7 +34,7 @@ impl RetryPolicy {
     }
 }
 
-impl Default for RetryPolicy {
+impl Default for ModelRetryPolicy {
     fn default() -> Self {
         Self::new(3, Duration::from_secs(30))
     }
@@ -44,7 +44,7 @@ pub(crate) async fn stream_turn(
     provider: &dyn Provider,
     request: ModelRequest<'_>,
     on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
-    policy: RetryPolicy,
+    policy: ModelRetryPolicy,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ModelTurn, RunError> {
     stream_turn_with_clock(
@@ -63,7 +63,7 @@ async fn stream_turn_with_clock<Sleep: Future<Output = ()>>(
     provider: &dyn Provider,
     request: ModelRequest<'_>,
     on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
-    policy: RetryPolicy,
+    policy: ModelRetryPolicy,
     cancellation: Option<&CancellationToken>,
     now: impl Fn() -> Instant,
     sleep: impl Fn(Duration) -> Sleep,

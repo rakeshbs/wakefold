@@ -94,7 +94,7 @@ fn concurrent_writers_at_the_same_sequence_commit_only_one_batch() {
     assert_eq!(winner.unwrap(), 2);
     assert!(matches!(
         loser,
-        Err(JournalError::Conflict {
+        Err(JournalError::SequenceMismatch {
             expected: 0,
             actual: 2
         })

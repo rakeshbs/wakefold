@@ -9,27 +9,27 @@ use crate::{CancellationToken, JsonValue, RunWorkspace};
 
 /// Identifies a model-requested tool call within a run.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CallId(String);
+pub struct ToolCallId(String);
 
-impl CallId {
+impl ToolCallId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl From<String> for CallId {
+impl From<String> for ToolCallId {
     fn from(value: String) -> Self {
         Self(value)
     }
 }
 
-impl From<&str> for CallId {
+impl From<&str> for ToolCallId {
     fn from(value: &str) -> Self {
         Self(value.to_owned())
     }
 }
 
-impl fmt::Display for CallId {
+impl fmt::Display for ToolCallId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
@@ -66,7 +66,8 @@ pub struct ToolSpec {
     /// Description shown to the model.
     pub description: String,
     /// JSON Schema describing the tool's arguments.
-    pub parameters: JsonValue,
+    #[serde(rename = "parameters")]
+    pub argument_schema: JsonValue,
     /// Recovery policy for interrupted calls. The handler must uphold this declaration.
     #[serde(default, skip_serializing_if = "ToolRecovery::is_default")]
     pub recovery: ToolRecovery,
@@ -77,12 +78,12 @@ impl ToolSpec {
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
-        parameters: JsonValue,
+        argument_schema: JsonValue,
     ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
-            parameters,
+            argument_schema,
             recovery: ToolRecovery::StopAfterCrash,
         }
     }
@@ -100,7 +101,7 @@ impl ToolSpec {
 #[non_exhaustive]
 pub struct ToolCall {
     /// Identifier assigned by the provider.
-    pub id: CallId,
+    pub id: ToolCallId,
     /// Name of the registered tool to invoke.
     pub name: String,
     /// Arguments supplied by the model.
@@ -109,7 +110,7 @@ pub struct ToolCall {
 
 impl ToolCall {
     /// Create a call with the identifier and arguments supplied by a provider.
-    pub fn new(id: impl Into<CallId>, name: impl Into<String>, arguments: JsonValue) -> Self {
+    pub fn new(id: impl Into<ToolCallId>, name: impl Into<String>, arguments: JsonValue) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
@@ -123,14 +124,14 @@ impl ToolCall {
 #[non_exhaustive]
 pub struct ToolResult {
     /// ID copied from the original call.
-    pub call_id: CallId,
+    pub call_id: ToolCallId,
     /// Output returned by the tool.
     pub value: JsonValue,
 }
 
 impl ToolResult {
     /// Associate a tool output with the call that produced it.
-    pub fn new(call_id: impl Into<CallId>, value: JsonValue) -> Self {
+    pub fn new(call_id: impl Into<ToolCallId>, value: JsonValue) -> Self {
         Self {
             call_id: call_id.into(),
             value,

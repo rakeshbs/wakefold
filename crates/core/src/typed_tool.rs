@@ -23,16 +23,16 @@ pub trait ToolInput {
 
 /// Register an asynchronous handler using its input type as the tool schema.
 ///
-/// Derive [`crate::WakefoldTool`], Serde's `Deserialize`, and Schemars's
+/// Derive [`ToolInput`](derive@crate::ToolInput), Serde's `Deserialize`, and Schemars's
 /// `JsonSchema` on a named-field struct. Arguments are deserialized before
 /// the handler runs.
 ///
 /// ```
 /// use schemars::JsonSchema;
 /// use serde::Deserialize;
-/// use wakefold::{JsonValue, Tool, WakefoldTool, typed_tool};
+/// use wakefold::{JsonValue, Tool, ToolInput, typed_tool};
 ///
-/// #[derive(Deserialize, JsonSchema, WakefoldTool)]
+/// #[derive(Deserialize, JsonSchema, ToolInput)]
 /// #[tool(name = "echo", description = "Echo a message")]
 /// struct Echo {
 ///     message: String,

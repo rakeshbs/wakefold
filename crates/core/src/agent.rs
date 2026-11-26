@@ -14,8 +14,8 @@ use thiserror::Error;
 
 use crate::skill::RunSkills;
 use crate::{
-    CallId, CancellationToken, Message, ModelRequest, Provider, ProviderError, RetryPolicy,
-    RunEvent, RunJournal, RunWorkspace, Skill, TokenUsage, ToolCall, ToolContext, ToolError,
+    CancellationToken, Message, ModelRequest, ModelRetryPolicy, Provider, ProviderError, RunEvent,
+    RunJournal, RunWorkspace, Skill, TokenUsage, ToolCall, ToolCallId, ToolContext, ToolError,
 };
 
 /// Limits, retries, and cancellation for a single agent run.
@@ -25,7 +25,7 @@ pub struct RunOptions {
     max_model_turns: usize,
     token_budget: Option<u64>,
     context_byte_budget: Option<usize>,
-    retry_policy: RetryPolicy,
+    model_retry_policy: ModelRetryPolicy,
     workspace: Option<RunWorkspace>,
     cancellation: Option<CancellationToken>,
 }
@@ -37,7 +37,7 @@ impl RunOptions {
             max_model_turns,
             token_budget: None,
             context_byte_budget: None,
-            retry_policy: RetryPolicy::default(),
+            model_retry_policy: ModelRetryPolicy::default(),
             workspace: None,
             cancellation: None,
         }
@@ -67,8 +67,8 @@ impl RunOptions {
     /// Configure retries for each model turn.
     ///
     /// Attempts for the same model turn share one slot in the turn limit.
-    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
-        self.retry_policy = policy;
+    pub fn with_model_retry_policy(mut self, policy: ModelRetryPolicy) -> Self {
+        self.model_retry_policy = policy;
         self
     }
 
@@ -155,7 +155,7 @@ pub enum RunError {
     #[error("outcome of tool {name} (call {id}) is unknown")]
     ToolOutcomeUnknown {
         /// The interrupted call.
-        id: CallId,
+        id: ToolCallId,
         /// The tool whose effects may have occurred.
         name: String,
     },
@@ -189,9 +189,9 @@ pub enum RunError {
         name: String,
     },
 
-    /// The model requested a tool that was not registered.
-    #[error("model requested unknown tool {name}")]
-    UnknownTool {
+    /// The requested function is unknown or its tool is unavailable in the loaded skills.
+    #[error("tool {name} is unavailable")]
+    ToolUnavailable {
         /// The requested tool name.
         name: String,
     },
@@ -200,7 +200,7 @@ pub enum RunError {
     #[error("model repeated tool call ID {id}")]
     DuplicateCallId {
         /// The repeated call identifier.
-        id: CallId,
+        id: ToolCallId,
     },
 
     /// A tool failed while executing the model's request.
@@ -345,7 +345,7 @@ impl RunJournal<'_> {
     ///
     /// let mut store = WorkspaceStore::open("state")?;
     /// let mut journal = store.open_journal("chat-7", "run-1")?;
-    /// let report = journal.run("Set a timer", provider, skills, RunOptions::new(6)).await?;
+    /// let report = journal.run_or_resume("Set a timer", provider, skills, RunOptions::new(6)).await?;
     /// println!("{}", report.answer);
     /// # Ok(())
     /// # }
@@ -357,7 +357,7 @@ impl RunJournal<'_> {
     /// [`RunError::Journal`]. Returns [`RunError::ToolOutcomeUnknown`] if an interrupted
     /// tool cannot safely retry under its recorded and current recovery policies.
     /// Other failures are reported as in [`run_with_options`].
-    pub async fn run(
+    pub async fn run_or_resume(
         &mut self,
         prompt: impl Into<String> + Send,
         provider: &dyn Provider,
@@ -429,7 +429,7 @@ async fn drive(
                         provider,
                         compaction.request(),
                         &mut |_| {},
-                        options.retry_policy,
+                        options.model_retry_policy,
                         cancellation,
                     )
                     .await?;
@@ -447,7 +447,7 @@ async fn drive(
                         assistant_replay_data: &run.state.assistant_replay_data,
                     },
                     &mut emit_text,
-                    options.retry_policy,
+                    options.model_retry_policy,
                     cancellation,
                 )
                 .await?;
@@ -534,7 +534,7 @@ fn next_action(messages: &[Message], remaining_turns: usize) -> Option<Action<'_
 
 fn validate_calls(
     calls: &[ToolCall],
-    used_call_ids: &mut HashSet<CallId>,
+    used_call_ids: &mut HashSet<ToolCallId>,
     skills: &RunSkills<'_>,
 ) -> Result<(), RunError> {
     for call in calls {

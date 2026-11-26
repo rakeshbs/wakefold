@@ -11,8 +11,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use wakefold::{
-    JsonValue, Message, ModelRequest, ModelResponse, ModelTurn, OpenAiProvider, Provider,
-    ProviderError, ReasoningEffort, RetryPolicy, RunEvent, RunOptions, Skill, Tool, ToolError,
+    JsonValue, Message, ModelRequest, ModelResponse, ModelRetryPolicy, ModelTurn, OpenAiProvider,
+    Provider, ProviderError, ReasoningEffort, RunEvent, RunOptions, Skill, Tool, ToolError,
     ToolSpec, WorkspaceStore,
 };
 
@@ -88,10 +88,10 @@ async fn drive(state: &Path, stop_after_activation: bool) -> Result<String, Box<
     )];
     let options = RunOptions::new(5)
         .with_token_budget(6_000)
-        .with_retry_policy(RetryPolicy::new(0, Duration::ZERO));
+        .with_model_retry_policy(ModelRetryPolicy::new(0, Duration::ZERO));
     let report = tokio::time::timeout(
         Duration::from_secs(90),
-        journal.run(PROMPT, &provider, &skills, options),
+        journal.run_or_resume(PROMPT, &provider, &skills, options),
     )
     .await??;
     let entries = journal.load_after(0)?;
@@ -288,14 +288,14 @@ async fn drive_compaction(
     let mut journal = store.open_journal("synthetic-orders", "compaction")?;
     let report = tokio::time::timeout(
         Duration::from_secs(180),
-        journal.run(
+        journal.run_or_resume(
             COMPACTION_PROMPT,
             &provider,
             &skills,
             RunOptions::new(10)
                 .with_context_byte_budget(22_000)
                 .with_token_budget(50_000)
-                .with_retry_policy(RetryPolicy::new(0, Duration::ZERO)),
+                .with_model_retry_policy(ModelRetryPolicy::new(0, Duration::ZERO)),
         ),
     )
     .await??;
@@ -359,7 +359,7 @@ async fn live_compaction_preserves_skills_across_restart() -> Result<(), Box<dyn
         assert_eq!(definitions["tools"][2]["name"], "orders.lookup");
         assert_eq!(
             definitions["tools"][2]["parameters"],
-            Lookup(state.path()).spec().parameters
+            Lookup(state.path()).spec().argument_schema
         );
         (
             serde_json::to_value(checkpoint)?,
@@ -433,7 +433,7 @@ async fn live_compaction_preserves_skills_across_restart() -> Result<(), Box<dyn
     assert_eq!(verification["tools"][0]["name"], "verification.receipt");
     assert_eq!(
         verification["tools"][0]["parameters"],
-        Receipt(state.path()).spec().parameters
+        Receipt(state.path()).spec().argument_schema
     );
     eprintln!(
         "After restart, call_tool dispatched orders.lookup, load_skill loaded verification, and call_tool dispatched verification.receipt successfully."

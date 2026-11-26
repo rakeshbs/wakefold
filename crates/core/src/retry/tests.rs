@@ -25,7 +25,7 @@ impl Script {
 
     async fn retry_turn(
         &self,
-        policy: RetryPolicy,
+        policy: ModelRetryPolicy,
         cancellation: Option<&CancellationToken>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelTurn, RunError> {
@@ -94,7 +94,7 @@ async fn waits_for_server_delay_then_backs_off_when_no_delay_is_supplied() -> Re
     let start = TestInstant::now();
     let mut text = String::new();
     let turn = provider
-        .retry_turn(RetryPolicy::default(), None, &mut |chunk| {
+        .retry_turn(ModelRetryPolicy::default(), None, &mut |chunk| {
             text.push_str(chunk)
         })
         .await?;
@@ -115,7 +115,7 @@ async fn stops_when_attempts_run_out_or_the_server_delay_exceeds_the_window() {
     ]);
     let error = provider
         .retry_turn(
-            RetryPolicy::new(1, Duration::from_secs(10)),
+            ModelRetryPolicy::new(1, Duration::from_secs(10)),
             None,
             &mut |_| {},
         )
@@ -131,7 +131,7 @@ async fn stops_when_attempts_run_out_or_the_server_delay_exceeds_the_window() {
     let start = TestInstant::now();
     let error = provider
         .retry_turn(
-            RetryPolicy::new(3, Duration::from_secs(1)),
+            ModelRetryPolicy::new(3, Duration::from_secs(1)),
             None,
             &mut |_| {},
         )
@@ -153,7 +153,7 @@ async fn permanent_and_partial_stream_errors_surface_immediately() {
         let provider = Script::new([attempt, final_answer()]);
         let mut text = String::new();
         let result = provider
-            .retry_turn(RetryPolicy::default(), None, &mut |chunk| {
+            .retry_turn(ModelRetryPolicy::default(), None, &mut |chunk| {
                 text.push_str(chunk)
             })
             .await;
@@ -172,7 +172,11 @@ async fn cancellation_interrupts_the_wait_before_another_attempt() {
     let cancellation = CancellationToken::new();
     let mut on_text = |_: &str| {};
     let (result, ()) = tokio::join!(
-        provider.retry_turn(RetryPolicy::default(), Some(&cancellation), &mut on_text),
+        provider.retry_turn(
+            ModelRetryPolicy::default(),
+            Some(&cancellation),
+            &mut on_text
+        ),
         async {
             sleep(Duration::from_secs(1)).await;
             cancellation.cancel();
@@ -192,7 +196,8 @@ fn retries_a_model_turn_without_a_tokio_runtime_or_an_extra_turn() -> Result<(),
         "Hello",
         &provider,
         &[],
-        RunOptions::new(1).with_retry_policy(RetryPolicy::new(1, Duration::from_secs(5))),
+        RunOptions::new(1)
+            .with_model_retry_policy(ModelRetryPolicy::new(1, Duration::from_secs(5))),
     ))?;
     assert_eq!(report.answer, "Hi");
     assert_eq!(provider.remaining(), 0);

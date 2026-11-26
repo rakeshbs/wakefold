@@ -120,7 +120,7 @@ impl<'a> RunSkills<'a> {
             return Ok(());
         }
         if call.name != DISPATCHER {
-            return Err(RunError::UnknownTool {
+            return Err(RunError::ToolUnavailable {
                 name: call.name.clone(),
             });
         }
@@ -131,7 +131,7 @@ impl<'a> RunSkills<'a> {
                 source,
             })?;
         if !self.handlers.contains_key(name) {
-            return Err(RunError::UnknownTool {
+            return Err(RunError::ToolUnavailable {
                 name: name.to_owned(),
             });
         }

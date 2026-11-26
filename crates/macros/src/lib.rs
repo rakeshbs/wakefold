@@ -13,8 +13,8 @@ use syn::{Data, DeriveInput, Fields, Ident, LitStr, parse_macro_input};
 /// Schemars's `JsonSchema`, then pass a typed handler to `wakefold::typed_tool`.
 /// The optional `recovery` accepts `"retry_after_crash"` or `"stop_after_crash"`.
 /// Tools default to `"stop_after_crash"`.
-#[proc_macro_derive(WakefoldTool, attributes(tool))]
-pub fn derive_wakefold_tool(input: TokenStream) -> TokenStream {
+#[proc_macro_derive(ToolInput, attributes(tool))]
+pub fn derive_tool_input(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(&input)
         .unwrap_or_else(syn::Error::into_compile_error)
@@ -26,7 +26,7 @@ fn expand(input: &DeriveInput) -> syn::Result<Tokens> {
     if !matches!(&input.data, Data::Struct(data) if matches!(data.fields, Fields::Named(_))) {
         return Err(syn::Error::new(
             ident.span(),
-            "WakefoldTool can only be derived for structs with named fields",
+            "ToolInput can only be derived for structs with named fields",
         ));
     }
     let (name, description, recovery) = tool_metadata(input)?;
@@ -39,7 +39,7 @@ fn expand(input: &DeriveInput) -> syn::Result<Tokens> {
         Err(error) => {
             return Err(syn::Error::new(
                 ident.span(),
-                format!("WakefoldTool requires the wakefold crate: {error}"),
+                format!("ToolInput requires the wakefold crate: {error}"),
             ));
         }
     };

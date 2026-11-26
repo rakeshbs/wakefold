@@ -72,7 +72,7 @@ pub struct JournalEntry {
 pub enum JournalError {
     /// Another position is already the current tail of this run.
     #[error("expected journal sequence {expected}, found {actual}")]
-    Conflict {
+    SequenceMismatch {
         /// Tail supplied by the caller.
         expected: u64,
         /// Last committed sequence, or zero for an empty journal.
@@ -152,8 +152,12 @@ impl<'a> RunJournal<'a> {
     ///
     /// # Errors
     ///
-    /// A stale tail returns [`JournalError::Conflict`]. A failed batch is rolled back.
-    pub fn append(&mut self, expected: u64, events: &[RunEvent]) -> Result<u64, JournalError> {
+    /// A stale tail returns [`JournalError::SequenceMismatch`]. A failed batch is rolled back.
+    pub fn append(
+        &mut self,
+        expected_last_sequence: u64,
+        events: &[RunEvent],
+    ) -> Result<u64, JournalError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -162,9 +166,9 @@ impl<'a> RunJournal<'a> {
             [self.workspace.agent_id()],
             |row| row.get(0),
         )?;
-        if sequence != expected {
-            return Err(JournalError::Conflict {
-                expected,
+        if sequence != expected_last_sequence {
+            return Err(JournalError::SequenceMismatch {
+                expected: expected_last_sequence,
                 actual: sequence,
             });
         }

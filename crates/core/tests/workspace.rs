@@ -11,13 +11,13 @@ use serde_json::json;
 use wakefold::testing::{ScriptedProvider, ScriptedTurn};
 use wakefold::{
     Message, ModelResponse, RunOptions, RunWorkspace, Skill, Tool, ToolContext, ToolError,
-    ToolResult, WakefoldTool, WorkspaceStore, run_with_options, typed_tool_with_context,
+    ToolInput, ToolResult, WorkspaceStore, run_with_options, typed_tool_with_context,
 };
 
 const CONTENT: &str = "notes from the first agent";
 const CHAT: &str = "../chat/one";
 
-#[derive(Deserialize, JsonSchema, WakefoldTool)]
+#[derive(Deserialize, JsonSchema, ToolInput)]
 #[tool(name = "note", description = "Access the chat note")]
 struct Note {}
 

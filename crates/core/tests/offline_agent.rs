@@ -152,7 +152,7 @@ fn rejects_a_tool_from_an_unloaded_skill() {
     ));
 
     assert!(
-        matches!(&result, Err(RunError::UnknownTool { name }) if name == "util.echo"),
+        matches!(&result, Err(RunError::ToolUnavailable { name }) if name == "util.echo"),
         "{result:?}"
     );
     assert_eq!(tool.calls.load(Ordering::Relaxed), 0);
@@ -396,7 +396,7 @@ fn a_load_and_premature_tool_call_in_one_turn_are_rejected_before_dispatch() {
         &[Skill::new("util", "Echo", &[&echo])],
         2,
     ));
-    assert!(matches!(result, Err(RunError::UnknownTool { name }) if name == "util.echo"));
+    assert!(matches!(result, Err(RunError::ToolUnavailable { name }) if name == "util.echo"));
     assert_eq!(echo.calls.load(Ordering::Relaxed), 0);
 }
 
@@ -462,7 +462,7 @@ fn rejects_malformed_and_unregistered_tool_calls_before_execution() {
         assert!(
             matches!(
                 result,
-                Err(RunError::Tool { .. } | RunError::UnknownTool { .. })
+                Err(RunError::Tool { .. } | RunError::ToolUnavailable { .. })
             ),
             "{result:?}"
         );
@@ -475,9 +475,9 @@ fn rejects_malformed_and_unregistered_tool_calls_before_execution() {
 fn dispatcher_deserializes_inner_arguments_before_running_a_typed_tool() {
     use schemars::JsonSchema;
     use serde::Deserialize;
-    use wakefold::{WakefoldTool, typed_tool};
+    use wakefold::{ToolInput, typed_tool};
 
-    #[derive(Deserialize, JsonSchema, WakefoldTool)]
+    #[derive(Deserialize, JsonSchema, ToolInput)]
     #[serde(deny_unknown_fields)]
     #[tool(name = "echo", description = "Echo a message")]
     struct EchoInput {

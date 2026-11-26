@@ -165,9 +165,9 @@ fn in_flight_tool_can_observe_cancellation_before_it_is_dropped() {
 fn typed_tool_receives_the_run_cancellation_signal() {
     use schemars::JsonSchema;
     use serde::Deserialize;
-    use wakefold::{WakefoldTool, typed_tool_with_context};
+    use wakefold::{ToolInput, typed_tool_with_context};
 
-    #[derive(Deserialize, JsonSchema, WakefoldTool)]
+    #[derive(Deserialize, JsonSchema, ToolInput)]
     #[tool(name = "stop", description = "Stop the current run")]
     struct Stop {}
 

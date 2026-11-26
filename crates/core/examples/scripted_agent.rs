@@ -7,10 +7,10 @@ use serde_json::json;
 use wakefold::testing::{ScriptedProvider, ScriptedTurn};
 use wakefold::{
     JsonValue, Message, ModelResponse, RunError, RunOptions, RunReport, Skill, TokenUsage, Tool,
-    ToolCall, ToolError, ToolResult, WakefoldTool, run_with_options, typed_tool,
+    ToolCall, ToolError, ToolInput, ToolResult, run_with_options, typed_tool,
 };
 
-#[derive(Deserialize, JsonSchema, WakefoldTool)]
+#[derive(Deserialize, JsonSchema, ToolInput)]
 #[serde(deny_unknown_fields)]
 #[tool(
     name = "lookup_price",
@@ -28,7 +28,7 @@ async fn lookup_price(input: LookupPrice) -> Result<JsonValue, ToolError> {
     Ok(json!({"price_cents": 350}))
 }
 
-#[derive(Deserialize, JsonSchema, WakefoldTool)]
+#[derive(Deserialize, JsonSchema, ToolInput)]
 #[serde(deny_unknown_fields)]
 #[tool(
     name = "calculate_total",

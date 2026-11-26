@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use super::{Action, RunError, RunOptions, RunUsage, next_action, validate_calls};
 use crate::context::Compaction;
 use crate::skill::{LOADER, RunSkills};
-use crate::{CallId, JsonValue, Message, ModelTurn, RunEvent, RunJournal, ToolCall, ToolRecovery};
+use crate::{
+    JsonValue, Message, ModelTurn, RunEvent, RunJournal, ToolCall, ToolCallId, ToolRecovery,
+};
 
 /// A durable model-call boundary containing the compacted transcript and run bookkeeping.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -21,7 +23,7 @@ pub(super) struct RunState {
     pub messages: Vec<Message>,
     #[serde(rename = "assistant_context")]
     pub assistant_replay_data: Vec<Option<JsonValue>>,
-    used_call_ids: HashSet<CallId>,
+    used_call_ids: HashSet<ToolCallId>,
     pub model_turns: usize,
     pub usage: RunUsage,
 }

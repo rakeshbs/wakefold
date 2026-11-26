@@ -29,15 +29,15 @@ pub use provider::{
 };
 #[cfg(feature = "openai")]
 pub use providers::openai::{OpenAiProvider, ReasoningEffort};
-pub use retry::RetryPolicy;
+pub use retry::ModelRetryPolicy;
 pub use serde_json::Value as JsonValue;
 pub use skill::Skill;
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{
-    CallId, Tool, ToolCall, ToolContext, ToolError, ToolRecovery, ToolResult, ToolSpec,
+    Tool, ToolCall, ToolCallId, ToolContext, ToolError, ToolRecovery, ToolResult, ToolSpec,
 };
 #[cfg(feature = "derive")]
 pub use typed_tool::{ToolInput, typed_tool, typed_tool_with_context};
 #[cfg(feature = "derive")]
-pub use wakefold_macros::WakefoldTool;
+pub use wakefold_macros::ToolInput;
 pub use workspace::{RunWorkspace, WorkspaceError, WorkspaceStore};

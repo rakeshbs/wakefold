@@ -5,9 +5,9 @@ use futures_executor::block_on;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
-use wakefold::{Tool, ToolError, ToolRecovery, WakefoldTool, typed_tool};
+use wakefold::{Tool, ToolError, ToolInput, ToolRecovery, typed_tool};
 
-#[derive(Deserialize, JsonSchema, WakefoldTool)]
+#[derive(Deserialize, JsonSchema, ToolInput)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[tool(
     name = "calculate",
@@ -28,14 +28,14 @@ fn derives_metadata_and_schema_from_the_argument_type() {
     assert_eq!(spec.name, "calculate");
     assert_eq!(spec.recovery, ToolRecovery::RetryAfterCrash);
     assert_eq!(spec.description, "Calculate an order total");
-    assert_eq!(spec.parameters["type"], "object");
-    assert_eq!(spec.parameters["additionalProperties"], false);
+    assert_eq!(spec.argument_schema["type"], "object");
+    assert_eq!(spec.argument_schema["additionalProperties"], false);
     assert_eq!(
-        spec.parameters["properties"]["unitPrice"]["type"],
+        spec.argument_schema["properties"]["unitPrice"]["type"],
         "integer"
     );
-    assert_eq!(spec.parameters["properties"]["quantity"]["minimum"], 1);
-    let required = spec.parameters["required"]
+    assert_eq!(spec.argument_schema["properties"]["quantity"]["minimum"], 1);
+    let required = spec.argument_schema["required"]
         .as_array()
         .expect("the schema contains required arguments");
     assert_eq!(required.len(), 2);

@@ -30,7 +30,7 @@ mod tests;
 /// Enable the `openai` Cargo feature and use a Tokio runtime with I/O enabled.
 /// The provider sends `store: false` and replays output items, including
 /// encrypted reasoning, with subsequent tool results. Agent runs apply
-/// [`RetryPolicy`](crate::RetryPolicy) to eligible failures before a stream opens.
+/// [`ModelRetryPolicy`](crate::ModelRetryPolicy) to eligible failures before a stream opens.
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -191,7 +191,7 @@ fn response_tools(specs: &[crate::ToolSpec]) -> Vec<Tool> {
                 .push(NamespaceToolParamTool::Function(FunctionToolParam {
                     name: local.to_owned(),
                     description: Some(spec.description.clone()),
-                    parameters: Some(spec.parameters.clone()),
+                    parameters: Some(spec.argument_schema.clone()),
                     strict: Some(false),
                     ..Default::default()
                 }));
@@ -200,7 +200,7 @@ fn response_tools(specs: &[crate::ToolSpec]) -> Vec<Tool> {
             tools.push(Tool::Function(FunctionTool {
                 name: spec.name.clone(),
                 description: Some(spec.description.clone()),
-                parameters: Some(spec.parameters.clone()),
+                parameters: Some(spec.argument_schema.clone()),
                 strict: Some(false),
                 ..Default::default()
             }));

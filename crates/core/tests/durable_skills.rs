@@ -182,7 +182,7 @@ fn run_note(
 ) -> Result<wakefold::RunReport, RunError> {
     let mut store = WorkspaceStore::open(path).unwrap();
     let mut journal = store.open_journal("chat", "notes").unwrap();
-    block_on(journal.run(
+    block_on(journal.run_or_resume(
         PROMPT,
         provider,
         &[Skill::new(
@@ -290,7 +290,7 @@ fn failed_loader_commit_rolls_back_activation_and_can_be_retried() {
     let mut journal = store.open_journal("chat", "run").unwrap();
     let tools: [&dyn Tool; 1] = [&WriteNote];
     let skills = [Skill::new("notes", "Manage notes", &tools)];
-    let result = block_on(journal.run(PROMPT, &LoadTwice, &skills, RunOptions::new(3)));
+    let result = block_on(journal.run_or_resume(PROMPT, &LoadTwice, &skills, RunOptions::new(3)));
     assert!(matches!(result, Err(RunError::Journal(_))));
     let entries = journal.load_after(0).unwrap();
     assert!(matches!(
@@ -303,7 +303,8 @@ fn failed_loader_commit_rolls_back_activation_and_can_be_retried() {
             .any(|entry| matches!(entry.event, RunEvent::SkillLoaded(_)))
     );
     db.execute_batch("DROP TRIGGER interrupt_loader").unwrap();
-    let report = block_on(journal.run(PROMPT, &LoadTwice, &skills, RunOptions::new(3))).unwrap();
+    let report =
+        block_on(journal.run_or_resume(PROMPT, &LoadTwice, &skills, RunOptions::new(3))).unwrap();
     assert_eq!(report.answer, "done");
     let entries = journal.load_after(0).unwrap();
     let loads: Vec<_> = entries
@@ -315,11 +316,11 @@ fn failed_loader_commit_rolls_back_activation_and_can_be_retried() {
         matches!(&entries[loads[0].sequence as usize].event, RunEvent::ToolCallCompleted(result) if result.call_id == "first".into())
     );
     assert!(matches!(
-        block_on(journal.run("different", &NoCalls, &skills, RunOptions::new(3))),
+        block_on(journal.run_or_resume("different", &NoCalls, &skills, RunOptions::new(3))),
         Err(RunError::InvalidJournal(_))
     ));
     assert!(matches!(
-        block_on(journal.run(PROMPT, &NoCalls, &[], RunOptions::new(3))),
+        block_on(journal.run_or_resume(PROMPT, &NoCalls, &[], RunOptions::new(3))),
         Err(RunError::Tool { .. })
     ));
 }
@@ -366,7 +367,7 @@ fn interrupted_application_tool_is_never_dispatched_again() {
             ],
         )
         .unwrap();
-    let result = block_on(journal.run(
+    let result = block_on(journal.run_or_resume(
         PROMPT,
         &NoCalls,
         &[Skill::new("notes", "Manage notes", &[&WriteNote])],
@@ -408,7 +409,8 @@ fn concurrent_driver_is_excluded_until_the_owner_dies() {
         let path = Path::new(&dir);
         let mut store = WorkspaceStore::open(path).unwrap();
         let mut journal = store.open_journal("chat", "one").unwrap();
-        block_on(journal.run(PROMPT, &HoldAtModel(path), &[], RunOptions::new(1))).unwrap();
+        block_on(journal.run_or_resume(PROMPT, &HoldAtModel(path), &[], RunOptions::new(1)))
+            .unwrap();
         return;
     }
 
@@ -432,8 +434,8 @@ fn concurrent_driver_is_excluded_until_the_owner_dies() {
     }
     let mut store = WorkspaceStore::open(dir.path()).unwrap();
     let mut competing = store.open_journal("chat", "one").unwrap();
-    let result = block_on(competing.run(PROMPT, &NoCalls, &[], RunOptions::new(1)));
-    let other = block_on(store.open_journal("chat", "two").unwrap().run(
+    let result = block_on(competing.run_or_resume(PROMPT, &NoCalls, &[], RunOptions::new(1)));
+    let other = block_on(store.open_journal("chat", "two").unwrap().run_or_resume(
         PROMPT,
         &Answer,
         &[],
@@ -453,7 +455,7 @@ fn concurrent_driver_is_excluded_until_the_owner_dies() {
     assert_eq!(other.unwrap().answer, "done");
     let mut recovered = store.open_journal("chat", "one").unwrap();
     assert_eq!(
-        block_on(recovered.run(PROMPT, &Answer, &[], RunOptions::new(1)))
+        block_on(recovered.run_or_resume(PROMPT, &Answer, &[], RunOptions::new(1)))
             .unwrap()
             .answer,
         "done"

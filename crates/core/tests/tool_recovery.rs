@@ -132,7 +132,7 @@ impl Tool for Operation<'_> {
 struct Workflow<'a>(&'a Path);
 
 #[cfg(feature = "derive")]
-#[derive(serde::Deserialize, schemars::JsonSchema, wakefold::WakefoldTool)]
+#[derive(serde::Deserialize, schemars::JsonSchema, wakefold::ToolInput)]
 #[serde(deny_unknown_fields)]
 #[tool(
     name = "reserve",
@@ -220,7 +220,7 @@ fn run_workflow(
     if let Some(hook) = hook {
         journal.set_commit_hook(hook);
     }
-    block_on(journal.run(PROMPT, &Workflow(root), &skills, RunOptions::new(3)))
+    block_on(journal.run_or_resume(PROMPT, &Workflow(root), &skills, RunOptions::new(3)))
 }
 
 fn events(root: &Path) -> Vec<RunEvent> {
