@@ -350,8 +350,9 @@ impl RunJournal<'_> {
     /// Supply the original prompt and skill definitions on restart. Turn limits
     /// and usage apply to the entire run. A finished run returns its saved answer.
     /// SQLite reads and writes are synchronous at step boundaries. A model request
-    /// interrupted before its response was committed may be sent again. Interrupted
-    /// tools that opt into retrying can reuse their saved idempotency key.
+    /// interrupted before its response was committed may be sent again. If a tool
+    /// call was recorded but has no saved result, its [`crate::ToolRecovery`] policy
+    /// applies. This includes resuming after a handler error in the same process.
     ///
     /// ```no_run
     /// # async fn example(provider: &dyn wakefold::Provider, skills: &[wakefold::Skill<'_>])

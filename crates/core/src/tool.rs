@@ -35,12 +35,16 @@ impl fmt::Display for ToolCallId {
     }
 }
 
-/// Controls how Wakefold handles an interrupted tool call after a crash.
+/// Controls how a journaled run resumes a tool call with no saved result.
+///
+/// The policy applies whenever the journal recorded the call but has no completed
+/// result. This can happen after a process crash, cancellation, or a handler
+/// returning [`ToolError`], even if the host resumes in the same process.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ToolRecovery {
-    /// Retry an interrupted call. The handler must make repetition safe.
+    /// Retry with the original call key when both the saved and current policies allow it.
     ///
     /// Calls that only read data can repeat directly. Calls that change state
     /// must use [`ToolContext::tool_call_key`] to prevent duplicate changes

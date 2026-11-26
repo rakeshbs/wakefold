@@ -82,7 +82,10 @@ impl Tool for Operation<'_> {
             .expect("agent calls must have an idempotency key");
         append_line(self.root.join(format!("{}-attempts", self.name)), key);
         let result = match self.name {
-            "read" => json!(fs::read_to_string(self.root.join("catalog")).unwrap()),
+            "read" => json!(
+                fs::read_to_string(self.root.join("catalog"))
+                    .map_err(|e| ToolError::with_source("could not read catalog", e))?
+            ),
             "reserve" => {
                 // The backing service commits the key and side effect together.
                 let mut service = Connection::open(self.root.join("reservations.sqlite3")).unwrap();
@@ -391,6 +394,37 @@ fn process_crashes_at_every_durable_boundary() {
         }
         if point == "read-effect" {
             assert_eq!(lines(root.path(), "read-attempts").len(), 2);
+        }
+    }
+}
+
+#[test]
+fn resuming_after_a_handler_error_uses_the_recorded_policy_and_key() {
+    for policy in [ToolRecovery::RetryAfterCrash, ToolRecovery::StopAfterCrash] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path();
+        let mut policies = POLICIES;
+        policies[0] = policy;
+
+        // The missing catalog makes the handler return an error after recording its call key.
+        assert!(matches!(
+            run_workflow(path, policies, None),
+            Err(RunError::Tool { name, .. }) if name == "workflow.read"
+        ));
+        let attempts = lines(path, "read-attempts");
+        assert_eq!(attempts.len(), 1);
+        fs::write(path.join("catalog"), "notebook").unwrap();
+
+        let resumed = run_workflow(path, policies, None);
+        if policy == ToolRecovery::RetryAfterCrash {
+            assert_eq!(resumed.unwrap().answer, "reserved and notified");
+            let original_key = attempts[0].as_str();
+            assert_eq!(lines(path, "read-attempts"), [original_key, original_key]);
+        } else {
+            assert!(
+                matches!(resumed, Err(RunError::ToolOutcomeUnknown { name, .. }) if name == "workflow.read")
+            );
+            assert_eq!(lines(path, "read-attempts"), attempts);
         }
     }
 }
