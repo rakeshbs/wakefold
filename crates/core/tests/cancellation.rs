@@ -130,7 +130,7 @@ fn scripted_tool_call(prompt: &str, name: &str, spec: ToolSpec) -> ScriptedProvi
         load,
         ScriptedTurn::new(
             messages,
-            ModelResponse::ToolCall(common::call_tool("call-1", name, json!({}))),
+            ModelResponse::from(common::call_tool("call-1", name, json!({}))),
         ),
     ])
 }

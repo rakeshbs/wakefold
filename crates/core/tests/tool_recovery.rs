@@ -164,7 +164,7 @@ impl Provider for Workflow<'_> {
         );
         append_line(self.0.join("model-calls"), "called");
         let response = match request.messages.last().unwrap() {
-            Message::User(_) => ModelResponse::ToolCall(ToolCall::new("load", "load_skill", json!({"name": "workflow"}))),
+            Message::User(_) => ModelResponse::from(ToolCall::new("load", "load_skill", json!({"name": "workflow"}))),
             Message::Tool(result) if result.value["loaded"] == "workflow" => ModelResponse::ToolCalls {
                 text: None,
                 calls: ["read", "reserve", "notify"].into_iter().map(|name| ToolCall::new(

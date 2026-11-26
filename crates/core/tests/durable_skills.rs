@@ -76,7 +76,7 @@ fn definitions() -> JsonValue {
 }
 
 fn load(id: &str) -> ModelResponse {
-    ModelResponse::ToolCall(ToolCall::new(id, "load_skill", json!({"name": "notes"})))
+    ModelResponse::from(ToolCall::new(id, "load_skill", json!({"name": "notes"})))
 }
 
 fn write_note() -> ModelResponse {
@@ -332,7 +332,7 @@ fn interrupted_application_tool_is_never_dispatched_again() {
     let mut journal = store.open_journal("chat", "run").unwrap();
     let loader = load("first");
     // Older journals recorded the dispatcher target under `name`.
-    let call = ModelResponse::ToolCall(ToolCall::new(
+    let call = ModelResponse::from(ToolCall::new(
         "write",
         "call_tool",
         json!({"name": "notes.write", "arguments": {}}),

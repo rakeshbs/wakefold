@@ -81,7 +81,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
         )],
     };
 
-    let load = ModelResponse::ToolCall(ToolCall::new(
+    let load = ModelResponse::from(ToolCall::new(
         "load-1",
         "load_skill",
         json!({"name": "pricing"}),

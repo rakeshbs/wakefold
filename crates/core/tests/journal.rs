@@ -11,7 +11,7 @@ fn reopens_run_events_in_order_with_provider_replay_data() {
     let state = tempfile::tempdir().unwrap();
     let call = ToolCall::new("call-1", "lookup", json!({"id": 3}));
     let mut turn = ModelTurn::new(
-        ModelResponse::ToolCall(call.clone()),
+        ModelResponse::from(call.clone()),
         Some(TokenUsage::new(4, 2)),
     );
     turn.replay_data = Some(json!({"opaque": ["provider data"]}));

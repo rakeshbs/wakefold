@@ -22,15 +22,16 @@ pub enum Message {
     Tool(ToolResult),
 }
 
-/// A completed model turn.
+/// The assistant's answer or tool requests for one turn.
+///
+/// Use `ModelResponse::from(call)` for a single [`ToolCall`] without accompanying text.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(from = "StoredModelResponse")]
 #[non_exhaustive]
 pub enum ModelResponse {
     /// The final answer to the user.
     Final(String),
-    /// A request to run a tool before asking the model again.
-    ToolCall(ToolCall),
-    /// An assistant message that requests several tool calls or includes text.
+    /// An assistant message with an ordered list of tool calls and optional text.
     ToolCalls {
         /// Text emitted before or alongside the calls.
         text: Option<String>,
@@ -39,12 +40,41 @@ pub enum ModelResponse {
     },
 }
 
+impl From<ToolCall> for ModelResponse {
+    fn from(call: ToolCall) -> Self {
+        Self::ToolCalls {
+            text: None,
+            calls: vec![call],
+        }
+    }
+}
+
+// Earlier journals can contain the single-call variant in both events and checkpoints.
+#[derive(serde::Deserialize)]
+enum StoredModelResponse {
+    Final(String),
+    ToolCalls {
+        text: Option<String>,
+        calls: Vec<ToolCall>,
+    },
+    ToolCall(ToolCall),
+}
+
+impl From<StoredModelResponse> for ModelResponse {
+    fn from(stored: StoredModelResponse) -> Self {
+        match stored {
+            StoredModelResponse::Final(answer) => Self::Final(answer),
+            StoredModelResponse::ToolCalls { text, calls } => Self::ToolCalls { text, calls },
+            StoredModelResponse::ToolCall(call) => call.into(),
+        }
+    }
+}
+
 impl ModelResponse {
     /// Text emitted by the model during this turn, if any.
     pub fn text(&self) -> Option<&str> {
         match self {
             Self::Final(answer) => Some(answer),
-            Self::ToolCall(_) => None,
             Self::ToolCalls { text, .. } => text.as_deref(),
         }
     }
@@ -59,7 +89,6 @@ impl ModelResponse {
     pub fn tool_calls(&self) -> &[ToolCall] {
         match self {
             Self::Final(_) => &[],
-            Self::ToolCall(call) => std::slice::from_ref(call),
             Self::ToolCalls { calls, .. } => calls,
         }
     }

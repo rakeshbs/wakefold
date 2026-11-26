@@ -127,7 +127,7 @@ fn repeated_compaction_preserves_loaded_schemas_and_mixed_call_turns() -> Result
         "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
     }]);
     let loader = [
-        Message::Assistant(ModelResponse::ToolCall(ToolCall::new(
+        Message::Assistant(ModelResponse::from(ToolCall::new(
             "load-notes",
             "load_skill",
             json!({"name": "notes"}),
@@ -158,7 +158,7 @@ fn repeated_compaction_preserves_loaded_schemas_and_mixed_call_turns() -> Result
     let mut messages = vec![Message::User("Keep the notes.".into())];
     messages.extend(loader.clone());
     messages.extend([
-        Message::Assistant(ModelResponse::ToolCall(ToolCall::new(
+        Message::Assistant(ModelResponse::from(ToolCall::new(
             "reload-notes",
             "load_skill",
             json!({"name": "notes"}),
