@@ -155,6 +155,13 @@ pub enum RunError {
     #[error("the supplied prompt differs from the run's original prompt")]
     ResumePromptMismatch,
 
+    /// A skill loaded by the saved run is missing from the supplied catalog.
+    #[error("cannot resume run without the previously loaded skill {name}")]
+    MissingSkillOnResume {
+        /// The skill to supply when resuming this run.
+        name: String,
+    },
+
     /// The supplied workspace belongs to a different run.
     #[error("the supplied workspace belongs to a different run")]
     RunWorkspaceMismatch,
@@ -363,6 +370,7 @@ impl RunJournal<'_> {
     ///
     /// Returns [`RunError::ResumePromptMismatch`] if the original prompt differs
     /// and [`RunError::RunWorkspaceMismatch`] if the options specify another run's workspace.
+    /// Returns [`RunError::MissingSkillOnResume`] if the catalog omits a previously loaded skill.
     /// A concurrent driver receives [`crate::JournalError::AlreadyRunning`] inside
     /// [`RunError::Journal`]. Returns [`RunError::ToolOutcomeUnknown`] if an interrupted
     /// tool cannot safely retry under its recorded and current recovery policies.

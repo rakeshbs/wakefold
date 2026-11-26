@@ -202,7 +202,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             }
             (RunPhase::Ready, RunEvent::TranscriptCompacted(snapshot)) => {
                 for name in snapshot.loaded_skill_names {
-                    activate_skill(&mut self.skills, &name)?;
+                    self.skills.activate(&name)?;
                 }
                 self.state = snapshot.state;
                 RunPhase::Ready
@@ -236,7 +236,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             (RunPhase::ToolPrepared { call, .. }, RunEvent::SkillLoaded(name))
                 if call.name == LOADER && call.arguments["name"].as_str() == Some(&name) =>
             {
-                activate_skill(&mut self.skills, &name)?;
+                self.skills.activate(&name)?;
                 return Ok(());
             }
             (RunPhase::ToolPrepared { call, .. }, RunEvent::ToolCallCompleted(result))
@@ -263,11 +263,4 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         };
         Ok(())
     }
-}
-
-fn activate_skill(skills: &mut RunSkills<'_>, name: &str) -> Result<(), RunError> {
-    skills.activate(name).map_err(|source| RunError::Tool {
-        name: LOADER.to_owned(),
-        source,
-    })
 }

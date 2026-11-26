@@ -142,7 +142,10 @@ impl<'a> RunSkills<'a> {
     }
 
     fn definitions(&self, name: &str) -> Result<JsonValue, ToolError> {
-        let tools = self.available.get(name).ok_or_else(|| unavailable(name))?;
+        let tools = self
+            .available
+            .get(name)
+            .ok_or_else(|| ToolError::new(format!("skill {name} is unavailable to this agent")))?;
         Ok(json!({
             "loaded": name,
             "tools": tools.iter().map(|(spec, _)| spec).collect::<Vec<_>>()
@@ -220,11 +223,16 @@ impl<'a> RunSkills<'a> {
         self.loaded.iter().any(|loaded| loaded == name)
     }
 
-    pub(crate) fn activate(&mut self, name: &str) -> Result<(), ToolError> {
+    pub(crate) fn activate(&mut self, name: &str) -> Result<(), RunError> {
         if self.is_loaded(name) {
             return Ok(());
         }
-        let tools = self.available.get(name).ok_or_else(|| unavailable(name))?;
+        let tools = self
+            .available
+            .get(name)
+            .ok_or_else(|| RunError::MissingSkillOnResume {
+                name: name.to_owned(),
+            })?;
         for (spec, tool) in tools {
             self.handlers
                 .insert(spec.name.clone(), (spec.recovery, *tool));
@@ -241,10 +249,6 @@ fn load_name(arguments: &JsonValue) -> Result<&str, ToolError> {
         .and_then(|fields| fields.get("name"))
         .and_then(JsonValue::as_str)
         .ok_or_else(|| ToolError::new("expected an object with a single string field `name`"))
-}
-
-fn unavailable(name: &str) -> ToolError {
-    ToolError::new(format!("skill {name} is unavailable to this agent"))
 }
 
 fn validate_name(name: &str) -> Result<(), RunError> {

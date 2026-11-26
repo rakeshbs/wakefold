@@ -219,6 +219,15 @@ fn process_restart_restores_loaded_tools_after_compaction() {
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(73));
+    {
+        let mut store = WorkspaceStore::open(dir.path()).unwrap();
+        let mut journal = store.open_journal("chat", "notes").unwrap();
+        let before = journal.load_after(0).unwrap();
+        let error =
+            block_on(journal.run_or_resume(PROMPT, &NoCalls, &[], RunOptions::new(5))).unwrap_err();
+        assert!(matches!(error, RunError::MissingSkillOnResume { name } if name == "notes"));
+        assert_eq!(journal.load_after(0).unwrap(), before);
+    }
     let report = run_note(dir.path(), &AfterRestart, 2000).unwrap();
     assert_eq!(report.answer, "done");
     assert_eq!(report.usage.reported_tokens, TokenUsage::new(8, 4));
@@ -366,7 +375,7 @@ fn failed_loader_commit_rolls_back_activation_and_can_be_retried() {
     ));
     assert!(matches!(
         block_on(journal.run_or_resume(PROMPT, &NoCalls, &[], RunOptions::new(3))),
-        Err(RunError::Tool { .. })
+        Err(RunError::MissingSkillOnResume { name }) if name == "notes"
     ));
 }
 
