@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use futures_executor::block_on;
 use serde_json::json;
 use wakefold::{
-    CancellationToken, JournalError, JsonValue, Message, ModelRequest, ModelResponse, Provider,
-    ProviderError, RunError, RunEvent, RunOptions, RunOutcome, ScheduledRunConfig, SendMessage,
-    Skill, Tool, ToolCall, WaitForMessage, WaitOn, WakeEvent, WorkspaceStore,
+    CancellationToken, ClientMessageError, JournalError, JsonValue, Message, ModelRequest,
+    ModelResponse, Provider, ProviderError, RunError, RunEvent, RunOptions, RunOutcome,
+    ScheduledRunConfig, SendMessage, Skill, Tool, ToolCall, WaitForMessage, WaitOn, WakeEvent,
+    WorkspaceStore,
 };
 
 const PROMPT: &str = "Exchange the notebook price.";
@@ -17,6 +18,99 @@ const CHILD_STATE: &str = "WAKEFOLD_MAILBOX_TEST_STATE";
 static TOOLS: [&dyn Tool; 2] = [&SendMessage, &WaitForMessage];
 fn mailbox_skills() -> [Skill<'static>; 1] {
     [Skill::new("mailbox", "Send and receive messages", &TOOLS)]
+}
+
+#[test]
+fn opening_a_legacy_mailbox_keeps_order_and_consumption() {
+    let state = tempfile::tempdir().unwrap();
+    let mut store = WorkspaceStore::open(state.path()).unwrap();
+    let sender = store.queue_run("chat", "sender", "agent", PROMPT).unwrap();
+    let receiver = store
+        .queue_run("chat", "receiver", "agent", PROMPT)
+        .unwrap();
+    drop(store);
+
+    let db = rusqlite::Connection::open(state.path().join("wakefold.sqlite3")).unwrap();
+    db.execute_batch(
+        "DROP TABLE mailbox;
+         CREATE TABLE mailbox (
+             arrival_order INTEGER PRIMARY KEY,
+             message_id TEXT NOT NULL UNIQUE,
+             from_agent_id INTEGER NOT NULL REFERENCES workspace_runs(agent_id),
+             to_agent_id INTEGER NOT NULL REFERENCES workspace_runs(agent_id),
+             payload_json TEXT NOT NULL,
+             consumed_sequence INTEGER
+         );
+         CREATE INDEX unread_mailbox ON mailbox(to_agent_id, arrival_order)
+         WHERE consumed_sequence IS NULL;",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO mailbox VALUES (4, 'old-consumed', ?1, ?2, '1', 7),
+                                    (8, 'old-unread', ?1, ?2, '2', NULL)",
+        [sender, receiver],
+    )
+    .unwrap();
+
+    let mut store = WorkspaceStore::open(state.path()).unwrap();
+    let posted = store
+        .post_client_message(receiver, "client-1", &json!(3))
+        .unwrap();
+    let mut all = db
+        .prepare(
+            "SELECT arrival_order, message_id, from_agent_id, consumed_sequence
+         FROM mailbox ORDER BY arrival_order",
+        )
+        .unwrap();
+    let rows: Vec<(i64, String, Option<i64>, Option<i64>)> = all
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (4, "old-consumed".into(), Some(sender), Some(7)),
+            (8, "old-unread".into(), Some(sender), None),
+            (9, posted, None, None),
+        ]
+    );
+}
+
+#[test]
+fn retrying_an_accepted_client_message_after_the_run_ends_returns_the_saved_id() {
+    let state = tempfile::tempdir().unwrap();
+    let mut store = WorkspaceStore::open(state.path()).unwrap();
+    let id = store
+        .queue_run("chat", "receiver", "agent", PROMPT)
+        .unwrap();
+    let payload = json!({"price_cents": 350});
+    let posted = store.post_client_message(id, "client-1", &payload).unwrap();
+    assert!(
+        store
+            .open_journal("chat", "receiver")
+            .unwrap()
+            .record_failure("stopped".into())
+            .unwrap()
+    );
+    assert_eq!(
+        store.post_client_message(id, "client-1", &payload).unwrap(),
+        posted
+    );
+    assert!(matches!(
+        store.post_client_message(id, "client-1", &json!(0)),
+        Err(ClientMessageError::KeyConflict)
+    ));
+    assert!(matches!(
+        store.post_client_message(id, "client-2", &payload),
+        Err(ClientMessageError::RunEnded)
+    ));
+    assert!(matches!(
+        store.post_client_message(id + 1, "client-2", &payload),
+        Err(ClientMessageError::UnknownRun)
+    ));
 }
 
 fn mailbox_call(id: &str, tool_name: &str, arguments: JsonValue) -> ModelResponse {

@@ -338,7 +338,10 @@ impl WorkspaceStore {
     }
 }
 
-fn tail(connection: &Connection, agent_id: i64) -> Result<Option<(u64, bool)>, JournalError> {
+pub(crate) fn tail(
+    connection: &Connection,
+    agent_id: i64,
+) -> Result<Option<(u64, bool)>, JournalError> {
     Ok(connection
         .query_row(
             "SELECT sequence, json_extract(event_json, '$.kind') IN ('run_finished', 'run_failed')

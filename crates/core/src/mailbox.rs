@@ -1,27 +1,164 @@
-//! Messages between agents in one chat.
+//! Messages from agents and host clients.
 
 use async_trait::async_trait;
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::json;
+use thiserror::Error;
 
-use crate::journal::append_events;
+use crate::journal::{append_events, tail};
 use crate::{
     JournalEntry, JournalError, JsonValue, PendingWait, RunEvent, Tool, ToolContext, ToolError,
-    ToolOutput, ToolRecovery, ToolSpec, WaitOn,
+    ToolOutput, ToolRecovery, ToolSpec, WaitOn, WorkspaceStore,
 };
 
-pub(crate) const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS mailbox (
+const SCHEMA: &str = "
+    CREATE TABLE mailbox (
         arrival_order INTEGER PRIMARY KEY,
         message_id TEXT NOT NULL UNIQUE,
-        from_agent_id INTEGER NOT NULL REFERENCES workspace_runs(agent_id),
+        from_agent_id INTEGER REFERENCES workspace_runs(agent_id),
         to_agent_id INTEGER NOT NULL REFERENCES workspace_runs(agent_id),
         payload_json TEXT NOT NULL,
-        consumed_sequence INTEGER
+        consumed_sequence INTEGER,
+        client_message_key TEXT,
+        CHECK ((from_agent_id IS NULL) = (client_message_key IS NOT NULL))
     );
-    CREATE INDEX IF NOT EXISTS unread_mailbox ON mailbox(to_agent_id, arrival_order)
-    WHERE consumed_sequence IS NULL;";
+    CREATE INDEX unread_mailbox ON mailbox(to_agent_id, arrival_order)
+    WHERE consumed_sequence IS NULL;
+    CREATE UNIQUE INDEX client_message_keys ON mailbox(to_agent_id, client_message_key)
+    WHERE client_message_key IS NOT NULL;";
+
+pub(crate) fn initialize_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
+    if has_client_messages(connection)? {
+        return Ok(());
+    }
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Another connection may have upgraded the schema while this one waited.
+    if has_client_messages(&tx)? {
+        return Ok(());
+    }
+    let mailbox_exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'mailbox')",
+        [],
+        |row| row.get(0),
+    )?;
+    if mailbox_exists {
+        tx.execute_batch(
+            "ALTER TABLE mailbox RENAME TO mailbox_before_client_messages;
+             DROP INDEX IF EXISTS unread_mailbox;",
+        )?;
+    }
+    tx.execute_batch(SCHEMA)?;
+    if mailbox_exists {
+        // Arrival order and consumption are part of the mailbox state.
+        tx.execute_batch(
+            "INSERT INTO mailbox(arrival_order, message_id, from_agent_id, to_agent_id,
+                                 payload_json, consumed_sequence)
+             SELECT arrival_order, message_id, from_agent_id, to_agent_id, payload_json,
+                    consumed_sequence FROM mailbox_before_client_messages;
+             DROP TABLE mailbox_before_client_messages;",
+        )?;
+    }
+    tx.commit()
+}
+
+fn has_client_messages(connection: &Connection) -> Result<bool, rusqlite::Error> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mailbox')
+                       WHERE name = 'client_message_key')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// A failure to post a client message to a run's mailbox.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ClientMessageError {
+    /// The message key is empty.
+    #[error("message_key must be nonempty")]
+    EmptyKey,
+    /// The recipient has no run journal.
+    #[error("unknown run")]
+    UnknownRun,
+    /// The recipient has already finished or failed.
+    #[error("the run has already ended")]
+    RunEnded,
+    /// This key already identifies a different message for the recipient.
+    #[error("message_key already identifies a different payload")]
+    KeyConflict,
+    /// The mailbox or journal could not be read or advanced.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+}
+
+impl From<rusqlite::Error> for ClientMessageError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Journal(error.into())
+    }
+}
+
+impl WorkspaceStore {
+    /// Queue a client message for an existing run and return its message ID.
+    ///
+    /// Reusing the same key and payload for this run returns the original ID,
+    /// including after the run ends. A matching mailbox wait wakes in the
+    /// same transaction. A receive with a specific agent filter skips client messages.
+    ///
+    /// # Errors
+    ///
+    /// A new message requires an existing run that has not ended. Empty keys
+    /// and attempts to reuse a key with a different payload are rejected.
+    pub fn post_client_message(
+        &mut self,
+        agent_id: i64,
+        message_key: &str,
+        payload: &JsonValue,
+    ) -> Result<String, ClientMessageError> {
+        if message_key.trim().is_empty() {
+            return Err(ClientMessageError::EmptyKey);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous = tx
+            .query_row(
+                "SELECT message_id, payload_json FROM mailbox
+             WHERE to_agent_id = ?1 AND client_message_key = ?2",
+                params![agent_id, message_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((id, json)) = previous {
+            let saved: JsonValue = serde_json::from_str(&json).map_err(JournalError::from)?;
+            return if &saved == payload {
+                Ok(id)
+            } else {
+                Err(ClientMessageError::KeyConflict)
+            };
+        }
+        let Some((_, terminal)) = tail(&tx, agent_id)? else {
+            return Err(ClientMessageError::UnknownRun);
+        };
+        if terminal {
+            return Err(ClientMessageError::RunEnded);
+        }
+        let id = format!("client-{:032x}", rand::random::<u128>());
+        tx.execute(
+            "INSERT INTO mailbox(message_id, to_agent_id, payload_json, client_message_key)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id,
+                agent_id,
+                serde_json::to_string(payload).map_err(JournalError::from)?,
+                message_key
+            ],
+        )?;
+        deliver_waiting_message(&tx, agent_id)?;
+        tx.commit()?;
+        Ok(id)
+    }
+}
 
 /// Queue a JSON message for another agent in the current chat.
 ///
@@ -94,7 +231,7 @@ impl Tool for WaitForMessage {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "receive",
-            "Receive the oldest matching message. Pause the run if none is available.",
+            "Receive the oldest matching message. Omit from_agent_id to include client messages. Pause the run if none is available.",
             json!({
                 "type": "object",
                 "properties": { "from_agent_id": { "type": ["integer", "null"], "minimum": 1 } },
@@ -186,7 +323,7 @@ pub(crate) fn deliver_waiting_message(
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(1)?,
                     row.get::<_, String>(2)?,
                 ))
             },

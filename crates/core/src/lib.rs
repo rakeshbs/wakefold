@@ -30,7 +30,7 @@ pub use agent::{
 };
 pub use delegation::{DelegateTool, DelegatedRun};
 pub use journal::{JournalEntry, JournalError, RunEvent, RunEventPage, RunJournal};
-pub use mailbox::{SendMessage, WaitForMessage};
+pub use mailbox::{ClientMessageError, SendMessage, WaitForMessage};
 pub use provider::{
     Message, ModelRequest, ModelResponse, ModelToolSpec, ModelTurn, Provider, ProviderError,
     TokenUsage,

@@ -59,7 +59,7 @@ impl WorkspaceStore {
         let state = state_directory.as_ref();
         fs::create_dir_all(state)?;
         let state = fs::canonicalize(state)?;
-        let connection = Connection::open(state.join("wakefold.sqlite3"))?;
+        let mut connection = Connection::open(state.join("wakefold.sqlite3"))?;
         // Concurrent first opens can return SQLITE_BUSY immediately while
         // upgrading the journal mode, even with SQLite's busy handler enabled.
         let started = Instant::now();
@@ -94,7 +94,7 @@ impl WorkspaceStore {
         connection.execute_batch(crate::journal::SCHEMA)?;
         connection.execute_batch(crate::wait::SCHEMA)?;
         connection.execute_batch(crate::delegation::SCHEMA)?;
-        connection.execute_batch(crate::mailbox::SCHEMA)?;
+        crate::mailbox::initialize_schema(&mut connection)?;
         connection.execute_batch(crate::queued_run::SCHEMA)?;
         Ok(Self { connection, state })
     }
