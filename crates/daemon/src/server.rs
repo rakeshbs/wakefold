@@ -31,6 +31,7 @@ pub(crate) async fn serve(
         .open(runtime.state_directory.join("daemon.lock"))?;
     lock.try_lock()
         .map_err(|error| format!("could not lock Wakefold state directory: {error}"))?;
+    tracing::info!(address = %listener.local_addr()?, "daemon started");
     let app = api::router(
         store,
         runtime.agents.keys().cloned().collect(),
@@ -87,6 +88,15 @@ async fn drive(runtime: &Runtime, stop: &CancellationToken) -> Result<(), Daemon
                 |run| {
                     let name = run.agent_name.as_deref()?;
                     let agent = runtime.agents.get(name)?;
+                    tracing::info!(
+                        agent_id = run.agent_id,
+                        parent_agent_id =
+                            run.delegation.as_ref().map(|worker| worker.parent_agent_id),
+                        agent = name,
+                        chat_key = run.chat_key.as_str(),
+                        run_key = run.run_key.as_str(),
+                        "dispatching ready run"
+                    );
                     Some(ScheduledRunConfig::new(
                         agent.provider.as_ref(),
                         &agent_skills[name],
@@ -105,9 +115,11 @@ async fn drive(runtime: &Runtime, stop: &CancellationToken) -> Result<(), Daemon
             }
             Err(error) => return Err(error.into()),
         };
-        eprintln!(
-            "Wakefold run {} in chat {} failed: {error}",
-            run.run_key, run.chat_key
+        tracing::warn!(
+            agent_id = run.agent_id,
+            chat_key = run.chat_key.as_str(),
+            run_key = run.run_key.as_str(),
+            "run execution failed"
         );
         fail_run(&runtime.state_directory, &run, error)?;
     }

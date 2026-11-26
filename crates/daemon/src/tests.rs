@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -167,6 +167,7 @@ impl Tool for OrderTool {
 }
 
 async fn daemon_process(config: &Path) -> Result<(), DaemonError> {
+    crate::init_logging()?;
     let state = config.parent().unwrap().to_owned();
     let runtime = Runtime::build(
         Config::load(config)?,
@@ -211,6 +212,12 @@ impl Drop for RunningDaemon {
 
 async fn launch(config: &Path, test: &str) -> (RunningDaemon, SocketAddr) {
     let ready = config.parent().unwrap().join("listen");
+    let log_path = config.parent().unwrap().join("daemon.jsonl");
+    let log_file = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
     if ready.exists() {
         std::fs::remove_file(&ready).unwrap();
     }
@@ -218,6 +225,7 @@ async fn launch(config: &Path, test: &str) -> (RunningDaemon, SocketAddr) {
         child: Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
             .env(CHILD_CONFIG, config)
+            .stderr(Stdio::from(log_file))
             .spawn()
             .unwrap(),
     };
@@ -225,7 +233,8 @@ async fn launch(config: &Path, test: &str) -> (RunningDaemon, SocketAddr) {
         loop {
             assert!(
                 daemon.child.try_wait().unwrap().is_none(),
-                "daemon exited during startup"
+                "daemon exited during startup\n{}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
             );
             if let Ok(value) = std::fs::read_to_string(&ready)
                 && let Ok(address) = value.parse::<SocketAddr>()
@@ -388,6 +397,20 @@ async fn http_workflow_survives_daemon_restart() {
             && frame["event"]["kind"] == "run_finished" && frame["event"]["data"] == FINAL_ANSWER).unwrap();
         assert!(approval_requested < approval_granted && approval_granted < worker_finished
             && worker_finished < worker_result && worker_result < coordinator_finished);
+        let log = std::fs::read_to_string(directory.path().join("daemon.jsonl")).unwrap();
+        let logs: Vec<Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        for frame in &events {
+            assert!(logs.iter().any(|log| {
+                let fields = &log["fields"];
+                fields["agent_id"] == frame["agent_id"] && fields["sequence"] == frame["sequence"]
+                    && fields["event"] == frame["event"]["kind"]
+            }), "missing committed trace for agent {} sequence {}", frame["agent_id"], frame["sequence"]);
+        }
+        assert!(logs.iter().any(|log| log["fields"]["agent_id"] == review_id
+            && log["fields"]["parent_agent_id"] == id));
+        assert!(logs.iter().any(|log| log["fields"]["agent_id"] == review_id
+            && log["fields"]["wait_id"] == wait && log["fields"]["approved"] == true));
+        assert!(!log.contains(PROMPT));
         let repeated = client.post(format!("http://{address}/approvals/{wait}"))
             .json(&json!({"approved": true})).send().await.unwrap();
         assert_eq!(repeated.status(), StatusCode::NOT_FOUND);

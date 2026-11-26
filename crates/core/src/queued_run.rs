@@ -1,9 +1,9 @@
 //! Durable admission of top-level runs to the scheduler.
 
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use thiserror::Error;
 
-use crate::journal::append_events;
+use crate::journal::JournalTransaction;
 use crate::workspace::reserve_run;
 use crate::{JournalError, RunEvent, WorkspaceStore};
 
@@ -49,11 +49,10 @@ impl WorkspaceStore {
         agent_name: &str,
         prompt: &str,
     ) -> Result<i64, QueueRunError> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (_, agent_id) = reserve_run(&tx, chat_key, run_key)?;
+        let tx = JournalTransaction::begin(&mut self.connection)?;
+        let (_, agent_id) = reserve_run(tx.sql(), chat_key, run_key)?;
         let saved = tx
+            .sql()
             .query_row(
                 "SELECT event_json, agent_name FROM run_events
              LEFT JOIN queued_runs USING (agent_id)
@@ -70,11 +69,11 @@ impl WorkspaceStore {
                 return Err(QueueRunError::Conflict);
             }
         } else {
-            tx.execute(
+            tx.sql().execute(
                 "INSERT INTO queued_runs(agent_id, agent_name) VALUES (?1, ?2)",
                 params![agent_id, agent_name],
             )?;
-            append_events(&tx, agent_id, 0, &[RunEvent::RunStarted(prompt.into())])?;
+            tx.append(agent_id, 0, &[RunEvent::RunStarted(prompt.into())])?;
         }
         tx.commit()?;
         Ok(agent_id)

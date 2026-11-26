@@ -6,15 +6,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::mailbox;
 use crate::{
     JsonValue, ModelTurn, PendingWait, RunCheckpoint, RunWorkspace, ToolCall, ToolRecovery,
     ToolResult, WorkspaceStore,
 };
-use crate::{mailbox, wait::record_transition};
+
+mod write;
+pub(crate) use write::JournalTransaction;
 
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS run_events (
@@ -214,15 +217,8 @@ impl<'a> RunJournal<'a> {
         expected_last_sequence: u64,
         events: &[RunEvent],
     ) -> Result<(u64, Option<RunEvent>), JournalError> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let sequence = append_events(
-            &tx,
-            self.workspace.agent_id(),
-            expected_last_sequence,
-            events,
-        )?;
+        let tx = JournalTransaction::begin(self.connection)?;
+        let sequence = tx.append(self.workspace.agent_id(), expected_last_sequence, events)?;
         let wake = match events.last() {
             Some(RunEvent::WaitStarted(PendingWait {
                 on: crate::WaitOn::MailboxMessage { .. },
@@ -282,14 +278,12 @@ impl<'a> RunJournal<'a> {
     /// Returns a journal error if the run is active or the write fails.
     pub fn record_failure(&mut self, error: String) -> Result<bool, JournalError> {
         let _driver_lock = self.lock_driver()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = JournalTransaction::begin(self.connection)?;
         let id = self.workspace.agent_id();
-        let Some((sequence, terminal)) = tail(&tx, id)? else {
+        let Some((sequence, terminal)) = tail(tx.sql(), id)? else {
             return Ok(false);
         };
-        let suspended: bool = tx.query_row(
+        let suspended: bool = tx.sql().query_row(
             "SELECT EXISTS(SELECT 1 FROM run_waits WHERE agent_id = ?1 AND resolved = 0)",
             [id],
             |row| row.get(0),
@@ -297,7 +291,7 @@ impl<'a> RunJournal<'a> {
         if terminal || suspended {
             return Ok(false);
         }
-        append_events(&tx, id, sequence, &[RunEvent::RunFailed(error)])?;
+        tx.append(id, sequence, &[RunEvent::RunFailed(error)])?;
         tx.commit()?;
         Ok(true)
     }
@@ -419,34 +413,6 @@ pub(crate) fn tail(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)
-}
-
-pub(crate) fn append_events(
-    tx: &rusqlite::Transaction<'_>,
-    agent_id: i64,
-    expected_last_sequence: u64,
-    events: &[RunEvent],
-) -> Result<u64, JournalError> {
-    let mut sequence: u64 = tx.query_row(
-        "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE agent_id = ?1",
-        [agent_id],
-        |row| row.get(0),
-    )?;
-    if sequence != expected_last_sequence {
-        return Err(JournalError::SequenceMismatch {
-            expected: expected_last_sequence,
-            actual: sequence,
-        });
-    }
-    let mut insert = tx.prepare_cached(
-        "INSERT INTO run_events(agent_id, sequence, event_json) VALUES (?1, ?2, ?3)",
-    )?;
-    for event in events {
-        sequence += 1;
-        record_transition(tx, agent_id, sequence, event)?;
-        insert.execute(params![agent_id, sequence, serde_json::to_string(event)?])?;
-    }
-    Ok(sequence)
 }
 
 fn read_entries(

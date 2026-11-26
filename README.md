@@ -118,3 +118,7 @@ Replay opens a read-only SQLite snapshot and writes one JSON object per event
 with its `agent_id`, `sequence`, and `event`. A delegation shows the worker's
 journal after the parent's wait and before its result. The command works on
 both finished and still-pending runs.
+
+The daemon writes JSON logs to standard error. Journal entries include
+`agent_id`, `sequence`, and the event name, so a log line can be matched to
+the saved replay. Scheduler logs identify the parent when dispatching a worker.

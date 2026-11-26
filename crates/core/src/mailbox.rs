@@ -1,12 +1,12 @@
 //! Messages from agents and host clients.
 
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
 
-use crate::journal::{append_events, tail};
+use crate::journal::{JournalTransaction, tail};
 use crate::{
     JournalEntry, JournalError, JsonValue, PendingWait, RunEvent, Tool, ToolContext, ToolError,
     ToolOutput, ToolRecovery, ToolSpec, WaitOn, WorkspaceStore,
@@ -118,10 +118,9 @@ impl WorkspaceStore {
         if message_key.trim().is_empty() {
             return Err(ClientMessageError::EmptyKey);
         }
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = JournalTransaction::begin(&mut self.connection)?;
         let previous = tx
+            .sql()
             .query_row(
                 "SELECT message_id, payload_json FROM mailbox
              WHERE to_agent_id = ?1 AND client_message_key = ?2",
@@ -137,14 +136,14 @@ impl WorkspaceStore {
                 Err(ClientMessageError::KeyConflict)
             };
         }
-        let Some((_, terminal)) = tail(&tx, agent_id)? else {
+        let Some((_, terminal)) = tail(tx.sql(), agent_id)? else {
             return Err(ClientMessageError::UnknownRun);
         };
         if terminal {
             return Err(ClientMessageError::RunEnded);
         }
         let id = format!("client-{:032x}", rand::random::<u128>());
-        tx.execute(
+        tx.sql().execute(
             "INSERT INTO mailbox(message_id, to_agent_id, payload_json, client_message_key)
              VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -262,13 +261,13 @@ impl Tool for WaitForMessage {
 }
 
 pub(crate) fn record_sent_message(
-    tx: &Transaction<'_>,
+    tx: &JournalTransaction<'_>,
     message_id: &str,
     from_agent_id: i64,
     to_agent_id: i64,
     payload: &JsonValue,
 ) -> Result<(), JournalError> {
-    let inserted = tx.execute(
+    let inserted = tx.sql().execute(
         "INSERT INTO mailbox(message_id, from_agent_id, to_agent_id, payload_json)
          SELECT ?1, sender.agent_id, recipient.agent_id, ?4
          FROM workspace_runs sender JOIN workspace_runs recipient USING (workspace_id)
@@ -290,10 +289,11 @@ pub(crate) fn record_sent_message(
 }
 
 pub(crate) fn deliver_waiting_message(
-    tx: &Transaction<'_>,
+    tx: &JournalTransaction<'_>,
     to_agent_id: i64,
 ) -> Result<Option<JournalEntry>, JournalError> {
     let pending = tx
+        .sql()
         .query_row(
             "SELECT rw.started_sequence, e.event_json
          FROM run_waits rw
@@ -314,6 +314,7 @@ pub(crate) fn deliver_waiting_message(
         return Err(JournalError::InvalidWait("expected a saved mailbox wait"));
     };
     let message = tx
+        .sql()
         .query_row(
             "SELECT message_id, from_agent_id, payload_json FROM mailbox
          WHERE to_agent_id = ?1 AND consumed_sequence IS NULL
@@ -337,8 +338,8 @@ pub(crate) fn deliver_waiting_message(
         wait_id: id,
         payload: json!({ "message_id": message_id, "from_agent_id": sender, "payload": payload }),
     };
-    let sequence = append_events(tx, to_agent_id, wait_sequence, std::slice::from_ref(&event))?;
-    tx.execute(
+    let sequence = tx.append(to_agent_id, wait_sequence, std::slice::from_ref(&event))?;
+    tx.sql().execute(
         "UPDATE mailbox SET consumed_sequence = ?1 WHERE message_id = ?2",
         params![sequence, message_id],
     )?;

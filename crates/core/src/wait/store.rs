@@ -3,11 +3,11 @@
 use std::num::NonZeroUsize;
 use std::time::SystemTime;
 
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 
 use super::{WaitOn, WakeEvent, current_millis, deadline_millis};
-use crate::journal::append_events;
+use crate::journal::JournalTransaction;
 use crate::{JournalError, JsonValue, PendingWait, RunEvent, WorkspaceStore};
 
 pub(crate) const SCHEMA: &str = "
@@ -26,11 +26,12 @@ pub(crate) const SCHEMA: &str = "
     WHERE source = 'tool_approval' AND resolved = 0;";
 
 pub(crate) fn record_transition(
-    tx: &Transaction<'_>,
+    tx: &JournalTransaction<'_>,
     agent_id: i64,
     sequence: u64,
     event: &RunEvent,
 ) -> Result<(), JournalError> {
+    let sql = tx.sql();
     match event {
         RunEvent::MailboxMessageSent {
             message_id,
@@ -47,7 +48,7 @@ pub(crate) fn record_transition(
                 ),
                 _ => None,
             };
-            let inserted = tx.execute(
+            let inserted = sql.execute(
                 "INSERT INTO run_waits(agent_id, wait_id, source, wake_at_ms, started_sequence)
                 VALUES(?1, ?2, ?3, ?4, ?5)
                 ON CONFLICT(agent_id) DO UPDATE SET wait_id = excluded.wait_id,
@@ -59,14 +60,14 @@ pub(crate) fn record_transition(
             if inserted == 0 {
                 return Err(JournalError::InvalidWait("run already has a pending wait"));
             }
-            crate::delegation::clear_start(tx, agent_id)?;
-            crate::queued_run::clear_ready(tx, agent_id)?;
+            crate::delegation::clear_start(sql, agent_id)?;
+            crate::queued_run::clear_ready(sql, agent_id)?;
             if let WaitOn::Delegation { worker, prompt } = &wait.on {
                 crate::delegation::start_worker(tx, agent_id, &wait.id, worker, prompt)?;
             }
         }
         RunEvent::Woken { wait_id, .. } => {
-            let updated = tx.execute(
+            let updated = sql.execute(
                 "UPDATE run_waits SET resolved = 1
                  WHERE agent_id = ?1 AND wait_id = ?2 AND resolved = 0",
                 params![agent_id, wait_id],
@@ -76,13 +77,13 @@ pub(crate) fn record_transition(
             }
         }
         RunEvent::RunFinished(answer) => {
-            tx.execute("DELETE FROM run_waits WHERE agent_id = ?1", [agent_id])?;
-            crate::queued_run::clear_ready(tx, agent_id)?;
+            sql.execute("DELETE FROM run_waits WHERE agent_id = ?1", [agent_id])?;
+            crate::queued_run::clear_ready(sql, agent_id)?;
             crate::delegation::finish_worker(tx, agent_id, Ok(answer))?;
         }
         RunEvent::RunFailed(error) => {
-            tx.execute("DELETE FROM run_waits WHERE agent_id = ?1", [agent_id])?;
-            crate::queued_run::clear_ready(tx, agent_id)?;
+            sql.execute("DELETE FROM run_waits WHERE agent_id = ?1", [agent_id])?;
+            crate::queued_run::clear_ready(sql, agent_id)?;
             crate::delegation::finish_worker(tx, agent_id, Err(error))?;
         }
         _ => {}
@@ -100,11 +101,14 @@ impl WorkspaceStore {
     ///
     /// Returns a journal error if the transaction cannot be committed.
     pub fn resolve_wait(&mut self, wait_id: &str, event: WakeEvent) -> Result<bool, JournalError> {
+        let approval = match &event {
+            WakeEvent::Approval { approved } => Some(*approved),
+            _ => None,
+        };
         let (source, payload) = event.into_result();
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = JournalTransaction::begin(&mut self.connection)?;
         let pending = tx
+            .sql()
             .query_row(
                 "SELECT agent_id, started_sequence FROM run_waits
                  WHERE wait_id = ?1 AND resolved = 0
@@ -117,6 +121,9 @@ impl WorkspaceStore {
             record_wake(&tx, agent_id, sequence, wait_id.into(), payload)?;
         }
         tx.commit()?;
+        if let (Some((agent_id, _)), Some(approved)) = (pending, approval) {
+            tracing::info!(target: "wakefold::journal", agent_id, wait_id, approved, "approval decision committed");
+        }
         Ok(pending.is_some())
     }
 
@@ -166,11 +173,9 @@ impl WorkspaceStore {
         now: SystemTime,
         limit: NonZeroUsize,
     ) -> Result<usize, JournalError> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = JournalTransaction::begin(&mut self.connection)?;
         let due = {
-            let mut query = tx.prepare_cached(
+            let mut query = tx.sql().prepare_cached(
                 "SELECT agent_id, started_sequence, wait_id, wake_at_ms FROM run_waits
                 WHERE resolved = 0 AND wake_at_ms IS NOT NULL AND wake_at_ms <= ?1
                 ORDER BY wake_at_ms, agent_id LIMIT ?2",
@@ -194,17 +199,12 @@ impl WorkspaceStore {
 }
 
 fn record_wake(
-    tx: &Transaction<'_>,
+    tx: &JournalTransaction<'_>,
     agent_id: i64,
     sequence: u64,
     wait_id: String,
     payload: JsonValue,
 ) -> Result<(), JournalError> {
-    append_events(
-        tx,
-        agent_id,
-        sequence,
-        &[RunEvent::Woken { wait_id, payload }],
-    )?;
+    tx.append(agent_id, sequence, &[RunEvent::Woken { wait_id, payload }])?;
     Ok(())
 }

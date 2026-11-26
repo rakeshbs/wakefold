@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::json;
 
-use crate::journal::append_events;
+use crate::journal::JournalTransaction;
 use crate::{
     JournalError, JsonValue, RunEvent, Tool, ToolContext, ToolError, ToolOutput, ToolRecovery,
     ToolSpec, WaitOn,
@@ -94,26 +94,26 @@ impl Tool for DelegateTool {
 }
 
 pub(crate) fn start_worker(
-    tx: &Transaction<'_>,
+    tx: &JournalTransaction<'_>,
     parent: i64,
     wait_id: &str,
     worker: &str,
     prompt: &str,
 ) -> Result<(), JournalError> {
     // The parent's durable call key also identifies the child within the chat.
-    let child = tx.query_row(
+    let child = tx.sql().query_row(
         "INSERT INTO workspace_runs(workspace_id, run_key)
          SELECT workspace_id, ?2 FROM workspace_runs WHERE agent_id = ?1
          RETURNING agent_id",
         params![parent, wait_id],
         |row| row.get(0),
     )?;
-    tx.execute(
+    tx.sql().execute(
         "INSERT INTO delegated_runs(child_agent_id, parent_agent_id, parent_wait_id, worker)
          VALUES (?1, ?2, ?3, ?4)",
         params![child, parent, wait_id, worker],
     )?;
-    append_events(tx, child, 0, &[RunEvent::RunStarted(prompt.to_owned())])?;
+    tx.append(child, 0, &[RunEvent::RunStarted(prompt.to_owned())])?;
     Ok(())
 }
 
@@ -126,11 +126,12 @@ pub(crate) fn clear_start(tx: &Transaction<'_>, child: i64) -> Result<(), Journa
 }
 
 pub(crate) fn finish_worker(
-    tx: &Transaction<'_>,
+    tx: &JournalTransaction<'_>,
     child: i64,
     outcome: Result<&str, &str>,
 ) -> Result<(), JournalError> {
     let delegation = tx
+        .sql()
         .query_row(
             "SELECT parent_agent_id, parent_wait_id, worker
          FROM delegated_runs WHERE child_agent_id = ?1",
@@ -148,6 +149,7 @@ pub(crate) fn finish_worker(
         return Ok(());
     };
     let sequence = tx
+        .sql()
         .query_row(
             "SELECT started_sequence FROM run_waits
          WHERE agent_id = ?1 AND wait_id = ?2 AND source = 'delegation' AND resolved = 0",
@@ -158,16 +160,11 @@ pub(crate) fn finish_worker(
         .ok_or(JournalError::InvalidWait(
             "delegated run has no pending parent wait",
         ))?;
-    clear_start(tx, child)?;
+    clear_start(tx.sql(), child)?;
     let payload = match outcome {
         Ok(answer) => json!({"worker": worker, "answer": answer}),
         Err(error) => json!({"worker": worker, "error": error}),
     };
-    append_events(
-        tx,
-        parent,
-        sequence,
-        &[RunEvent::Woken { wait_id, payload }],
-    )?;
+    tx.append(parent, sequence, &[RunEvent::Woken { wait_id, payload }])?;
     Ok(())
 }

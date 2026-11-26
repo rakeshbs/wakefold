@@ -49,7 +49,7 @@ struct ApiError(StatusCode, &'static str);
 
 impl ApiError {
     fn internal(error: impl std::fmt::Display) -> Self {
-        eprintln!("Wakefold API error: {error}");
+        tracing::error!(error = %error, "API request failed");
         Self(
             StatusCode::INTERNAL_SERVER_ERROR,
             "could not complete the request",
@@ -117,6 +117,11 @@ async fn post_message(
                 })
         })
         .await?;
+    tracing::info!(
+        agent_id,
+        message_id = id.as_str(),
+        "client message accepted"
+    );
     Ok((StatusCode::ACCEPTED, Json(json!({ "message_id": id }))))
 }
 

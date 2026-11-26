@@ -21,6 +21,14 @@ type DaemonError = Box<dyn Error + Send + Sync>;
 const USAGE: &str =
     "Usage: wakefold serve <config.json>\n       wakefold replay <state-directory> <agent-id>";
 
+fn init_logging() -> Result<(), DaemonError> {
+    tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .try_init()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DaemonError> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -41,6 +49,7 @@ async fn main() -> Result<(), DaemonError> {
             replay::write(Path::new(state), id, std::io::stdout().lock())?;
         }
         [command, path] if command == "serve" => {
+            init_logging()?;
             let config = Config::load(Path::new(path))?;
             let key = std::env::var("OPENAI_API_KEY")
                 .map_err(|_| "set OPENAI_API_KEY before starting the daemon")?;
