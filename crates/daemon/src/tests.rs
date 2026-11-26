@@ -21,9 +21,11 @@ use crate::{DaemonError, replay, server};
 const CHILD_CONFIG: &str = "WAKEFOLD_DAEMON_TEST_CONFIG";
 const ORDER_TEST: &str = "tests::http_workflow_survives_daemon_restart";
 const MAILBOX_TEST: &str = "tests::http_messages_survive_daemon_restart";
+const MCP_TEST: &str = "tests::mcp_tool_works_after_daemon_restart";
 const PROMPT: &str = "Find the notebook price and record an approved review.";
 const FINAL_ANSWER: &str = "The notebook costs 350 cents and its review was recorded.";
 const MAILBOX_PROMPT: &str = "After approval, receive two client messages.";
+const MCP_PROMPT: &str = "Look up prices for WF-318 and WF-319 in the MCP catalog.";
 type EventSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 struct WorkflowProvider;
@@ -53,6 +55,20 @@ impl Provider for WorkflowProvider {
         if prompt == MAILBOX_PROMPT {
             return Ok(ModelTurn::new(
                 mailbox_response(request.messages.last().unwrap()),
+                Some(TokenUsage::new(2, 1)),
+            ));
+        }
+        if prompt == MCP_PROMPT {
+            assert_eq!(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["load_skill", "call_tool"]
+            );
+            return Ok(ModelTurn::new(
+                mcp_response(request.messages.last().unwrap()),
                 Some(TokenUsage::new(2, 1)),
             ));
         }
@@ -146,6 +162,50 @@ fn mailbox_response(message: &Message) -> ModelResponse {
     }
 }
 
+fn mcp_response(message: &Message) -> ModelResponse {
+    match message {
+        Message::User(_) => {
+            ToolCall::new("load", "load_skill", json!({ "name": "catalog" })).into()
+        }
+        Message::Tool(result) if result.call_id == "load".into() => {
+            let tools = result.value["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 1, "grants must hide private MCP tools");
+            assert_eq!(tools[0]["name"], "catalog.lookup_price");
+            assert_eq!(
+                tools[0]["description"],
+                "Look up the catalog price in cents."
+            );
+            assert_eq!(tools[0]["parameters"]["required"], json!(["sku"]));
+            assert_eq!(
+                tools[0]["parameters"]["properties"]["sku"]["type"],
+                "string"
+            );
+            dispatch("notebook", "catalog.lookup_price", json!({"sku": "WF-318"})).into()
+        }
+        Message::Tool(result) if result.call_id == "notebook".into() => {
+            assert_eq!(
+                result.value["structuredContent"],
+                json!({"sku": "WF-318", "price_cents": 350})
+            );
+            assert_eq!(
+                result.value["content"][0]["text"],
+                "WF-318 costs 350 cents."
+            );
+            assert!(result.value.get("_meta").is_none());
+            dispatch("binder", "catalog.lookup_price", json!({"sku": "WF-319"})).into()
+        }
+        Message::Tool(result) => {
+            assert_eq!(result.call_id, "binder".into());
+            assert_eq!(
+                result.value["structuredContent"],
+                json!({"sku": "WF-319", "price_cents": 425})
+            );
+            ModelResponse::Final("Catalog prices are 350 and 425 cents.".into())
+        }
+        other => panic!("unexpected catalog message {other:?}"),
+    }
+}
+
 struct OrderTool {
     state: PathBuf,
     name: &'static str,
@@ -193,7 +253,8 @@ async fn daemon_process(config: &Path) -> Result<(), DaemonError> {
             assert_eq!(model, "scripted-workflow-provider");
             Ok(Box::new(WorkflowProvider))
         },
-    )?;
+    )
+    .await?;
     let listener = TcpListener::bind(runtime.bind).await?;
     std::fs::write(state.join("listen"), listener.local_addr()?.to_string())?;
     server::serve(listener, runtime, CancellationToken::new()).await
@@ -533,4 +594,119 @@ async fn http_messages_survive_daemon_restart() {
         }
         assert_eq!(received, [first_id, second_id]);
     }).await.expect("the HTTP mailbox workflow must finish");
+}
+
+async fn mcp_approval(client: &Client, address: SocketAddr, previous: &str) -> Value {
+    loop {
+        if let Some(approval) = approvals(client, address)
+            .await
+            .into_iter()
+            .find(|approval| {
+                approval["wait"]["id"]
+                    .as_str()
+                    .is_some_and(|id| id != previous)
+            })
+        {
+            return approval;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn mcp_tool_works_after_daemon_restart() {
+    if let Some(config) = std::env::var_os(CHILD_CONFIG) {
+        daemon_process(Path::new(&config)).await.unwrap();
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("wakefold.json");
+        std::fs::write(directory.path().join("catalog_mcp.py"),
+            include_str!("../tests/fixtures/catalog_mcp.py")).unwrap();
+        std::fs::write(&config, json!({
+            "state_directory": "state",
+            "bind": "127.0.0.1:0",
+            "mcp_servers": {
+                "inventory": { "command": "python3", "args": ["catalog_mcp.py"] }
+            },
+            "skills": {
+                "catalog": {
+                    "description": "Read the catalog",
+                    "tools": [
+                        { "kind": "mcp", "server": "inventory", "tool": "lookup.price", "name": "lookup_price" },
+                        { "kind": "mcp", "server": "inventory", "tool": "private_notes" }
+                    ]
+                }
+            },
+            "agents": {
+                "assistant": {
+                    "model": "scripted-workflow-provider", "max_model_turns": 5, "token_budget": 30,
+                    "skills": ["catalog"], "tool_grants": { "catalog.lookup_price": "require_approval" }
+                }
+            }
+        }).to_string()).unwrap();
+        let calls_path = directory.path().join("catalog-calls.jsonl");
+        let client = Client::builder().no_proxy().build().unwrap();
+        let (daemon, address) = launch(&config, MCP_TEST).await;
+        let response = client.post(format!("http://{address}/runs")).json(&json!({
+            "chat_key": "catalog", "run_key": "prices", "agent": "assistant", "prompt": MCP_PROMPT
+        })).send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
+        let agent_id = response["agent_id"].as_i64().unwrap();
+        let first = mcp_approval(&client, address, "").await;
+        assert_eq!(first["agent_id"], agent_id);
+        assert_eq!(first["wait"]["on"]["ToolApproval"]["tool_name"], "catalog.lookup_price");
+        assert_eq!(first["wait"]["on"]["ToolApproval"]["arguments"], json!({"sku": "WF-318"}));
+        assert!(!calls_path.exists());
+        let first_wait = first["wait"]["id"].as_str().unwrap();
+        let approval = client.post(format!("http://{address}/approvals/{first_wait}"))
+            .json(&json!({"approved": true})).send().await.unwrap();
+        assert_eq!(approval.status(), StatusCode::NO_CONTENT);
+
+        let second = mcp_approval(&client, address, first_wait).await;
+        assert_eq!(second["agent_id"], agent_id);
+        assert_eq!(second["wait"]["on"]["ToolApproval"]["arguments"], json!({"sku": "WF-319"}));
+        let calls = std::fs::read_to_string(&calls_path).unwrap();
+        let first_call: Value = serde_json::from_str(&calls).unwrap();
+        assert_eq!(first_call["sku"], "WF-318");
+        drop(daemon);
+
+        let (_daemon, address) = launch(&config, MCP_TEST).await;
+        assert_eq!(approvals(&client, address).await.as_slice(), std::slice::from_ref(&second));
+        let second_wait = second["wait"]["id"].as_str().unwrap();
+        let (mut socket, _) = connect_async(format!("ws://{address}/runs/{agent_id}/events")).await.unwrap();
+        let approval = client.post(format!("http://{address}/approvals/{second_wait}"))
+            .json(&json!({"approved": true})).send().await.unwrap();
+        assert_eq!(approval.status(), StatusCode::NO_CONTENT);
+        let mut load_count = 0;
+        let mut call_count = 0;
+        loop {
+            let frame = next_event(&mut socket).await;
+            let event = &frame["event"];
+            match event["kind"].as_str() {
+                Some("skill_loaded") => {
+                    assert_eq!(event["data"], "catalog");
+                    load_count += 1;
+                }
+                Some("tool_call_started") if event["data"]["call"]["name"] == "call_tool" => {
+                    assert_eq!(event["data"]["recovery"], "stop_after_crash");
+                    call_count += 1;
+                }
+                Some("run_finished") => {
+                    assert_eq!(event["data"], "Catalog prices are 350 and 425 cents.");
+                    break;
+                }
+                Some("run_failed") => panic!("MCP workflow failed {event}"),
+                _ => {}
+            }
+        }
+        assert_eq!(load_count, 1);
+        assert_eq!(call_count, 2);
+        let calls: Vec<Value> = std::fs::read_to_string(calls_path).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], first_call);
+        assert_eq!(calls[1]["sku"], "WF-319");
+        assert_ne!(calls[0]["pid"], calls[1]["pid"], "the daemon must launch a new MCP process");
+    }).await.expect("the MCP workflow must finish");
 }

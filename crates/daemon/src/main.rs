@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod mcp;
 mod replay;
 mod server;
 
@@ -55,7 +56,8 @@ async fn main() -> Result<(), DaemonError> {
                 .map_err(|_| "set OPENAI_API_KEY before starting the daemon")?;
             let runtime = Runtime::build(config, BTreeMap::new(), |model| {
                 Ok(Box::new(OpenAiProvider::new(model, &key)?))
-            })?;
+            })
+            .await?;
             let listener = TcpListener::bind(runtime.bind).await?;
             println!("Wakefold listening on http://{}", listener.local_addr()?);
             let stop = CancellationToken::new();

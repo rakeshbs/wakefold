@@ -107,6 +107,57 @@ A grant can be `allow` or `require_approval`. Other built-in tool kinds are
 `send_message`, `wait_for_message`, and `delegate`. A delegate tool takes a
 local `name`, a `description`, and the target `agent` from the configuration.
 
+## Connecting a local MCP server
+
+Declare a stdio server under `mcp_servers` and reference its tools from a
+skill. This example exposes one tool as `catalog.lookup_price`.
+
+```json
+{
+  "state_directory": "state",
+  "mcp_servers": {
+    "inventory": {
+      "command": "./catalog-mcp",
+      "args": []
+    }
+  },
+  "skills": {
+    "catalog": {
+      "description": "Look up inventory prices",
+      "tools": [
+        {
+          "kind": "mcp",
+          "server": "inventory",
+          "tool": "lookup.price",
+          "name": "lookup_price"
+        }
+      ]
+    }
+  },
+  "agents": {
+    "assistant": {
+      "model": "gpt-6-luna",
+      "max_model_turns": 6,
+      "token_budget": 6000,
+      "skills": ["catalog"],
+      "tool_grants": { "catalog.lookup_price": "allow" }
+    }
+  }
+}
+```
+
+The daemon launches each referenced server once at startup and reads its tool
+descriptions and input schemas. Commands like `./catalog-mcp` and relative
+arguments resolve from the configuration directory. The server inherits
+`PATH` and any variables listed in its optional `inherit_env` array.
+
+The `tool` field is the server's name for the tool. Use `name` to give it a
+Wakefold alias, including when the server's name contains a dot. Agents
+load the skill and call the qualified name through `call_tool`. The usual
+`allow` and `require_approval` grants apply. After a restart the daemon
+reconnects to the server and can dispatch tools from a run's already-loaded
+skills. An interrupted MCP tool call follows `StopAfterCrash`.
+
 ## Replaying a run
 
 ```sh

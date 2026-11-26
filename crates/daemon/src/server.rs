@@ -1,7 +1,6 @@
 //! Daemon lifecycle and scheduler integration.
 
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::path::Path;
 
 use tokio::net::TcpListener;
@@ -15,22 +14,13 @@ use crate::{DaemonError, api};
 
 pub(crate) async fn serve(
     listener: TcpListener,
-    runtime: Runtime,
+    mut runtime: Runtime,
     stop: CancellationToken,
 ) -> Result<(), DaemonError> {
     if !listener.local_addr()?.ip().is_loopback() {
         return Err("daemon listener must be loopback".into());
     }
     let store = WorkspaceStore::open(&runtime.state_directory)?;
-    // A single daemon owns the scheduler and handles terminal run failures.
-    let lock = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(runtime.state_directory.join("daemon.lock"))?;
-    lock.try_lock()
-        .map_err(|error| format!("could not lock Wakefold state directory: {error}"))?;
     tracing::info!(address = %listener.local_addr()?, "daemon started");
     let app = api::router(
         store,
@@ -50,6 +40,9 @@ pub(crate) async fn serve(
         result
     };
     let (http, scheduler) = tokio::join!(http, scheduler);
+    for (name, server) in &mut runtime.mcp_servers {
+        server.close(name).await;
+    }
     scheduler?;
     http?;
     Ok(())

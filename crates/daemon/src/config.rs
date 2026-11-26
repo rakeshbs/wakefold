@@ -1,6 +1,7 @@
 //! On-disk daemon configuration and the host tool catalog.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::fs::{self, File};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -11,10 +12,13 @@ use wakefold::{
 };
 
 use crate::DaemonError;
+use crate::mcp::{McpServer, ServerConfig};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
+    #[serde(skip)]
+    directory: PathBuf,
     pub(crate) state_directory: PathBuf,
     #[serde(default = "default_bind")]
     pub(crate) bind: SocketAddr,
@@ -22,6 +26,8 @@ pub(crate) struct Config {
     max_concurrent: NonZeroUsize,
     #[serde(default)]
     skills: BTreeMap<String, SkillConfig>,
+    #[serde(default)]
+    mcp_servers: BTreeMap<String, ServerConfig>,
     agents: BTreeMap<String, AgentConfig>,
 }
 
@@ -29,11 +35,12 @@ impl Config {
     pub(crate) fn load(path: &Path) -> Result<Self, DaemonError> {
         let path = path.canonicalize()?;
         let mut config: Self = serde_json::from_slice(&std::fs::read(&path)?)?;
+        config.directory = path
+            .parent()
+            .expect("the canonical configuration file has a parent")
+            .to_owned();
         if config.state_directory.is_relative() {
-            config.state_directory = path
-                .parent()
-                .expect("the canonical configuration file has a parent")
-                .join(config.state_directory);
+            config.state_directory = config.directory.join(config.state_directory);
         }
         Ok(config)
     }
@@ -95,6 +102,11 @@ enum ToolConfig {
         description: String,
         agent: String,
     },
+    Mcp {
+        server: String,
+        tool: String,
+        name: Option<String>,
+    },
 }
 
 pub(crate) struct RegisteredSkill {
@@ -114,10 +126,12 @@ pub(crate) struct Runtime {
     pub(crate) max_concurrent: NonZeroUsize,
     pub(crate) skills: BTreeMap<String, RegisteredSkill>,
     pub(crate) agents: BTreeMap<String, Agent>,
+    pub(crate) mcp_servers: BTreeMap<String, McpServer>,
+    _state_lock: File,
 }
 
 impl Runtime {
-    pub(crate) fn build(
+    pub(crate) async fn build(
         config: Config,
         mut skills: BTreeMap<String, RegisteredSkill>,
         mut provider: impl FnMut(&str) -> Result<Box<dyn Provider>, DaemonError>,
@@ -128,6 +142,18 @@ impl Runtime {
         if config.agents.is_empty() {
             return Err("configure at least one agent".into());
         }
+        // Own the state directory before starting the configured server processes.
+        fs::create_dir_all(&config.state_directory)?;
+        let state_lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(config.state_directory.join("daemon.lock"))?;
+        state_lock
+            .try_lock()
+            .map_err(|error| format!("could not lock Wakefold state directory: {error}"))?;
+        let mut mcp_servers = BTreeMap::new();
         for (name, skill) in config.skills {
             let mut tools: Vec<Box<dyn Tool>> = Vec::new();
             for tool in skill.tools {
@@ -147,6 +173,28 @@ impl Runtime {
                             .into());
                         }
                         Box::new(DelegateTool::new(name, description, agent))
+                    }
+                    ToolConfig::Mcp {
+                        server,
+                        tool,
+                        name: local_name,
+                    } => {
+                        let connection = match mcp_servers.entry(server.clone()) {
+                            Entry::Occupied(entry) => entry.into_mut(),
+                            Entry::Vacant(entry) => {
+                                let definition =
+                                    config.mcp_servers.get(&server).ok_or_else(|| {
+                                        format!(
+                                            "skill {name} references unknown MCP server {server}"
+                                        )
+                                    })?;
+                                let connection =
+                                    McpServer::start(&server, definition, &config.directory)
+                                        .await?;
+                                entry.insert(connection)
+                            }
+                        };
+                        connection.tool(&server, tool, local_name)?
                     }
                 });
             }
@@ -212,6 +260,8 @@ impl Runtime {
             max_concurrent: config.max_concurrent,
             skills,
             agents,
+            mcp_servers,
+            _state_lock: state_lock,
         })
     }
 }
