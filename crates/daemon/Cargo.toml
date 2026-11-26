@@ -4,6 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+wakefold = { path = "../core", default-features = false, features = ["openai"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tempfile = "3"
+tokio-tungstenite = "0.29"
+
 [[bin]]
 name = "wakefold"
 path = "src/main.rs"

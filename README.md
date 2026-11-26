@@ -55,3 +55,49 @@ chat can call `mailbox.send` with `to_agent_id` and a JSON `payload`.
 and payload. It accepts an optional `from_agent_id` filter. When no matching
 message is queued, the run suspends. A later matching send wakes it.
 Wakefold commits delivery and the receiver's wake together in SQLite.
+
+## Running the daemon
+
+Save a JSON configuration and launch the daemon with `OPENAI_API_KEY` in
+its environment. The daemon listens on loopback for local clients. Relative
+state paths are resolved alongside the configuration file.
+
+```json
+{
+  "bind": "127.0.0.1:8700",
+  "state_directory": "state",
+  "skills": {
+    "timers": {
+      "description": "Wait for a timer",
+      "tools": [{ "kind": "timer_wait" }]
+    }
+  },
+  "agents": {
+    "assistant": {
+      "model": "gpt-6-luna",
+      "max_model_turns": 6,
+      "token_budget": 6000,
+      "skills": ["timers"],
+      "tool_grants": { "timers.wait": "allow" }
+    }
+  }
+}
+```
+
+```sh
+cargo run --locked -p wakefold-daemon -- serve wakefold.json
+```
+
+- `POST /runs` takes `chat_key`, `run_key`, `agent`, and `prompt`. It returns
+  `202` with an `agent_id`. Retrying the same request returns the same ID.
+- Connect to `ws://127.0.0.1:8700/runs/{agent_id}/events` for journal events
+  with `sequence` and `event` fields. Reconnect with `?after=<last sequence>`
+  to continue after the last event you received.
+- `GET /approvals` lists pending requests. Each response includes the
+  `agent_id` and the saved `wait` with its ID and tool arguments.
+- `POST /approvals/{wait_id}` accepts `{"approved":true}` or
+  `{"approved":false}`. The scheduler resumes the saved run.
+
+A grant can be `allow` or `require_approval`. Other built-in tool kinds are
+`send_message`, `wait_for_message`, and `delegate`. A delegate tool takes a
+local `name`, a `description`, and the target `agent` from the configuration.
