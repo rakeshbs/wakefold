@@ -45,7 +45,7 @@ impl RunWorkspace {
 /// A blocking SQLite store. Open workspaces before entering the async agent loop.
 #[derive(Debug)]
 pub struct WorkspaceStore {
-    connection: Connection,
+    pub(crate) connection: Connection,
     state: PathBuf,
 }
 
@@ -92,6 +92,7 @@ impl WorkspaceStore {
              );",
         )?;
         connection.execute_batch(crate::journal::SCHEMA)?;
+        connection.execute_batch(crate::wait::SCHEMA)?;
         Ok(Self { connection, state })
     }
 

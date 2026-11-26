@@ -9,7 +9,11 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ModelTurn, RunCheckpoint, RunWorkspace, ToolCall, ToolRecovery, ToolResult};
+use crate::wait::record_transition;
+use crate::{
+    JsonValue, ModelTurn, PendingWait, RunCheckpoint, RunWorkspace, ToolCall, ToolRecovery,
+    ToolResult,
+};
 
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS run_events (
@@ -49,6 +53,15 @@ pub enum RunEvent {
     },
     /// The tool returned a result for its call ID.
     ToolCallCompleted(ToolResult),
+    /// The prepared tool call is suspended until its wait resolves.
+    WaitStarted(PendingWait),
+    /// The wait resolved and its payload becomes the prepared tool call's result.
+    Woken {
+        /// Identifier from the corresponding [`RunEvent::WaitStarted`].
+        wait_id: String,
+        /// Data to return to the model as the tool result.
+        payload: JsonValue,
+    },
     /// A skill became available with the loader result in the same transaction.
     SkillLoaded(String),
     /// State at a model-call boundary after transcript compaction.
@@ -86,6 +99,9 @@ pub enum JournalError {
         /// The stable agent ID of the active run.
         agent_id: i64,
     },
+    /// A wait transition conflicts with the durable wait for the run.
+    #[error("journal wait transition is invalid: {0}")]
+    InvalidWait(&'static str),
     /// The operating system could not open or lock the run's lock file.
     #[error("run lock: {0}")]
     Lock(#[from] std::io::Error),
@@ -163,30 +179,12 @@ impl<'a> RunJournal<'a> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut sequence: u64 = tx.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE agent_id = ?1",
-            [self.workspace.agent_id()],
-            |row| row.get(0),
+        let sequence = append_events(
+            &tx,
+            self.workspace.agent_id(),
+            expected_last_sequence,
+            events,
         )?;
-        if sequence != expected_last_sequence {
-            return Err(JournalError::SequenceMismatch {
-                expected: expected_last_sequence,
-                actual: sequence,
-            });
-        }
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO run_events(agent_id, sequence, event_json) VALUES (?1, ?2, ?3)",
-            )?;
-            for event in events {
-                sequence += 1;
-                insert.execute(params![
-                    self.workspace.agent_id(),
-                    sequence,
-                    serde_json::to_string(event)?
-                ])?;
-            }
-        }
         tx.commit()?;
         if !events.is_empty()
             && let Some(hook) = self.commit_hook
@@ -219,6 +217,34 @@ impl<'a> RunJournal<'a> {
     pub fn load_after(&self, sequence: u64) -> Result<Vec<JournalEntry>, JournalError> {
         read_entries(self.connection, self.workspace.agent_id(), sequence)
     }
+}
+
+pub(crate) fn append_events(
+    tx: &rusqlite::Transaction<'_>,
+    agent_id: i64,
+    expected_last_sequence: u64,
+    events: &[RunEvent],
+) -> Result<u64, JournalError> {
+    let mut sequence: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE agent_id = ?1",
+        [agent_id],
+        |row| row.get(0),
+    )?;
+    if sequence != expected_last_sequence {
+        return Err(JournalError::SequenceMismatch {
+            expected: expected_last_sequence,
+            actual: sequence,
+        });
+    }
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO run_events(agent_id, sequence, event_json) VALUES (?1, ?2, ?3)",
+    )?;
+    for event in events {
+        sequence += 1;
+        record_transition(tx, agent_id, sequence, event)?;
+        insert.execute(params![agent_id, sequence, serde_json::to_string(event)?])?;
+    }
+    Ok(sequence)
 }
 
 fn read_entries(

@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::{
     JsonValue, ModelToolSpec, RunError, RunEvent, Tool, ToolCall, ToolContext, ToolError,
-    ToolRecovery, ToolResult, ToolSpec,
+    ToolOutput, ToolRecovery, ToolResult, ToolSpec, WaitOn,
 };
 
 /// A named group of tools the agent can load together.
@@ -46,6 +46,11 @@ impl fmt::Debug for Skill<'_> {
 pub(crate) const LOADER: &str = "load_skill";
 const LOADER_RECOVERY: ToolRecovery = ToolRecovery::RetryAfterCrash;
 pub(crate) const DISPATCHER: &str = "call_tool";
+
+pub(crate) enum ToolExecution {
+    Completed(Vec<RunEvent>),
+    Waiting(WaitOn),
+}
 
 pub(crate) struct RunSkills<'a> {
     available: BTreeMap<&'a str, Vec<(ToolSpec, &'a dyn Tool)>>,
@@ -196,7 +201,7 @@ impl<'a> RunSkills<'a> {
         &self,
         call: &ToolCall,
         context: ToolContext,
-    ) -> Result<Vec<RunEvent>, ToolError> {
+    ) -> Result<ToolExecution, ToolError> {
         let mut events = Vec::new();
         let value = if call.name == LOADER {
             let name = load_name(&call.arguments)?;
@@ -210,13 +215,16 @@ impl<'a> RunSkills<'a> {
             let (_, handler) = self.handlers.get(name).ok_or_else(|| {
                 ToolError::new(format!("tool {name} is unavailable to this agent"))
             })?;
-            handler.call_with_context(context, arguments).await?
+            match handler.call_with_output(context, arguments).await? {
+                ToolOutput::Value(value) => value,
+                ToolOutput::Wait(on) => return Ok(ToolExecution::Waiting(on)),
+            }
         };
         events.push(RunEvent::ToolCallCompleted(ToolResult::new(
             call.id.clone(),
             value,
         )));
-        Ok(events)
+        Ok(ToolExecution::Completed(events))
     }
 
     pub(crate) fn is_loaded(&self, name: &str) -> bool {

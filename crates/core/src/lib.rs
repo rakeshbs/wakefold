@@ -8,6 +8,7 @@ mod providers;
 mod retry;
 mod skill;
 mod tool;
+mod wait;
 mod workspace;
 
 #[cfg(feature = "derive")]
@@ -20,7 +21,7 @@ pub mod testing;
 extern crate self as wakefold;
 
 pub use agent::{
-    RunCheckpoint, RunError, RunOptions, RunReport, RunUsage, run, run_streaming,
+    RunCheckpoint, RunError, RunOptions, RunOutcome, RunReport, RunUsage, run, run_streaming,
     run_streaming_with_options, run_with_options,
 };
 pub use journal::{JournalEntry, JournalError, RunEvent, RunJournal};
@@ -35,10 +36,12 @@ pub use serde_json::Value as JsonValue;
 pub use skill::Skill;
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{
-    Tool, ToolCall, ToolCallId, ToolContext, ToolError, ToolRecovery, ToolResult, ToolSpec,
+    Tool, ToolCall, ToolCallId, ToolContext, ToolError, ToolOutput, ToolRecovery, ToolResult,
+    ToolSpec,
 };
 #[cfg(feature = "derive")]
 pub use typed_tool::{ToolInput, typed_tool, typed_tool_with_context};
+pub use wait::{PendingWait, TimerWait, WaitOn, WakeEvent};
 #[cfg(feature = "derive")]
 pub use wakefold_macros::ToolInput;
 pub use workspace::{RunWorkspace, WorkspaceError, WorkspaceStore};

@@ -12,10 +12,11 @@ use futures_util::future::{Either, select};
 
 use thiserror::Error;
 
-use crate::skill::RunSkills;
+use crate::skill::{RunSkills, ToolExecution};
 use crate::{
-    CancellationToken, Message, ModelRequest, ModelRetryPolicy, Provider, ProviderError, RunEvent,
-    RunJournal, RunWorkspace, Skill, TokenUsage, ToolCall, ToolCallId, ToolContext, ToolError,
+    CancellationToken, Message, ModelRequest, ModelRetryPolicy, PendingWait, Provider,
+    ProviderError, RunEvent, RunJournal, RunWorkspace, Skill, TokenUsage, ToolCall, ToolCallId,
+    ToolContext, ToolError,
 };
 
 /// Limits, retries, and cancellation for a single agent run.
@@ -139,10 +140,40 @@ pub struct RunReport {
     pub usage: RunUsage,
 }
 
+/// The state reached when a durable run yields control to its host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RunOutcome {
+    /// The run returned a final answer.
+    Finished(RunReport),
+    /// The run is saved and waiting for an event.
+    Suspended(PendingWait),
+}
+
+impl RunOutcome {
+    fn into_report(self) -> Result<RunReport, RunError> {
+        match self {
+            Self::Finished(report) => Ok(report),
+            Self::Suspended(wait) => Err(RunError::Suspended(wait)),
+        }
+    }
+}
+
 /// The reason an agent run stopped before producing a final answer.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunError {
+    /// A caller expecting a final answer reached a durable wait.
+    #[error("run suspended on wait {}", .0.id)]
+    Suspended(PendingWait),
+
+    /// A tool requested suspension in a run without a journal.
+    #[error("tool {name} requires a journaled run to suspend")]
+    WaitRequiresJournal {
+        /// The tool that requested suspension.
+        name: String,
+    },
+
     /// The journal could not be read or advanced at the expected sequence.
     #[error(transparent)]
     Journal(#[from] crate::JournalError),
@@ -341,7 +372,9 @@ pub async fn run_streaming_with_options(
     options: RunOptions,
     on_text: impl FnMut(&str) + Send,
 ) -> Result<RunReport, RunError> {
-    drive(prompt.into(), provider, skills, options, on_text, None).await
+    drive(prompt.into(), provider, skills, options, on_text, None)
+        .await?
+        .into_report()
 }
 
 impl RunJournal<'_> {
@@ -375,6 +408,7 @@ impl RunJournal<'_> {
     /// A concurrent driver receives [`crate::JournalError::AlreadyRunning`] inside
     /// [`RunError::Journal`]. Returns [`RunError::ToolOutcomeUnknown`] if an interrupted
     /// tool cannot safely retry under its recorded and current recovery policies.
+    /// Returns [`RunError::Suspended`] if a tool requests a durable wait.
     /// Other failures are reported as in [`run_with_options`].
     pub async fn run_or_resume(
         &mut self,
@@ -383,6 +417,26 @@ impl RunJournal<'_> {
         skills: &[Skill<'_>],
         options: RunOptions,
     ) -> Result<RunReport, RunError> {
+        self.run_until_blocked(prompt, provider, skills, options)
+            .await?
+            .into_report()
+    }
+
+    /// Start or resume a durable run until it finishes or reaches a saved wait.
+    ///
+    /// Calling this again before the wait is resolved returns the same wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::run_or_resume`]. Suspension is
+    /// returned as [`RunOutcome::Suspended`].
+    pub async fn run_until_blocked(
+        &mut self,
+        prompt: impl Into<String> + Send,
+        provider: &dyn Provider,
+        skills: &[Skill<'_>],
+        options: RunOptions,
+    ) -> Result<RunOutcome, RunError> {
         if options
             .workspace
             .as_ref()
@@ -403,7 +457,7 @@ async fn drive(
     options: RunOptions,
     mut on_text: impl FnMut(&str) + Send,
     journal: Option<&mut RunJournal<'_>>,
-) -> Result<RunReport, RunError> {
+) -> Result<RunOutcome, RunError> {
     let cancellation = options.cancellation.as_ref();
     check_cancelled(cancellation)?;
     let mut emit_text = |chunk: &str| {
@@ -412,15 +466,20 @@ async fn drive(
         }
     };
 
+    let durable = journal.is_some();
     let mut run = RunDriver::open(prompt, journal, RunSkills::new(skills)?, &options)?;
     let mut context_sizes = crate::context::ContextSizes::default();
     loop {
         check_cancelled(cancellation)?;
-        if let RunPhase::Finished(answer) = run.phase {
-            return Ok(RunReport {
-                answer,
-                usage: run.state.usage,
-            });
+        match run.phase {
+            RunPhase::Finished(answer) => {
+                return Ok(RunOutcome::Finished(RunReport {
+                    answer,
+                    usage: run.state.usage,
+                }));
+            }
+            RunPhase::Waiting { wait, .. } => return Ok(RunOutcome::Suspended(wait)),
+            _ => {}
         }
         let action = next_action(
             &run.state.messages,
@@ -481,13 +540,30 @@ async fn drive(
                     options.workspace.clone(),
                     run.tool_call_key().map(str::to_owned),
                 );
-                let events = await_cancellable(run.skills.call(call, context), cancellation)
+                let execution = await_cancellable(run.skills.call(call, context), cancellation)
                     .await?
                     .map_err(|source| RunError::Tool {
                         name: run.skills.target_name(call).to_owned(),
                         source,
                     })?;
-                run.commit(events)?;
+                match execution {
+                    ToolExecution::Completed(events) => run.commit(events)?,
+                    ToolExecution::Waiting(on) => {
+                        if !durable {
+                            return Err(RunError::WaitRequiresJournal {
+                                name: run.skills.target_name(call).to_owned(),
+                            });
+                        }
+                        let wait = PendingWait {
+                            id: run
+                                .tool_call_key()
+                                .expect("prepared tool call has a key")
+                                .into(),
+                            on,
+                        };
+                        run.commit([RunEvent::WaitStarted(wait)])?;
+                    }
+                }
             }
             Action::Finish(answer) => run.commit([RunEvent::RunFinished(answer.to_owned())])?,
         }

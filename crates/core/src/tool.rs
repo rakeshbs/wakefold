@@ -5,7 +5,7 @@ use std::fmt;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::{CancellationToken, JsonValue, RunWorkspace};
+use crate::{CancellationToken, JsonValue, RunWorkspace, WaitOn};
 
 /// Identifies a model-requested tool call within a run.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
@@ -185,6 +185,16 @@ impl ToolContext {
     }
 }
 
+/// The result of a handler, including a request to suspend a durable run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolOutput {
+    /// Deliver an immediate result to the model.
+    Value(JsonValue),
+    /// Suspend the run and use the wake event as this call's result.
+    Wait(WaitOn),
+}
+
 /// A tool that can be registered with the agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -214,6 +224,24 @@ pub trait Tool: Send + Sync {
         arguments: &JsonValue,
     ) -> Result<JsonValue, ToolError> {
         self.call(arguments).await
+    }
+
+    /// Run the tool, optionally asking the journaled driver to suspend.
+    ///
+    /// The default wraps an ordinary handler result in [`ToolOutput::Value`].
+    /// A tool returning [`ToolOutput::Wait`] can be invoked by a durable run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ToolError`] if the arguments are invalid or the tool fails.
+    async fn call_with_output(
+        &self,
+        context: ToolContext,
+        arguments: &JsonValue,
+    ) -> Result<ToolOutput, ToolError> {
+        self.call_with_context(context, arguments)
+            .await
+            .map(ToolOutput::Value)
     }
 }
 

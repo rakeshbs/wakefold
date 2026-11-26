@@ -8,7 +8,8 @@ use super::{Action, RunError, RunOptions, RunUsage, next_action, validate_calls}
 use crate::context::Compaction;
 use crate::skill::{LOADER, RunSkills};
 use crate::{
-    JsonValue, Message, ModelTurn, RunEvent, RunJournal, ToolCall, ToolCallId, ToolRecovery,
+    JsonValue, Message, ModelTurn, PendingWait, RunEvent, RunJournal, ToolCall, ToolCallId,
+    ToolRecovery, ToolResult,
 };
 
 /// A durable model-call boundary containing the compacted transcript and run bookkeeping.
@@ -67,6 +68,10 @@ pub(super) enum RunPhase {
         call: ToolCall,
         recovery: ToolRecovery,
         tool_call_key: String,
+    },
+    Waiting {
+        call_id: ToolCallId,
+        wait: PendingWait,
     },
     Finished(String),
 }
@@ -254,6 +259,25 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                     ));
                 }
                 self.state.messages.push(Message::Tool(result));
+                RunPhase::Ready
+            }
+            (
+                RunPhase::ToolPrepared {
+                    call,
+                    tool_call_key,
+                    ..
+                },
+                RunEvent::WaitStarted(wait),
+            ) if call.name != LOADER && wait.id == *tool_call_key => RunPhase::Waiting {
+                call_id: call.id.clone(),
+                wait,
+            },
+            (RunPhase::Waiting { call_id, wait }, RunEvent::Woken { wait_id, payload })
+                if wait.id == wait_id =>
+            {
+                self.state
+                    .messages
+                    .push(Message::Tool(ToolResult::new(call_id.clone(), payload)));
                 RunPhase::Ready
             }
             (RunPhase::Ready, RunEvent::RunFinished(answer)) if matches!(action(), Some(Action::Finish(expected)) if expected == answer) => {
