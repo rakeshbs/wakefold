@@ -2,8 +2,8 @@ use std::{sync::Barrier, thread};
 
 use serde_json::json;
 use wakefold::{
-    JournalError, ModelResponse, ModelTurn, RunEvent, TokenUsage, ToolCall, ToolResult,
-    WorkspaceStore,
+    JournalError, ModelResponse, ModelTurn, RunEvent, TokenUsage, ToolCall, ToolRecovery,
+    ToolResult, WorkspaceStore,
 };
 
 #[test]
@@ -19,7 +19,11 @@ fn reopens_run_events_in_order_with_replay_context() {
         RunEvent::RunStarted("hello".into()),
         RunEvent::ModelCallRequested,
         RunEvent::ModelCallCompleted(turn),
-        RunEvent::ToolCallStarted(call),
+        RunEvent::ToolCallStarted {
+            call,
+            recovery: ToolRecovery::RetryAfterCrash,
+            idempotency_key: "saved-key".into(),
+        },
         RunEvent::ToolCallCompleted(ToolResult::new("call-1", json!(42))),
         RunEvent::ModelCallRequested,
         RunEvent::ModelCallCompleted(ModelTurn::new(ModelResponse::Final("42".into()), None)),

@@ -9,7 +9,7 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{Effect, ModelTurn, RunCheckpoint, RunWorkspace, ToolCall, ToolResult};
+use crate::{ModelTurn, RunCheckpoint, RunWorkspace, ToolCall, ToolRecovery, ToolResult};
 
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS run_events (
@@ -32,14 +32,12 @@ pub enum RunEvent {
     ModelCallRequested,
     /// A full model response, including usage and provider replay context.
     ModelCallCompleted(ModelTurn),
-    /// A tool start recorded by an earlier version without recovery metadata.
-    ToolCallStarted(ToolCall),
     /// A tool is about to execute with a durable recovery policy and key.
-    ToolCallStartedWithRecovery {
+    ToolCallStarted {
         /// The original model request, including its dispatcher arguments.
         call: ToolCall,
         /// The recovery policy declared before the first attempt.
-        effect: Effect,
+        recovery: ToolRecovery,
         /// Stable key reused by all recovery attempts for this call.
         idempotency_key: String,
     },

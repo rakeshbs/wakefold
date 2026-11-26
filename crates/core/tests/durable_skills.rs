@@ -5,8 +5,8 @@ use futures_executor::block_on;
 use serde_json::json;
 use wakefold::{
     JsonValue, Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError, RunError,
-    RunEvent, RunOptions, Skill, TokenUsage, Tool, ToolCall, ToolContext, ToolError, ToolSpec,
-    WorkspaceStore,
+    RunEvent, RunOptions, Skill, TokenUsage, Tool, ToolCall, ToolContext, ToolError, ToolRecovery,
+    ToolSpec, WorkspaceStore,
 };
 
 const PROMPT: &str = "Write a note.";
@@ -289,7 +289,7 @@ fn failed_loader_commit_rolls_back_activation_and_can_be_retried() {
     let entries = journal.load_after(0).unwrap();
     assert!(matches!(
         entries.last().unwrap().event,
-        RunEvent::ToolCallStartedWithRecovery { .. }
+        RunEvent::ToolCallStarted { .. }
     ));
     assert!(
         !entries
@@ -332,15 +332,26 @@ fn interrupted_application_tool_is_never_dispatched_again() {
                 RunEvent::RunStarted(PROMPT.into()),
                 RunEvent::ModelCallRequested,
                 RunEvent::ModelCallCompleted(ModelTurn::new(loader.clone(), None)),
-                RunEvent::ToolCallStarted(loader.tool_calls()[0].clone()),
+                RunEvent::ToolCallStarted {
+                    call: loader.tool_calls()[0].clone(),
+                    recovery: ToolRecovery::RetryAfterCrash,
+                    idempotency_key: "load-key".into(),
+                },
                 RunEvent::SkillLoaded("notes".into()),
                 RunEvent::ToolCallCompleted(wakefold::ToolResult::new(
                     "first",
-                    json!({"loaded": "notes"}),
+                    json!({"loaded": "notes", "tools": [{
+                        "name": "notes.write", "description": "Write the note",
+                        "parameters": {"type": "object"}
+                    }]}),
                 )),
                 RunEvent::ModelCallRequested,
                 RunEvent::ModelCallCompleted(ModelTurn::new(call.clone(), None)),
-                RunEvent::ToolCallStarted(call.tool_calls()[0].clone()),
+                RunEvent::ToolCallStarted {
+                    call: call.tool_calls()[0].clone(),
+                    recovery: ToolRecovery::StopAfterCrash,
+                    idempotency_key: "write-key".into(),
+                },
             ],
         )
         .unwrap();
@@ -352,135 +363,6 @@ fn interrupted_application_tool_is_never_dispatched_again() {
     ));
     assert!(
         matches!(result, Err(RunError::ToolOutcomeUnknown { name, id }) if name == "notes.write" && id == "write".into())
-    );
-}
-
-#[test]
-fn resumes_a_saved_tool_request_from_an_earlier_journal_without_a_checkpoint() {
-    // Existing journals may have only the loader's successful ToolCallCompleted.
-    let dir = tempfile::tempdir().unwrap();
-    let loader = ModelResponse::ToolCall(ToolCall::new(
-        "first",
-        "skills.load",
-        json!({"name": "notes"}),
-    ));
-    {
-        let mut store = WorkspaceStore::open(dir.path()).unwrap();
-        store
-            .open_journal("chat", "old")
-            .unwrap()
-            .append(
-                0,
-                &[
-                    RunEvent::RunStarted(PROMPT.into()),
-                    RunEvent::ModelCallRequested,
-                    RunEvent::ModelCallCompleted(ModelTurn::new(loader.clone(), None)),
-                    RunEvent::ToolCallStarted(loader.tool_calls()[0].clone()),
-                    RunEvent::ToolCallCompleted(wakefold::ToolResult::new(
-                        "first",
-                        json!({"loaded": "notes"}),
-                    )),
-                    RunEvent::ModelCallRequested,
-                    RunEvent::ModelCallCompleted(ModelTurn::new(
-                        ModelResponse::ToolCall(ToolCall::new("write", "notes.write", json!({}))),
-                        None,
-                    )),
-                ],
-            )
-            .unwrap();
-    }
-    struct Finish;
-    #[async_trait]
-    impl Provider for Finish {
-        async fn complete(&self, req: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
-            assert!(
-                matches!(req.messages.last(), Some(Message::Tool(result)) if result.value == "written")
-            );
-            assert_eq!(
-                req.tools
-                    .iter()
-                    .map(|s| s.name.as_str())
-                    .collect::<Vec<_>>(),
-                ["load_skill", "call_tool"]
-            );
-            Ok(ModelResponse::Final("saved".into()))
-        }
-    }
-    let mut store = WorkspaceStore::open(dir.path()).unwrap();
-    let mut journal = store.open_journal("chat", "old").unwrap();
-    let skills = [Skill::new("notes", "Manage notes", &[&WriteNote])];
-    let result = block_on(journal.run(
-        PROMPT,
-        &NoCalls,
-        &skills,
-        RunOptions::new(3).with_context_budget(1),
-    ));
-    let Err(RunError::ContextBudgetExceeded { required, .. }) = result else {
-        panic!("expected context to include restored definitions, got {result:?}");
-    };
-    let report = block_on(journal.run(
-        PROMPT,
-        &Finish,
-        &skills,
-        RunOptions::new(3).with_context_budget(required.try_into().unwrap()),
-    ))
-    .unwrap();
-    assert_eq!(report.answer, "saved");
-}
-
-#[test]
-fn an_older_checkpoint_restores_definitions_before_dispatching() {
-    struct Resume;
-    #[async_trait]
-    impl Provider for Resume {
-        async fn complete(&self, req: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
-            assert_eq!(
-                req.tools
-                    .iter()
-                    .map(|spec| spec.name.as_str())
-                    .collect::<Vec<_>>(),
-                ["load_skill", "call_tool"]
-            );
-            let Message::Tool(result) = &req.messages[2] else {
-                panic!("restored loader definitions should follow the prompt");
-            };
-            assert_eq!(result.call_id, "wakefold-load-1".into());
-            assert_eq!(result.value["tools"][0]["name"], "notes.write");
-            assert_eq!(
-                result.value["tools"][0]["parameters"],
-                WriteNote.spec().parameters
-            );
-            if matches!(req.messages.last(), Some(Message::Tool(result)) if result.value == "written")
-            {
-                return Ok(ModelResponse::Final("saved".into()));
-            }
-            Ok(write_note())
-        }
-    }
-
-    let state = tempfile::tempdir().unwrap();
-    let mut store = WorkspaceStore::open(state.path()).unwrap();
-    let mut journal = store.open_journal("chat", "old-checkpoint").unwrap();
-    let checkpoint = serde_json::from_value(json!({
-        "state": {
-            "messages": [Message::User(PROMPT.into()), Message::Summary("Notes loaded.".into())],
-            "assistant_context": [],
-            "used_call_ids": ["wakefold-load-0"],
-            "model_turns": 1,
-            "usage": wakefold::RunUsage::default()
-        },
-        "loaded_skills": ["notes"]
-    }))
-    .unwrap();
-    journal
-        .append(0, &[RunEvent::Compacted(checkpoint)])
-        .unwrap();
-    let skills = [Skill::new("notes", "Manage notes", &[&WriteNote])];
-    let report = block_on(journal.run(PROMPT, &Resume, &skills, RunOptions::new(3))).unwrap();
-    assert_eq!(report.answer, "saved");
-    assert_eq!(
-        block_on(journal.run(PROMPT, &NoCalls, &skills, RunOptions::new(3))).unwrap(),
-        report
     );
 }
 

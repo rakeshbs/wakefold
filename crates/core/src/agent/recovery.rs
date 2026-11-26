@@ -6,11 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{Action, RunError, RunOptions, RunUsage, next_action, validate_calls};
 use crate::context::Compaction;
-use crate::skill::{LOADER, RunSkills, is_loader};
-use crate::{
-    CallId, Effect, JsonValue, Message, ModelResponse, ModelTurn, RunEvent, RunJournal, ToolCall,
-    ToolResult,
-};
+use crate::skill::{LOADER, RunSkills};
+use crate::{CallId, JsonValue, Message, ModelTurn, RunEvent, RunJournal, ToolCall, ToolRecovery};
 
 /// A durable model-call boundary containing the compacted transcript and run bookkeeping.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,8 +58,8 @@ pub(super) enum Boundary {
     ModelRequested,
     ToolStarted {
         call: ToolCall,
-        effect: Effect,
-        idempotency_key: Option<String>,
+        recovery: ToolRecovery,
+        idempotency_key: String,
     },
     Finished(String),
 }
@@ -116,38 +113,29 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
             run.apply(entry.event)?;
             run.tail = entry.sequence;
         }
-        if let Boundary::ToolStarted {
-            call,
-            effect,
-            idempotency_key,
-        } = &run.boundary
-            && !is_loader(&call.name)
-            && (!matches!(effect, Effect::ReadOnly | Effect::Idempotent)
-                || idempotency_key.is_none()
-                || run.skills.effect(call).ok() != Some(*effect))
+        if let Boundary::ToolStarted { call, recovery, .. } = &run.boundary
+            && (*recovery != ToolRecovery::RetryAfterCrash
+                || run.skills.recovery(call).ok() != Some(ToolRecovery::RetryAfterCrash))
         {
             return Err(RunError::ToolOutcomeUnknown {
                 id: call.id.clone(),
-                name: run
-                    .skills
-                    .resolve(call)
-                    .map(|(name, _)| name)
-                    .unwrap_or(&call.name)
-                    .to_owned(),
+                name: run.skills.target_name(call).to_owned(),
             });
         }
-        run.restore_definitions()?;
         Ok(run)
     }
 
     pub fn start_tool(&mut self, call: ToolCall) -> Result<(), RunError> {
-        let effect = self.skills.effect(&call).map_err(|source| RunError::Tool {
-            name: call.name.clone(),
-            source,
-        })?;
-        self.commit([RunEvent::ToolCallStartedWithRecovery {
+        let recovery = self
+            .skills
+            .recovery(&call)
+            .map_err(|source| RunError::Tool {
+                name: call.name.clone(),
+                source,
+            })?;
+        self.commit([RunEvent::ToolCallStarted {
             call,
-            effect,
+            recovery,
             idempotency_key: format!("wakefold-{:032x}", rand::random::<u128>()),
         }])
     }
@@ -156,63 +144,9 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
         match &self.boundary {
             Boundary::ToolStarted {
                 idempotency_key, ..
-            } => idempotency_key.as_deref(),
+            } => Some(idempotency_key),
             _ => None,
         }
-    }
-
-    fn restore_definitions(&mut self) -> Result<(), RunError> {
-        // Older checkpoints retained only skill names. Restore ordinary loader
-        // exchanges so their definitions can be replayed and compacted as usual.
-        let mut restored = Vec::new();
-        let mut contexts = Vec::new();
-        for name in self.skills.loaded() {
-            let loader_calls = self
-                .state
-                .messages
-                .iter()
-                .filter_map(|message| match message {
-                    Message::Assistant(response) => Some(response.tool_calls()),
-                    _ => None,
-                })
-                .flatten()
-                .filter(|call| {
-                    is_loader(&call.name) && call.arguments["name"].as_str() == Some(name)
-                })
-                .map(|call| &call.id)
-                .collect::<HashSet<_>>();
-            if self.state.messages.iter().any(|message| {
-                matches!(message,
-                Message::Tool(result) if loader_calls.contains(&result.call_id)
-                    && result.value["loaded"].as_str() == Some(name)
-                    && result.value["tools"].is_array())
-            }) {
-                continue;
-            }
-            let mut index = 0;
-            let mut id = CallId::from(format!("wakefold-load-{index}"));
-            while !self.state.used_call_ids.insert(id.clone()) {
-                index += 1;
-                id = CallId::from(format!("wakefold-load-{index}"));
-            }
-            let value = self
-                .skills
-                .definitions(name)
-                .map_err(|source| RunError::Tool {
-                    name: LOADER.to_owned(),
-                    source,
-                })?;
-            restored.push(Message::Assistant(ModelResponse::ToolCall(ToolCall::new(
-                id.clone(),
-                LOADER,
-                serde_json::json!({"name": name}),
-            ))));
-            restored.push(Message::Tool(ToolResult::new(id, value)));
-            contexts.push(None);
-        }
-        self.state.messages.splice(1..1, restored);
-        self.state.assistant_context.splice(..0, contexts);
-        Ok(())
     }
 
     pub fn compact(
@@ -270,18 +204,11 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
                 self.state.complete_turn(turn, &self.skills, self.options)?;
                 Boundary::Ready
             }
-            (Boundary::Ready, RunEvent::ToolCallStarted(call)) if matches!(action(), Some(Action::RunTool(expected)) if expected == &call) => {
-                Boundary::ToolStarted {
-                    call,
-                    effect: Effect::NonIdempotent,
-                    idempotency_key: None,
-                }
-            }
             (
                 Boundary::Ready,
-                RunEvent::ToolCallStartedWithRecovery {
+                RunEvent::ToolCallStarted {
                     call,
-                    effect,
+                    recovery,
                     idempotency_key,
                 },
             ) if !idempotency_key.is_empty()
@@ -289,12 +216,12 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
             {
                 Boundary::ToolStarted {
                     call,
-                    effect,
-                    idempotency_key: Some(idempotency_key),
+                    recovery,
+                    idempotency_key,
                 }
             }
             (Boundary::ToolStarted { call, .. }, RunEvent::SkillLoaded(name))
-                if is_loader(&call.name) && call.arguments["name"].as_str() == Some(&name) =>
+                if call.name == LOADER && call.arguments["name"].as_str() == Some(&name) =>
             {
                 activate_skill(&mut self.skills, &name)?;
                 return Ok(());
@@ -302,15 +229,16 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
             (Boundary::ToolStarted { call, .. }, RunEvent::ToolCallCompleted(result))
                 if call.id == result.call_id =>
             {
-                // Earlier journals recorded successful loader calls without a SkillLoaded event.
-                if is_loader(&call.name) {
-                    let name = call.arguments["name"]
-                        .as_str()
-                        .filter(|name| result.value["loaded"].as_str() == Some(*name))
-                        .ok_or(RunError::InvalidJournal(
-                            "loader result does not match its call",
-                        ))?;
-                    activate_skill(&mut self.skills, name)?;
+                if call.name == LOADER
+                    && !call.arguments["name"].as_str().is_some_and(|name| {
+                        self.skills.is_loaded(name)
+                            && result.value["loaded"].as_str() == Some(name)
+                            && result.value["tools"].is_array()
+                    })
+                {
+                    return Err(RunError::InvalidJournal(
+                        "loader result does not match the activated skill",
+                    ));
                 }
                 self.state.messages.push(Message::Tool(result));
                 Boundary::Ready

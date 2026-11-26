@@ -418,15 +418,23 @@ fn loader_rejects_unknown_skills_and_invalid_arguments() {
 }
 
 #[test]
-fn dispatcher_rejects_malformed_calls_and_unknown_targets_before_execution() {
-    for arguments in [
-        json!({}),
-        json!({"name": "util.echo"}),
-        json!({"name": 1, "arguments": {}}),
-        json!({"name": "util.echo", "arguments": {}, "extra": true}),
-        json!({"name": "other.echo", "arguments": {}}),
-        json!({"name": "load_skill", "arguments": {"name": "util"}}),
-        json!({"name": "call_tool", "arguments": {}}),
+fn rejects_malformed_and_unregistered_tool_calls_before_execution() {
+    for (name, arguments) in [
+        ("call_tool", json!({})),
+        ("call_tool", json!({"name": "util.echo"})),
+        ("call_tool", json!({"name": 1, "arguments": {}})),
+        (
+            "call_tool",
+            json!({"name": "util.echo", "arguments": {}, "extra": true}),
+        ),
+        ("call_tool", json!({"name": "other.echo", "arguments": {}})),
+        (
+            "call_tool",
+            json!({"name": "load_skill", "arguments": {"name": "util"}}),
+        ),
+        ("call_tool", json!({"name": "call_tool", "arguments": {}})),
+        ("util.echo", json!({})),
+        ("skills.load", json!({"name": "util"})),
     ] {
         let user = Message::User("test".into());
         let (load, messages) = common::load_skill(&user, "util", &[Echo::default().spec()]);
@@ -434,7 +442,7 @@ fn dispatcher_rejects_malformed_calls_and_unknown_targets_before_execution() {
             load,
             ScriptedTurn::new(
                 messages,
-                ModelResponse::ToolCall(ToolCall::new("bad", "call_tool", arguments)),
+                ModelResponse::ToolCall(ToolCall::new("bad", name, arguments)),
             ),
         ]);
         let tool = Echo::default();
@@ -544,15 +552,10 @@ fn rejects_ambiguous_registrations_before_the_first_turn() {
     let provider = ScriptedProvider::new([]);
     let tool = Echo::default();
     let skill = Skill::new("util", "Echo", &[]);
-    for skills in [
-        vec![skill, skill],
-        vec![Skill::new("skills", "Reserved", &[])],
-    ] {
-        assert!(matches!(
-            block_on(run("", &provider, &skills, 1)),
-            Err(RunError::DuplicateSkillName { .. })
-        ));
-    }
+    assert!(matches!(
+        block_on(run("", &provider, &[skill, skill], 1)),
+        Err(RunError::DuplicateSkillName { .. })
+    ));
     assert!(
         matches!(block_on(run("", &provider, &[Skill::new("util", "Echo", &[&tool, &tool])], 1)),
         Err(RunError::DuplicateToolName { name }) if name == "util.echo")

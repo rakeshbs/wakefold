@@ -10,14 +10,18 @@ use futures_executor::block_on;
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde_json::json;
 use wakefold::{
-    Effect, JsonValue, Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError,
-    RunError, RunEvent, RunOptions, RunReport, Skill, TokenUsage, Tool, ToolCall, ToolContext,
-    ToolError, ToolSpec, WorkspaceStore,
+    JsonValue, Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError, RunError,
+    RunEvent, RunOptions, RunReport, Skill, TokenUsage, Tool, ToolCall, ToolContext, ToolError,
+    ToolRecovery, ToolSpec, WorkspaceStore,
 };
 
 const WORKER_ROOT: &str = "WAKEFOLD_RECOVERY_WORKER_ROOT";
 const FAULT_POINT: &str = "WAKEFOLD_RECOVERY_FAULT_POINT";
-const POLICIES: [Effect; 3] = [Effect::ReadOnly, Effect::Idempotent, Effect::NonIdempotent];
+const POLICIES: [ToolRecovery; 3] = [
+    ToolRecovery::RetryAfterCrash,
+    ToolRecovery::RetryAfterCrash,
+    ToolRecovery::StopAfterCrash,
+];
 const PROMPT: &str = "Read the catalog, reserve an item, and send one notification.";
 
 fn append_line(path: PathBuf, value: &str) {
@@ -50,7 +54,7 @@ fn pause_after_commit(sequence: u64, _: &[RunEvent]) {
 struct Operation<'a> {
     root: &'a Path,
     name: &'static str,
-    effect: Effect,
+    recovery: ToolRecovery,
 }
 
 #[async_trait]
@@ -61,7 +65,7 @@ impl Tool for Operation<'_> {
             "Execute this workflow operation",
             json!({"type": "object"}),
         )
-        .with_effect(self.effect)
+        .with_recovery(self.recovery)
     }
 
     async fn call(&self, _: &JsonValue) -> Result<JsonValue, ToolError> {
@@ -77,9 +81,9 @@ impl Tool for Operation<'_> {
             .idempotency_key()
             .expect("agent calls must have an idempotency key");
         append_line(self.root.join(format!("{}-attempts", self.name)), key);
-        let result = match self.effect {
-            Effect::ReadOnly => json!(fs::read_to_string(self.root.join("catalog")).unwrap()),
-            Effect::Idempotent => {
+        let result = match self.name {
+            "read" => json!(fs::read_to_string(self.root.join("catalog")).unwrap()),
+            "reserve" => {
                 // The backing service commits the key and side effect together.
                 let mut service = Connection::open(self.root.join("reservations.sqlite3")).unwrap();
                 service
@@ -113,12 +117,12 @@ impl Tool for Operation<'_> {
                 tx.commit().unwrap();
                 json!({"reservation": format!("R-{id}")})
             }
-            Effect::NonIdempotent => {
+            "notify" => {
                 fs::File::create_new(self.root.join("notification"))
                     .expect("a notification must never repeat");
                 json!("sent")
             }
-            _ => unreachable!("the test uses the three declared policies"),
+            _ => unreachable!("the test uses three known operations"),
         };
         pause_at(&format!("{}-effect", self.name));
         Ok(result)
@@ -133,7 +137,7 @@ struct Workflow<'a>(&'a Path);
 #[tool(
     name = "reserve",
     description = "Reserve an item",
-    effect = "idempotent"
+    recovery = "retry_after_crash"
 )]
 struct ReservationInput {
     quantity: u64,
@@ -180,18 +184,18 @@ impl Provider for Workflow<'_> {
 
 fn run_workflow(
     root: &Path,
-    policies: [Effect; 3],
+    policies: [ToolRecovery; 3],
     hook: Option<fn(u64, &[RunEvent])>,
 ) -> Result<RunReport, RunError> {
     let read = Operation {
         root,
         name: "read",
-        effect: policies[0],
+        recovery: policies[0],
     };
     let reserve_operation = Operation {
         root,
         name: "reserve",
-        effect: policies[1],
+        recovery: policies[1],
     };
     #[cfg(feature = "derive")]
     let reserve = wakefold::typed_tool_with_context(|input: ReservationInput, context| {
@@ -207,7 +211,7 @@ fn run_workflow(
     let notify = Operation {
         root,
         name: "notify",
-        effect: policies[2],
+        recovery: policies[2],
     };
     let tools: [&dyn Tool; 3] = [&read, &reserve, &notify];
     let skills = [Skill::new("workflow", "Read, reserve and notify", &tools)];
@@ -299,7 +303,7 @@ fn process_crashes_at_every_durable_boundary() {
         kill_at(root.path(), &point);
         let before = events(root.path());
         let notification_attempts = lines(root.path(), "notify-attempts");
-        let interrupted_notification = matches!(before.last(), Some(RunEvent::ToolCallStartedWithRecovery { call, .. }) if call.id == "notify".into());
+        let interrupted_notification = matches!(before.last(), Some(RunEvent::ToolCallStarted { call, .. }) if call.id == "notify".into());
         let result = run_workflow(root.path(), POLICIES, None);
         if interrupted_notification {
             assert!(
@@ -333,7 +337,7 @@ fn process_crashes_at_every_durable_boundary() {
         let starts: Vec<_> = saved
             .iter()
             .filter_map(|event| match event {
-                RunEvent::ToolCallStartedWithRecovery {
+                RunEvent::ToolCallStarted {
                     call,
                     idempotency_key,
                     ..
@@ -375,10 +379,10 @@ fn recovery_requires_the_original_and_current_policies_to_allow_repetition() {
     run_workflow(baseline.path(), POLICIES, None).unwrap();
     let history = events(baseline.path());
     for (name, replacement) in [
-        ("read", Effect::NonIdempotent),
-        ("notify", Effect::Idempotent),
+        ("read", ToolRecovery::StopAfterCrash),
+        ("notify", ToolRecovery::RetryAfterCrash),
     ] {
-        let end = history.iter().position(|event| matches!(event, RunEvent::ToolCallStartedWithRecovery { call, .. } if call.id == name.into())).unwrap();
+        let end = history.iter().position(|event| matches!(event, RunEvent::ToolCallStarted { call, .. } if call.id == name.into())).unwrap();
         let root = tempfile::tempdir().unwrap();
         let mut store = WorkspaceStore::open(root.path()).unwrap();
         store
@@ -397,31 +401,6 @@ fn recovery_requires_the_original_and_current_policies_to_allow_repetition() {
 }
 
 #[test]
-fn older_tool_starts_keep_the_unknown_outcome_default() {
-    let baseline = tempfile::tempdir().unwrap();
-    fs::write(baseline.path().join("catalog"), "notebook").unwrap();
-    run_workflow(baseline.path(), POLICIES, None).unwrap();
-    let mut history = events(baseline.path());
-    let end = history.iter().position(|event| matches!(event, RunEvent::ToolCallStartedWithRecovery { call, .. } if call.id == "read".into())).unwrap();
-    let RunEvent::ToolCallStartedWithRecovery { call, .. } = history[end].clone() else {
-        unreachable!()
-    };
-    history[end] = RunEvent::ToolCallStarted(call);
-    let root = tempfile::tempdir().unwrap();
-    let mut store = WorkspaceStore::open(root.path()).unwrap();
-    store
-        .open_journal("chat", "run")
-        .unwrap()
-        .append(0, &history[..=end])
-        .unwrap();
-    assert!(matches!(
-        run_workflow(root.path(), POLICIES, None),
-        Err(RunError::ToolOutcomeUnknown { .. })
-    ));
-    assert!(lines(root.path(), "read-attempts").is_empty());
-}
-
-#[test]
 fn identical_call_ids_in_separate_runs_have_distinct_keys() {
     let mut keys = HashSet::new();
     for _ in 0..2 {
@@ -433,13 +412,14 @@ fn identical_call_ids_in_separate_runs_have_distinct_keys() {
 }
 
 #[test]
-fn old_tool_specs_default_to_non_idempotent_and_round_trip_effects() {
-    let old = json!({"name": "write", "description": "Write", "parameters": {"type": "object"}});
-    let spec: ToolSpec = serde_json::from_value(old.clone()).unwrap();
-    assert_eq!(spec.effect, Effect::NonIdempotent);
-    assert_eq!(serde_json::to_value(&spec).unwrap(), old);
-    for effect in POLICIES {
-        let spec = spec.clone().with_effect(effect);
+fn tool_specs_default_to_stop_after_crash_and_round_trip_recovery() {
+    let default_spec =
+        json!({"name": "write", "description": "Write", "parameters": {"type": "object"}});
+    let spec: ToolSpec = serde_json::from_value(default_spec.clone()).unwrap();
+    assert_eq!(spec.recovery, ToolRecovery::StopAfterCrash);
+    assert_eq!(serde_json::to_value(&spec).unwrap(), default_spec);
+    for recovery in [ToolRecovery::RetryAfterCrash, ToolRecovery::StopAfterCrash] {
+        let spec = spec.clone().with_recovery(recovery);
         let restored: ToolSpec =
             serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
         assert_eq!(restored, spec);

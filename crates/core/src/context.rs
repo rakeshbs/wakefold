@@ -146,7 +146,7 @@ impl ContextSizes {
                 for name in response
                     .tool_calls()
                     .iter()
-                    .filter(|call| crate::skill::is_loader(&call.name))
+                    .filter(|call| call.name == crate::skill::LOADER)
                     .filter_map(|call| call.arguments["name"].as_str())
                 {
                     keep_exchange |= loaded.insert(name);

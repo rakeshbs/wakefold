@@ -99,7 +99,7 @@ async fn drive(state: &Path, stop_after_activation: bool) -> Result<String, Box<
             .count(),
         1
     );
-    assert_eq!(entries.iter().filter(|entry| matches!(&entry.event, RunEvent::ToolCallStartedWithRecovery { call, .. } if call.name == "call_tool" && call.arguments["name"] == "orders.lookup")).count(), 1);
+    assert_eq!(entries.iter().filter(|entry| matches!(&entry.event, RunEvent::ToolCallStarted { call, .. } if call.name == "call_tool" && call.arguments["name"] == "orders.lookup")).count(), 1);
     Ok(report.answer)
 }
 
@@ -407,7 +407,7 @@ async fn live_compaction_preserves_skills_across_restart() -> Result<(), Box<dyn
         ("verification.receipt", false),
     ] {
         let calls: Vec<_> = entries.iter().filter(|entry| matches!(&entry.event,
-            RunEvent::ToolCallStartedWithRecovery { call, .. } if call.name == "call_tool" && call.arguments["name"] == name)).collect();
+            RunEvent::ToolCallStarted { call, .. } if call.name == "call_tool" && call.arguments["name"] == name)).collect();
         assert_eq!(calls.len(), 1, "{name} must execute exactly once");
         assert_eq!(
             calls[0].sequence < checkpoint_sequence,

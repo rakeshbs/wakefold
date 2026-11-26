@@ -35,23 +35,25 @@ impl fmt::Display for CallId {
     }
 }
 
-/// Declares whether an interrupted tool call can safely execute again during recovery.
+/// Controls how Wakefold handles an interrupted tool call after a crash.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-pub enum Effect {
-    /// Reads external state and can safely repeat after an interrupted call.
-    ReadOnly,
-    /// Uses the context's idempotency key to deduplicate effects and return the original result.
-    Idempotent,
-    /// An interrupted call requires reconciliation before another attempt.
+pub enum ToolRecovery {
+    /// Retry an interrupted call. The handler must make repetition safe.
+    ///
+    /// Calls that only read data can repeat directly. Calls that change state
+    /// must use [`ToolContext::idempotency_key`] to prevent duplicate changes
+    /// and recover the original result.
+    RetryAfterCrash,
+    /// Stop with an unknown outcome if the call's result was never saved.
     #[default]
-    NonIdempotent,
+    StopAfterCrash,
 }
 
-impl Effect {
-    fn is_non_idempotent(&self) -> bool {
-        *self == Self::NonIdempotent
+impl ToolRecovery {
+    fn is_default(&self) -> bool {
+        *self == Self::StopAfterCrash
     }
 }
 
@@ -66,8 +68,8 @@ pub struct ToolSpec {
     /// JSON Schema describing the tool's arguments.
     pub parameters: JsonValue,
     /// Recovery policy for interrupted calls. The handler must uphold this declaration.
-    #[serde(default, skip_serializing_if = "Effect::is_non_idempotent")]
-    pub effect: Effect,
+    #[serde(default, skip_serializing_if = "ToolRecovery::is_default")]
+    pub recovery: ToolRecovery,
 }
 
 impl ToolSpec {
@@ -81,17 +83,14 @@ impl ToolSpec {
             name: name.into(),
             description: description.into(),
             parameters,
-            effect: Effect::NonIdempotent,
+            recovery: ToolRecovery::StopAfterCrash,
         }
     }
 
-    /// Declare how this tool can be retried after a crash.
-    ///
-    /// An idempotent handler must use [`ToolContext::idempotency_key`] to deduplicate
-    /// external effects and recover the original result when called again.
+    /// Set the recovery policy for an interrupted call.
     #[must_use]
-    pub fn with_effect(mut self, effect: Effect) -> Self {
-        self.effect = effect;
+    pub fn with_recovery(mut self, recovery: ToolRecovery) -> Self {
+        self.recovery = recovery;
         self
     }
 }
@@ -172,10 +171,10 @@ impl ToolContext {
 
     /// The stable key assigned to this call before the agent executes its handler.
     ///
-    /// Journaled runs persist this key and reuse it after restart. Idempotent
-    /// handlers must pass it to their backing service or record it with their
-    /// effects in one transaction. Direct tool calls using the default context
-    /// have no assigned key.
+    /// Journaled runs persist this key and reuse it after restart. A handler
+    /// that changes state and opts into retries must use the key with its backing
+    /// service or record it with the change in one transaction. The default
+    /// context has no assigned key.
     pub fn idempotency_key(&self) -> Option<&str> {
         self.idempotency_key.as_deref()
     }

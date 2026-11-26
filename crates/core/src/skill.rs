@@ -6,16 +6,15 @@ use std::fmt::{self, Write};
 use serde_json::json;
 
 use crate::{
-    Effect, JsonValue, RunError, RunEvent, Tool, ToolCall, ToolContext, ToolError, ToolResult,
-    ToolSpec,
+    JsonValue, RunError, RunEvent, Tool, ToolCall, ToolContext, ToolError, ToolRecovery,
+    ToolResult, ToolSpec,
 };
 
 /// A named group of tools the agent can load together.
 ///
 /// The loader shows the model the skill's name and short description at startup.
 /// Tool names are local to their skill. Skill and local tool names may contain
-/// ASCII letters, digits, underscores, and hyphens. Wakefold reserves `skills`
-/// for compatibility with the built-in loader in earlier journals.
+/// ASCII letters, digits, underscores, and hyphens.
 #[derive(Clone, Copy)]
 pub struct Skill<'a> {
     name: &'a str,
@@ -47,20 +46,16 @@ impl fmt::Debug for Skill<'_> {
 pub(crate) const LOADER: &str = "load_skill";
 pub(crate) const DISPATCHER: &str = "call_tool";
 
-pub(crate) fn is_loader(name: &str) -> bool {
-    matches!(name, LOADER | "skills.load")
-}
-
 pub(crate) struct RunSkills<'a> {
     available: BTreeMap<&'a str, Vec<(ToolSpec, &'a dyn Tool)>>,
     loaded: Vec<String>,
     pub(crate) advertised: Vec<ToolSpec>,
-    handlers: BTreeMap<String, (Effect, &'a dyn Tool)>,
+    handlers: BTreeMap<String, (ToolRecovery, &'a dyn Tool)>,
 }
 
 impl<'a> RunSkills<'a> {
     pub(crate) fn new(skills: &[Skill<'a>]) -> Result<Self, RunError> {
-        let mut available = BTreeMap::from([("skills", Vec::new())]);
+        let mut available = BTreeMap::new();
         let mut description = String::from(
             "Load a skill by name to receive its tool definitions. Use call_tool with a returned tool name and arguments on subsequent turns. Available skills:",
         );
@@ -121,13 +116,20 @@ impl<'a> RunSkills<'a> {
     }
 
     pub(crate) fn validate_call(&self, call: &ToolCall) -> Result<(), RunError> {
-        if is_loader(&call.name) {
+        if call.name == LOADER {
             return Ok(());
         }
-        let (name, _) = self.resolve(call).map_err(|source| RunError::Tool {
-            name: call.name.clone(),
-            source,
-        })?;
+        if call.name != DISPATCHER {
+            return Err(RunError::UnknownTool {
+                name: call.name.clone(),
+            });
+        }
+        let (name, _) = self
+            .dispatch_arguments(call)
+            .map_err(|source| RunError::Tool {
+                name: call.name.clone(),
+                source,
+            })?;
         if !self.handlers.contains_key(name) {
             return Err(RunError::UnknownTool {
                 name: name.to_owned(),
@@ -136,7 +138,7 @@ impl<'a> RunSkills<'a> {
         Ok(())
     }
 
-    pub(crate) fn definitions(&self, name: &str) -> Result<JsonValue, ToolError> {
+    fn definitions(&self, name: &str) -> Result<JsonValue, ToolError> {
         let tools = self.available.get(name).ok_or_else(|| unavailable(name))?;
         Ok(json!({
             "loaded": name,
@@ -144,24 +146,28 @@ impl<'a> RunSkills<'a> {
         }))
     }
 
-    pub(crate) fn effect(&self, call: &ToolCall) -> Result<Effect, ToolError> {
-        if is_loader(&call.name) {
-            return Ok(Effect::ReadOnly);
+    pub(crate) fn recovery(&self, call: &ToolCall) -> Result<ToolRecovery, ToolError> {
+        if call.name == LOADER {
+            return Ok(ToolRecovery::RetryAfterCrash);
         }
-        let (name, _) = self.resolve(call)?;
+        let (name, _) = self.dispatch_arguments(call)?;
         self.handlers
             .get(name)
-            .map(|(effect, _)| *effect)
+            .map(|(recovery, _)| *recovery)
             .ok_or_else(|| ToolError::new(format!("tool {name} is unavailable to this agent")))
     }
 
-    pub(crate) fn resolve<'call>(
+    pub(crate) fn target_name<'call>(&self, call: &'call ToolCall) -> &'call str {
+        self.dispatch_arguments(call)
+            .map_or(&call.name, |(name, _)| name)
+    }
+
+    fn dispatch_arguments<'call>(
         &self,
         call: &'call ToolCall,
     ) -> Result<(&'call str, &'call JsonValue), ToolError> {
         if call.name != DISPATCHER {
-            // Direct names are retained for journals created before the dispatcher.
-            return Ok((&call.name, &call.arguments));
+            return Err(ToolError::new(format!("unknown function {}", call.name)));
         }
         let fields = call
             .arguments
@@ -184,7 +190,7 @@ impl<'a> RunSkills<'a> {
         context: ToolContext,
     ) -> Result<Vec<RunEvent>, ToolError> {
         let mut events = Vec::new();
-        let value = if is_loader(&call.name) {
+        let value = if call.name == LOADER {
             let name = load_name(&call.arguments)?;
             let definitions = self.definitions(name)?;
             if !self.is_loaded(name) {
@@ -192,7 +198,7 @@ impl<'a> RunSkills<'a> {
             }
             definitions
         } else {
-            let (name, arguments) = self.resolve(call)?;
+            let (name, arguments) = self.dispatch_arguments(call)?;
             let (_, handler) = self.handlers.get(name).ok_or_else(|| {
                 ToolError::new(format!("tool {name} is unavailable to this agent"))
             })?;
@@ -205,8 +211,8 @@ impl<'a> RunSkills<'a> {
         Ok(events)
     }
 
-    fn is_loaded(&self, name: &str) -> bool {
-        name == "skills" || self.loaded.iter().any(|loaded| loaded == name)
+    pub(crate) fn is_loaded(&self, name: &str) -> bool {
+        self.loaded.iter().any(|loaded| loaded == name)
     }
 
     pub(crate) fn activate(&mut self, name: &str) -> Result<(), ToolError> {
@@ -216,7 +222,7 @@ impl<'a> RunSkills<'a> {
         let tools = self.available.get(name).ok_or_else(|| unavailable(name))?;
         for (spec, tool) in tools {
             self.handlers
-                .insert(spec.name.clone(), (spec.effect, *tool));
+                .insert(spec.name.clone(), (spec.recovery, *tool));
         }
         self.loaded.push(name.to_owned());
         Ok(())

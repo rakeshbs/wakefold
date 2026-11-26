@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 
-use crate::{Effect, JsonValue, Tool, ToolContext, ToolError, ToolSpec};
+use crate::{JsonValue, Tool, ToolContext, ToolError, ToolRecovery, ToolSpec};
 
 /// Registration metadata for the argument type and recovery policy of a tool.
 pub trait ToolInput {
@@ -18,7 +18,7 @@ pub trait ToolInput {
     const DESCRIPTION: &'static str;
 
     /// Recovery policy implemented by the handler.
-    const EFFECT: Effect = Effect::NonIdempotent;
+    const RECOVERY: ToolRecovery = ToolRecovery::StopAfterCrash;
 }
 
 /// Register an asynchronous handler using its input type as the tool schema.
@@ -55,6 +55,8 @@ where
 /// Register a typed asynchronous handler that also receives the run context.
 ///
 /// Use [`ToolContext::cancellation_token`] to observe the caller's signal.
+/// Use [`ToolContext::idempotency_key`] to prevent duplicate changes when opting
+/// into [`ToolRecovery::RetryAfterCrash`].
 pub fn typed_tool_with_context<Input, Handler, Output>(handler: Handler) -> impl Tool
 where
     Input: ToolInput + DeserializeOwned + JsonSchema + Send + 'static,
@@ -85,7 +87,7 @@ where
             Input::DESCRIPTION,
             schema_for!(Input).to_value(),
         )
-        .with_effect(Input::EFFECT)
+        .with_recovery(Input::RECOVERY)
     }
 
     async fn call(&self, arguments: &JsonValue) -> Result<JsonValue, ToolError> {

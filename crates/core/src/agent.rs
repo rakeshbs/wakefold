@@ -166,7 +166,7 @@ pub enum RunError {
     #[error("model call failed: {0}")]
     Provider(#[from] ProviderError),
 
-    /// Two skills have the same name, including the reserved built-in skill.
+    /// Two skills have the same name.
     #[error("multiple skills registered as {name}")]
     DuplicateSkillName {
         /// The repeated skill name.
@@ -333,7 +333,7 @@ impl RunJournal<'_> {
     /// and usage apply to the entire run. A finished run returns its saved answer.
     /// SQLite reads and writes are synchronous at step boundaries. A model request
     /// interrupted before its response was committed may be sent again. Interrupted
-    /// read-only and idempotent tools can retry with their saved idempotency key.
+    /// tools that opt into retrying can reuse their saved idempotency key.
     ///
     /// ```no_run
     /// # async fn example(provider: &dyn wakefold::Provider, skills: &[wakefold::Skill<'_>])
@@ -464,12 +464,7 @@ async fn drive(
                 let events = await_cancellable(run.skills.call(call, context), cancellation)
                     .await?
                     .map_err(|source| RunError::Tool {
-                        name: run
-                            .skills
-                            .resolve(call)
-                            .map(|(name, _)| name)
-                            .unwrap_or(&call.name)
-                            .to_owned(),
+                        name: run.skills.target_name(call).to_owned(),
                         source,
                     })?;
                 run.commit(events)?;
