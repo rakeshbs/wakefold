@@ -13,7 +13,7 @@ mod tests;
 #[derive(Default)]
 pub(crate) struct ContextSizes {
     messages: Vec<u128>,
-    assistant_context: Vec<u128>,
+    assistant_replay_data: Vec<u128>,
     total: u128,
 }
 
@@ -37,7 +37,7 @@ impl Compaction<'_> {
         self,
         response: ModelResponse,
         messages: &mut Vec<Message>,
-        assistant_context: &mut Vec<Option<JsonValue>>,
+        assistant_replay_data: &mut Vec<Option<JsonValue>>,
     ) -> Result<(), RunError> {
         let ModelResponse::Final(summary) = response else {
             return Err(ProviderError::new("context compaction must return a text summary").into());
@@ -49,8 +49,8 @@ impl Compaction<'_> {
         let required = self.retained_bytes + summary.len() as u128;
         if required > self.limit as u128 {
             return Err(RunError::ContextBudgetExceeded {
-                limit: self.limit,
-                required,
+                limit_bytes: self.limit,
+                required_bytes: required,
             });
         }
 
@@ -64,9 +64,9 @@ impl Compaction<'_> {
         let retained = self
             .retained_context
             .iter()
-            .map(|&index| assistant_context[index].clone())
+            .map(|&index| assistant_replay_data[index].clone())
             .collect::<Vec<_>>();
-        assistant_context.splice(..self.assistant_turns, retained);
+        assistant_replay_data.splice(..self.assistant_turns, retained);
         let retained_sizes = self
             .retained_messages
             .iter()
@@ -79,10 +79,10 @@ impl Compaction<'_> {
         let retained_sizes = self
             .retained_context
             .iter()
-            .map(|&index| self.sizes.assistant_context[index])
+            .map(|&index| self.sizes.assistant_replay_data[index])
             .collect::<Vec<_>>();
         self.sizes
-            .assistant_context
+            .assistant_replay_data
             .splice(..self.assistant_turns, retained_sizes);
         self.sizes.total = required;
         Ok(())
@@ -93,7 +93,7 @@ impl ContextSizes {
     pub(crate) fn prepare(
         &mut self,
         messages: &[Message],
-        assistant_context: &[Option<JsonValue>],
+        assistant_replay_data: &[Option<JsonValue>],
         limit: usize,
     ) -> Result<Option<Compaction<'_>>, RunError> {
         for message in &messages[self.messages.len()..] {
@@ -101,9 +101,9 @@ impl ContextSizes {
             self.messages.push(size);
             self.total += size;
         }
-        for context in &assistant_context[self.assistant_context.len()..] {
+        for context in &assistant_replay_data[self.assistant_replay_data.len()..] {
             let size = context.as_ref().map_or(0, json_bytes);
-            self.assistant_context.push(size);
+            self.assistant_replay_data.push(size);
             self.total += size;
         }
         let budget = limit as u128;
@@ -113,7 +113,7 @@ impl ContextSizes {
 
         // At a model-call boundary all tool calls are answered. Only consider
         // prefixes ending before an assistant message to keep each exchange whole.
-        let latest = assistant_context.len().saturating_sub(1);
+        let latest = assistant_replay_data.len().saturating_sub(1);
         let mut input_bytes = self.messages.first().copied().unwrap_or(0);
         let mut retained_bytes = self.total;
         let mut assistant_turns = 0;
@@ -154,7 +154,7 @@ impl ContextSizes {
                 if keep_exchange {
                     retained_context.push(assistant_turns);
                 } else {
-                    retained_bytes -= self.assistant_context[assistant_turns];
+                    retained_bytes -= self.assistant_replay_data[assistant_turns];
                 }
                 assistant_turns += 1;
             }
@@ -177,8 +177,8 @@ impl ContextSizes {
         )) = candidate
         else {
             return Err(RunError::ContextBudgetExceeded {
-                limit,
-                required: self.total,
+                limit_bytes: limit,
+                required_bytes: self.total,
             });
         };
         let mut input = messages[..transcript_end].to_vec();

@@ -32,8 +32,8 @@ impl Tool for WriteNote {
     ) -> Result<JsonValue, ToolError> {
         let workspace = ctx.workspace().unwrap();
         let path = workspace
-            .root()
-            .join(workspace.agent_directory())
+            .chat_root()
+            .join(workspace.agent_relative_directory())
             .join("note.txt");
         fs::File::create_new(path).expect("a recovered run must never repeat this write");
         Ok(json!("written"))
@@ -59,8 +59,8 @@ impl Tool for ReadNote {
     ) -> Result<JsonValue, ToolError> {
         let workspace = ctx.workspace().unwrap();
         let path = workspace
-            .root()
-            .join(workspace.agent_directory())
+            .chat_root()
+            .join(workspace.agent_relative_directory())
             .join("note.txt");
         fs::read(path).unwrap();
         Ok(json!("read"))
@@ -85,7 +85,7 @@ fn write_note() -> ModelResponse {
         calls: vec![ToolCall::new(
             "write",
             "call_tool",
-            json!({"name": "notes.write", "arguments": {}}),
+            json!({"tool_name": "notes.write", "arguments": {}}),
         )],
     }
 }
@@ -96,7 +96,7 @@ fn read_note(id: &str) -> ModelResponse {
         calls: vec![ToolCall::new(
             id,
             "call_tool",
-            json!({"name": "notes.read", "arguments": {}}),
+            json!({"tool_name": "notes.read", "arguments": {}}),
         )],
     }
 }
@@ -105,11 +105,11 @@ struct BeforeRestart;
 
 #[async_trait]
 impl Provider for BeforeRestart {
-    async fn complete(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+    async fn complete_response(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
         unreachable!("the driver requests full model turns")
     }
 
-    async fn complete_turn(
+    async fn stream_turn(
         &self,
         req: ModelRequest<'_>,
         _: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
@@ -132,7 +132,7 @@ impl Provider for BeforeRestart {
             write_note()
         };
         let mut turn = ModelTurn::new(response, Some(TokenUsage::new(2, 1)));
-        turn.context = Some(json!("ctx"));
+        turn.replay_data = Some(json!("ctx"));
         Ok(turn)
     }
 }
@@ -141,7 +141,10 @@ struct AfterRestart;
 
 #[async_trait]
 impl Provider for AfterRestart {
-    async fn complete(&self, req: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+    async fn complete_response(
+        &self,
+        req: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
         assert_eq!(
             req.tools
                 .iter()
@@ -163,7 +166,7 @@ impl Provider for AfterRestart {
                 ]
             );
             assert_eq!(
-                req.assistant_context,
+                req.assistant_replay_data,
                 &[Some(json!("ctx")), Some(json!("ctx"))]
             );
             return Ok(read_note("after-restart"));
@@ -187,7 +190,7 @@ fn run_note(
             "Manage notes",
             &[&WriteNote, &ReadNote],
         )],
-        RunOptions::new(5).with_context_budget(budget),
+        RunOptions::new(5).with_context_byte_budget(budget),
     ))
 }
 
@@ -212,8 +215,8 @@ fn process_restart_restores_loaded_tools_after_compaction() {
     assert_eq!(status.code(), Some(73));
     let report = run_note(dir.path(), &AfterRestart, 2000).unwrap();
     assert_eq!(report.answer, "done");
-    assert_eq!(report.usage.reported, TokenUsage::new(8, 4));
-    assert_eq!(report.usage.unreported_turns, 2);
+    assert_eq!(report.usage.reported_tokens, TokenUsage::new(8, 4));
+    assert_eq!(report.usage.model_calls_without_usage, 2);
     assert_eq!(run_note(dir.path(), &NoCalls, 2000).unwrap(), report);
 
     let mut store = WorkspaceStore::open(dir.path()).unwrap();
@@ -232,7 +235,7 @@ fn process_restart_restores_loaded_tools_after_compaction() {
     assert_eq!(
         entries
             .iter()
-            .filter(|e| matches!(e.event, RunEvent::Compacted(_)))
+            .filter(|e| matches!(e.event, RunEvent::TranscriptCompacted(_)))
             .count(),
         1
     );
@@ -242,7 +245,7 @@ struct NoCalls;
 
 #[async_trait]
 impl Provider for NoCalls {
-    async fn complete(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+    async fn complete_response(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
         panic!("unexpected provider call during recovery")
     }
 }
@@ -251,7 +254,10 @@ struct LoadTwice;
 
 #[async_trait]
 impl Provider for LoadTwice {
-    async fn complete(&self, req: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+    async fn complete_response(
+        &self,
+        req: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
         match req.messages.len() {
             1 => Ok(load("first")),
             3 => Ok(load("again")),
@@ -289,7 +295,7 @@ fn failed_loader_commit_rolls_back_activation_and_can_be_retried() {
     let entries = journal.load_after(0).unwrap();
     assert!(matches!(
         entries.last().unwrap().event,
-        RunEvent::ToolCallStarted { .. }
+        RunEvent::ToolCallPrepared { .. }
     ));
     assert!(
         !entries
@@ -324,7 +330,12 @@ fn interrupted_application_tool_is_never_dispatched_again() {
     let mut store = WorkspaceStore::open(dir.path()).unwrap();
     let mut journal = store.open_journal("chat", "run").unwrap();
     let loader = load("first");
-    let call = write_note();
+    // Older journals recorded the dispatcher target under `name`.
+    let call = ModelResponse::ToolCall(ToolCall::new(
+        "write",
+        "call_tool",
+        json!({"name": "notes.write", "arguments": {}}),
+    ));
     journal
         .append(
             0,
@@ -332,10 +343,10 @@ fn interrupted_application_tool_is_never_dispatched_again() {
                 RunEvent::RunStarted(PROMPT.into()),
                 RunEvent::ModelCallRequested,
                 RunEvent::ModelCallCompleted(ModelTurn::new(loader.clone(), None)),
-                RunEvent::ToolCallStarted {
+                RunEvent::ToolCallPrepared {
                     call: loader.tool_calls()[0].clone(),
                     recovery: ToolRecovery::RetryAfterCrash,
-                    idempotency_key: "load-key".into(),
+                    tool_call_key: "load-key".into(),
                 },
                 RunEvent::SkillLoaded("notes".into()),
                 RunEvent::ToolCallCompleted(wakefold::ToolResult::new(
@@ -347,10 +358,10 @@ fn interrupted_application_tool_is_never_dispatched_again() {
                 )),
                 RunEvent::ModelCallRequested,
                 RunEvent::ModelCallCompleted(ModelTurn::new(call.clone(), None)),
-                RunEvent::ToolCallStarted {
+                RunEvent::ToolCallPrepared {
                     call: call.tool_calls()[0].clone(),
                     recovery: ToolRecovery::StopAfterCrash,
-                    idempotency_key: "write-key".into(),
+                    tool_call_key: "write-key".into(),
                 },
             ],
         )
@@ -372,7 +383,10 @@ fn concurrent_driver_is_excluded_until_the_owner_dies() {
     struct HoldAtModel<'a>(&'a Path);
     #[async_trait]
     impl Provider for HoldAtModel<'_> {
-        async fn complete(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+        async fn complete_response(
+            &self,
+            _: ModelRequest<'_>,
+        ) -> Result<ModelResponse, ProviderError> {
             fs::write(self.0.join("waiting"), b"").unwrap();
             // Bound the lifetime even if the parent test fails.
             std::thread::sleep(std::time::Duration::from_secs(15));
@@ -382,7 +396,10 @@ fn concurrent_driver_is_excluded_until_the_owner_dies() {
     struct Answer;
     #[async_trait]
     impl Provider for Answer {
-        async fn complete(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+        async fn complete_response(
+            &self,
+            _: ModelRequest<'_>,
+        ) -> Result<ModelResponse, ProviderError> {
             Ok(ModelResponse::Final("done".into()))
         }
     }

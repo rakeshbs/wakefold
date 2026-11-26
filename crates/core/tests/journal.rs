@@ -7,28 +7,36 @@ use wakefold::{
 };
 
 #[test]
-fn reopens_run_events_in_order_with_replay_context() {
+fn reopens_run_events_in_order_with_provider_replay_data() {
     let state = tempfile::tempdir().unwrap();
     let call = ToolCall::new("call-1", "lookup", json!({"id": 3}));
     let mut turn = ModelTurn::new(
         ModelResponse::ToolCall(call.clone()),
         Some(TokenUsage::new(4, 2)),
     );
-    turn.context = Some(json!({"opaque": ["provider data"]}));
+    turn.replay_data = Some(json!({"opaque": ["provider data"]}));
     let events = [
         RunEvent::RunStarted("hello".into()),
         RunEvent::ModelCallRequested,
         RunEvent::ModelCallCompleted(turn),
-        RunEvent::ToolCallStarted {
+        RunEvent::ToolCallPrepared {
             call,
             recovery: ToolRecovery::RetryAfterCrash,
-            idempotency_key: "saved-key".into(),
+            tool_call_key: "saved-key".into(),
         },
         RunEvent::ToolCallCompleted(ToolResult::new("call-1", json!(42))),
         RunEvent::ModelCallRequested,
         RunEvent::ModelCallCompleted(ModelTurn::new(ModelResponse::Final("42".into()), None)),
         RunEvent::RunFinished("42".into()),
     ];
+    let model_event = serde_json::to_value(&events[2]).unwrap();
+    assert_eq!(
+        model_event["data"]["context"],
+        json!({"opaque": ["provider data"]})
+    );
+    let prepared_event = serde_json::to_value(&events[3]).unwrap();
+    assert_eq!(prepared_event["kind"], "tool_call_started");
+    assert_eq!(prepared_event["data"]["idempotency_key"], "saved-key");
     {
         let mut store = WorkspaceStore::open(state.path()).unwrap();
         let mut journal = store.open_journal("chat", "run").unwrap();
@@ -133,9 +141,9 @@ fn existing_run_gains_an_empty_journal_without_changing_its_workspace() {
     let state = tempfile::tempdir().unwrap();
     let run = WorkspaceStore::open(state.path())
         .unwrap()
-        .open_run("chat", "old")
+        .open_run_workspace("chat", "old")
         .unwrap();
-    let file = run.root().join("note");
+    let file = run.chat_root().join("note");
     std::fs::write(&file, "existing data").unwrap();
     // Reproduce the schema before journal support, preserving its real run metadata.
     rusqlite::Connection::open(state.path().join("wakefold.sqlite3"))
@@ -144,7 +152,7 @@ fn existing_run_gains_an_empty_journal_without_changing_its_workspace() {
         .unwrap();
 
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    assert_eq!(store.open_run("chat", "old").unwrap(), run);
+    assert_eq!(store.open_run_workspace("chat", "old").unwrap(), run);
     let mut journal = store.open_journal("chat", "old").unwrap();
     assert!(journal.load_after(0).unwrap().is_empty());
     assert_eq!(

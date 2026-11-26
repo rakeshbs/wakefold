@@ -128,7 +128,7 @@ fn loader_tools() -> JsonValue {
     json!([
         {
             "type": "function", "name": "load_skill",
-            "description": "Load a skill by name to receive its tool definitions. Use call_tool with a returned tool name and arguments on subsequent turns. Available skills:\ncatalog: Look up prices",
+            "description": "Load a skill by name to receive its tool definitions. Use call_tool with a returned name as tool_name and the tool arguments on subsequent turns. Available skills:\ncatalog: Look up prices",
             "parameters": {
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
@@ -138,11 +138,11 @@ fn loader_tools() -> JsonValue {
         },
         {
             "type": "function", "name": "call_tool",
-            "description": "Execute a tool from a loaded skill. Supply its qualified name and arguments matching the schema returned by load_skill.",
+            "description": "Execute a tool from a loaded skill. Supply its qualified name as tool_name and arguments matching the schema returned by load_skill.",
             "parameters": {
                 "type": "object",
-                "properties": {"name": {"type": "string"}, "arguments": {}},
-                "required": ["name", "arguments"], "additionalProperties": false
+                "properties": {"tool_name": {"type": "string"}, "arguments": {}},
+                "required": ["tool_name", "arguments"], "additionalProperties": false
             },
             "strict": false
         }
@@ -214,7 +214,7 @@ fn call() -> JsonValue {
         "id": "fc_offline",
         "call_id": "call_notebook",
         "name": "call_tool",
-        "arguments": json!({"name": "catalog.lookup_price", "arguments": {"item": "notebook"}}).to_string(),
+        "arguments": json!({"tool_name": "catalog.lookup_price", "arguments": {"item": "notebook"}}).to_string(),
         "status": "completed"
     })
 }
@@ -287,8 +287,8 @@ async fn streams_function_calls_and_replays_reasoning_at_every_effort() -> Resul
         assert_eq!(*tool.0.lock().unwrap(), ["notebook"]);
         assert_eq!(chunks, ["A notebook ", "costs $3.50."]);
         assert_eq!(report.answer, "A notebook costs $3.50.");
-        assert_eq!(report.usage.reported, TokenUsage::new(60, 18));
-        assert_eq!(report.usage.unreported_turns, 0);
+        assert_eq!(report.usage.reported_tokens, TokenUsage::new(60, 18));
+        assert_eq!(report.usage.model_calls_without_usage, 0);
     }
 
     Ok(())
@@ -354,7 +354,7 @@ async fn uses_model_defaults_for_text_only_requests() -> Result<(), ProviderErro
     )?;
 
     let turn = provider
-        .complete_turn(
+        .stream_turn(
             ModelRequest::new(&[Message::User(String::from("Hello"))], &[]),
             &mut |_| {},
         )
@@ -428,7 +428,7 @@ async fn retries_a_rate_limited_follow_up_without_replaying_the_tool() -> Result
     assert_eq!(report.answer, "$3.50");
     assert_eq!(streamed, "$3.50");
     assert_eq!(*tool.0.lock().unwrap(), ["notebook"]);
-    assert_eq!(report.usage.reported, TokenUsage::new(60, 18));
+    assert_eq!(report.usage.reported_tokens, TokenUsage::new(60, 18));
     assert!(responses.lock().unwrap().is_empty());
     Ok(())
 }

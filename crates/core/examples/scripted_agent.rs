@@ -65,7 +65,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
         calls: vec![ToolCall::new(
             "price-1",
             "call_tool",
-            json!({"name": "pricing.lookup_price", "arguments": {"item": "notebook"}}),
+            json!({"tool_name": "pricing.lookup_price", "arguments": {"item": "notebook"}}),
         )],
     };
     let calculate = ModelResponse::ToolCalls {
@@ -77,7 +77,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
         calls: vec![ToolCall::new(
             "total-1",
             "call_tool",
-            json!({"name": "pricing.calculate_total", "arguments": {"unit_price_cents": 350, "quantity": 3}}),
+            json!({"tool_name": "pricing.calculate_total", "arguments": {"unit_price_cents": 350, "quantity": 3}}),
         )],
     };
 
@@ -87,7 +87,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
         json!({"name": "pricing"}),
     ));
     let load_turn = ScriptedTurn::new(vec![user.clone()], load.clone())
-        .with_tools(&["load_skill", "call_tool"]);
+        .expect_tool_names(&["load_skill", "call_tool"]);
     let loaded_tools = ["load_skill", "call_tool"];
     let mut earlier = vec![
         user.clone(),
@@ -95,14 +95,15 @@ fn notebook_total() -> Result<RunReport, RunError> {
         Message::Tool(ToolResult::new("load-1", loaded)),
     ];
     let pinned = earlier[1..].to_vec();
-    let lookup_turn = ScriptedTurn::new(earlier.clone(), lookup.clone()).with_tools(&loaded_tools);
+    let lookup_turn =
+        ScriptedTurn::new(earlier.clone(), lookup.clone()).expect_tool_names(&loaded_tools);
     earlier.push(Message::Assistant(lookup));
     earlier.push(Message::Tool(ToolResult::new(
         "price-1",
         json!({"price_cents": 350}),
     )));
     let calculate_turn =
-        ScriptedTurn::new(earlier.clone(), calculate.clone()).with_tools(&loaded_tools);
+        ScriptedTurn::new(earlier.clone(), calculate.clone()).expect_tool_names(&loaded_tools);
 
     // The calculator exchange pushes the next request over budget. The model
     // summarizes the earlier lookup and keeps the calculator exchange intact.
@@ -110,7 +111,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
     summary_request.push(Message::User(String::from(concat!(
         "Summarize the earlier work for continuing the original task. ",
         "Preserve relevant tool facts, decisions, and next steps. ",
-        "Return only the summary, up to 98 UTF-8 bytes."
+        "Return only the summary, up to 93 UTF-8 bytes."
     ))));
     let summary = String::from("Catalog lookup confirmed 350 cents per notebook.");
     let summary_turn = ScriptedTurn::new(summary_request, ModelResponse::Final(summary.clone()))
@@ -126,7 +127,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
         final_messages,
         ModelResponse::Final(String::from("Three notebooks cost $10.50.")),
     )
-    .with_tools(&loaded_tools);
+    .expect_tool_names(&loaded_tools);
 
     let provider = ScriptedProvider::new([
         load_turn,
@@ -135,7 +136,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
         summary_turn,
         final_turn,
     ]);
-    let options = RunOptions::new(4).with_context_budget(1260);
+    let options = RunOptions::new(4).with_context_byte_budget(1260);
     block_on(run_with_options(
         prompt,
         &provider,
@@ -163,7 +164,7 @@ mod tests {
     fn calculates_the_total_after_compacting_context() -> Result<(), RunError> {
         let report = notebook_total()?;
         assert_eq!(report.answer, "Three notebooks cost $10.50.");
-        assert_eq!(report.usage.reported, TokenUsage::new(80, 12));
+        assert_eq!(report.usage.reported_tokens, TokenUsage::new(80, 12));
         Ok(())
     }
 }

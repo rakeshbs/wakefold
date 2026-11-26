@@ -51,11 +51,14 @@ struct LiveProvider {
 
 #[async_trait]
 impl Provider for LiveProvider {
-    async fn complete(&self, req: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
-        Ok(self.complete_turn(req, &mut |_| {}).await?.response)
+    async fn complete_response(
+        &self,
+        req: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        Ok(self.stream_turn(req, &mut |_| {}).await?.response)
     }
 
-    async fn complete_turn(
+    async fn stream_turn(
         &self,
         req: ModelRequest<'_>,
         on_text: &mut (dyn for<'a> FnMut(&'a str) + Send),
@@ -63,7 +66,7 @@ impl Provider for LiveProvider {
         if self.stop_after_activation && req.messages.iter().any(|message| matches!(message, Message::Tool(result) if result.value["loaded"] == "orders")) {
             std::process::exit(73);
         }
-        self.inner.complete_turn(req, on_text).await
+        self.inner.stream_turn(req, on_text).await
     }
 }
 
@@ -99,7 +102,7 @@ async fn drive(state: &Path, stop_after_activation: bool) -> Result<String, Box<
             .count(),
         1
     );
-    assert_eq!(entries.iter().filter(|entry| matches!(&entry.event, RunEvent::ToolCallStarted { call, .. } if call.name == "call_tool" && call.arguments["name"] == "orders.lookup")).count(), 1);
+    assert_eq!(entries.iter().filter(|entry| matches!(&entry.event, RunEvent::ToolCallPrepared { call, .. } if call.name == "call_tool" && call.arguments["tool_name"] == "orders.lookup")).count(), 1);
     Ok(report.answer)
 }
 
@@ -197,11 +200,14 @@ struct CompactionProvider {
 
 #[async_trait]
 impl Provider for CompactionProvider {
-    async fn complete(&self, req: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
-        Ok(self.complete_turn(req, &mut |_| {}).await?.response)
+    async fn complete_response(
+        &self,
+        req: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        Ok(self.stream_turn(req, &mut |_| {}).await?.response)
     }
 
-    async fn complete_turn(
+    async fn stream_turn(
         &self,
         req: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
@@ -221,11 +227,11 @@ impl Provider for CompactionProvider {
                         checkpoint["state"]["messages"]
                     );
                     assert_eq!(
-                        serde_json::to_value(req.assistant_context).unwrap(),
+                        serde_json::to_value(req.assistant_replay_data).unwrap(),
                         checkpoint["state"]["assistant_context"]
                     );
                     eprintln!(
-                        "Resumed model request exactly matches the saved compacted transcript and provider context."
+                        "Resumed model request exactly matches the saved compacted transcript and provider replay data."
                     );
                 }
             } else if req
@@ -237,7 +243,7 @@ impl Provider for CompactionProvider {
                 std::process::exit(74);
             }
         }
-        self.inner.complete_turn(req, on_text).await
+        self.inner.stream_turn(req, on_text).await
     }
 }
 
@@ -287,7 +293,7 @@ async fn drive_compaction(
             &provider,
             &skills,
             RunOptions::new(10)
-                .with_context_budget(22_000)
+                .with_context_byte_budget(22_000)
                 .with_token_budget(50_000)
                 .with_retry_policy(RetryPolicy::new(0, Duration::ZERO)),
         ),
@@ -335,9 +341,9 @@ async fn live_compaction_preserves_skills_across_restart() -> Result<(), Box<dyn
         let entries = journal.load_after(0)?;
         let compacted = entries
             .iter()
-            .find(|entry| matches!(entry.event, RunEvent::Compacted(_)))
+            .find(|entry| matches!(entry.event, RunEvent::TranscriptCompacted(_)))
             .expect("a real compaction must have committed");
-        let RunEvent::Compacted(checkpoint) = &compacted.event else {
+        let RunEvent::TranscriptCompacted(checkpoint) = &compacted.event else {
             unreachable!()
         };
         let definitions = entries
@@ -407,7 +413,7 @@ async fn live_compaction_preserves_skills_across_restart() -> Result<(), Box<dyn
         ("verification.receipt", false),
     ] {
         let calls: Vec<_> = entries.iter().filter(|entry| matches!(&entry.event,
-            RunEvent::ToolCallStarted { call, .. } if call.name == "call_tool" && call.arguments["name"] == name)).collect();
+            RunEvent::ToolCallPrepared { call, .. } if call.name == "call_tool" && call.arguments["tool_name"] == name)).collect();
         assert_eq!(calls.len(), 1, "{name} must execute exactly once");
         assert_eq!(
             calls[0].sequence < checkpoint_sequence,

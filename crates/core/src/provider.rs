@@ -106,7 +106,8 @@ pub struct ModelTurn {
     /// Usage when reported by the provider.
     pub usage: Option<TokenUsage>,
     /// Provider-specific data to replay alongside this assistant turn.
-    pub context: Option<JsonValue>,
+    #[serde(rename = "context")]
+    pub replay_data: Option<JsonValue>,
 }
 
 impl ModelTurn {
@@ -115,7 +116,7 @@ impl ModelTurn {
         Self {
             response,
             usage,
-            context: None,
+            replay_data: None,
         }
     }
 }
@@ -128,11 +129,11 @@ pub struct ModelRequest<'a> {
     pub messages: &'a [Message],
     /// Tool schemas advertised for this turn. Agent runs expose `load_skill` and `call_tool`.
     pub tools: &'a [ToolSpec],
-    /// Provider context for each [`Message::Assistant`], in chronological order.
+    /// Provider replay data for each [`Message::Assistant`], in chronological order.
     ///
-    /// When context is unavailable, an entry can be `None` or the slice can be
-    /// empty. The agent passes back the context from each completed model turn.
-    pub assistant_context: &'a [Option<JsonValue>],
+    /// Entries may be `None` when the provider returned no replay data. An
+    /// empty slice means replay data is unavailable for the entire transcript.
+    pub assistant_replay_data: &'a [Option<JsonValue>],
 }
 
 impl<'a> ModelRequest<'a> {
@@ -141,7 +142,7 @@ impl<'a> ModelRequest<'a> {
         Self {
             messages,
             tools,
-            assistant_context: &[],
+            assistant_replay_data: &[],
         }
     }
 }
@@ -149,14 +150,17 @@ impl<'a> ModelRequest<'a> {
 /// Supplies model turns to the agent loop.
 #[async_trait]
 pub trait Provider: Send + Sync {
-    /// Produce the next model turn for this transcript.
+    /// Return the next model response for this transcript.
     ///
     /// # Errors
     ///
     /// Returns a [`ProviderError`] if the provider cannot produce a turn.
-    async fn complete(&self, request: ModelRequest<'_>) -> Result<ModelResponse, ProviderError>;
+    async fn complete_response(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError>;
 
-    /// Produce a model turn and report text as it arrives.
+    /// Return a model response and report text as it arrives.
     ///
     /// The default implementation emits the text in one chunk after the model
     /// finishes. A streaming provider can emit multiple chunks before returning
@@ -165,30 +169,30 @@ pub trait Provider: Send + Sync {
     /// # Errors
     ///
     /// Returns a [`ProviderError`] if the provider cannot complete the turn.
-    async fn complete_streaming(
+    async fn stream_response(
         &self,
         request: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelResponse, ProviderError> {
-        let response = self.complete(request).await?;
+        let response = self.complete_response(request).await?;
         response.emit_text(on_text);
         Ok(response)
     }
 
-    /// Produce a completed turn with streamed text, usage, and provider context.
+    /// Return a completed turn with streamed text, usage, and replay data.
     ///
-    /// The default delegates to [`Provider::complete_streaming`] without usage
-    /// or provider context.
+    /// The default delegates to [`Provider::stream_response`] and returns
+    /// `None` for usage and replay data.
     ///
     /// # Errors
     ///
     /// Returns a [`ProviderError`] if the provider cannot complete the turn.
-    async fn complete_turn(
+    async fn stream_turn(
         &self,
         request: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelTurn, ProviderError> {
-        let response = self.complete_streaming(request, on_text).await?;
+        let response = self.stream_response(request, on_text).await?;
         Ok(ModelTurn::new(response, None))
     }
 }
@@ -204,13 +208,17 @@ pub struct ProviderError {
 }
 
 impl ProviderError {
-    /// Mark a failure as safe to retry before the model begins streaming.
-    ///
-    /// Supply the minimum delay requested by the provider when available.
-    /// Without a delay, the agent uses its backoff policy.
+    /// Mark a failure as safe to retry using the agent's backoff policy.
     #[must_use]
-    pub fn with_retry(mut self, retry_after: Option<Duration>) -> Self {
-        self.retry = retry_after.map_or(RetryAdvice::Backoff, RetryAdvice::After);
+    pub fn retry_with_backoff(mut self) -> Self {
+        self.retry = RetryAdvice::Backoff;
+        self
+    }
+
+    /// Mark a failure as safe to retry after the provider's minimum delay.
+    #[must_use]
+    pub fn retry_after(mut self, delay: Duration) -> Self {
+        self.retry = RetryAdvice::After(delay);
         self
     }
 

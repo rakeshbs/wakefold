@@ -58,9 +58,9 @@ fn returns_the_tool_result_and_accumulates_usage_across_turns() -> Result<(), Ru
         options,
     ))?;
     assert_eq!(report.answer, "The value is 42.");
-    assert_eq!(report.usage.reported, TokenUsage::new(73, 27));
-    assert_eq!(report.usage.reported.total_tokens(), 100);
-    assert_eq!(report.usage.unreported_turns, 0);
+    assert_eq!(report.usage.reported_tokens, TokenUsage::new(73, 27));
+    assert_eq!(report.usage.reported_tokens.total_tokens(), 100);
+    assert_eq!(report.usage.model_calls_without_usage, 0);
     assert_eq!(tool.calls.load(Ordering::Relaxed), 1);
     Ok(())
 }
@@ -185,7 +185,7 @@ fn stops_before_a_tool_or_follow_up_when_usage_reaches_the_budget() {
 
         assert!(
             matches!(&result, Err(RunError::TokenBudgetReached { limit: reached, usage })
-                if *reached == limit && usage.reported == TokenUsage::new(92, 8) && usage.unreported_turns == 0),
+                if *reached == limit && usage.reported_tokens == TokenUsage::new(92, 8) && usage.model_calls_without_usage == 0),
             "{result:?}"
         );
         assert_eq!(tool.calls.load(Ordering::Relaxed), 0);
@@ -201,7 +201,7 @@ fn zero_budget_stops_before_the_first_model_call() {
 
     assert!(
         matches!(&result, Err(RunError::TokenBudgetReached { limit: 0, usage })
-            if usage.reported.total_tokens() == 0 && usage.unreported_turns == 0),
+            if usage.reported_tokens.total_tokens() == 0 && usage.model_calls_without_usage == 0),
         "{result:?}"
     );
 }
@@ -229,7 +229,7 @@ fn budgeted_run_stops_when_a_tool_turn_has_no_usage_report() {
 
     assert!(
         matches!(&result, Err(RunError::TokenUsageUnavailable { usage })
-            if usage.reported.total_tokens() == 0 && usage.unreported_turns == 1),
+            if usage.reported_tokens.total_tokens() == 0 && usage.model_calls_without_usage == 1),
         "{result:?}"
     );
     assert_eq!(tool.calls.load(Ordering::Relaxed), 0);
@@ -261,8 +261,8 @@ fn reported_zero_allows_continuation_and_missing_final_usage_is_counted() -> Res
     ))?;
 
     assert_eq!(report.answer, "Done.");
-    assert_eq!(report.usage.reported, TokenUsage::default());
-    assert_eq!(report.usage.unreported_turns, 1);
+    assert_eq!(report.usage.reported_tokens, TokenUsage::default());
+    assert_eq!(report.usage.model_calls_without_usage, 1);
     assert_eq!(tool.calls.load(Ordering::Relaxed), 1);
     Ok(())
 }
@@ -274,14 +274,14 @@ fn rejects_an_oversized_prompt_before_calling_the_provider() {
         "café",
         &provider,
         &[],
-        RunOptions::new(1).with_context_budget(4),
+        RunOptions::new(1).with_context_byte_budget(4),
     ));
 
     assert!(matches!(
         result,
         Err(RunError::ContextBudgetExceeded {
-            limit: 4,
-            required: 5,
+            limit_bytes: 4,
+            required_bytes: 5,
         })
     ));
 }
@@ -309,7 +309,7 @@ fn compacted_tool_call_ids_still_reject_duplicates() {
     summary_input.push(Message::User(String::from(concat!(
         "Summarize the earlier work for continuing the original task. ",
         "Preserve relevant tool facts, decisions, and next steps. ",
-        "Return only the summary, up to 64 UTF-8 bytes."
+        "Return only the summary, up to 59 UTF-8 bytes."
     ))));
     let summary = String::from("First echo returned 42.");
     let mut compacted = vec![user];
@@ -332,7 +332,7 @@ fn compacted_tool_call_ids_still_reject_duplicates() {
         prompt,
         &provider,
         &[Skill::new("util", "Utility tools", &[&tool])],
-        RunOptions::new(5).with_context_budget(902),
+        RunOptions::new(5).with_context_byte_budget(902),
     ));
 
     assert!(
@@ -343,7 +343,7 @@ fn compacted_tool_call_ids_still_reject_duplicates() {
 }
 
 #[test]
-fn loading_twice_exposes_only_one_copy_and_leaves_other_skills_unloaded() -> Result<(), RunError> {
+fn loading_twice_returns_the_same_definitions() -> Result<(), RunError> {
     let user = Message::User("Use the echo skill".into());
     let (load, mut messages) = common::load_skill(&user, "first", &[Echo::default().spec()]);
     let loaded_tools = ["load_skill", "call_tool"];
@@ -352,15 +352,16 @@ fn loading_twice_exposes_only_one_copy_and_leaves_other_skills_unloaded() -> Res
         "load_skill",
         json!({"name": "first"}),
     ));
-    let repeat = ScriptedTurn::new(messages.clone(), again.clone()).with_tools(&loaded_tools);
+    let repeat =
+        ScriptedTurn::new(messages.clone(), again.clone()).expect_tool_names(&loaded_tools);
     messages.push(Message::Assistant(again));
     messages.push(Message::Tool(ToolResult::new(
         "again",
         common::definitions("first", &[Echo::default().spec()]),
     )));
-    let done =
-        ScriptedTurn::new(messages, ModelResponse::Final("done".into())).with_tools(&loaded_tools);
-    let provider = ScriptedProvider::new([load.with_tools(&loaded_tools), repeat, done]);
+    let done = ScriptedTurn::new(messages, ModelResponse::Final("done".into()))
+        .expect_tool_names(&loaded_tools);
+    let provider = ScriptedProvider::new([load.expect_tool_names(&loaded_tools), repeat, done]);
     let first = Echo::default();
     let second = Echo::default();
     let answer = block_on(run(
@@ -421,18 +422,24 @@ fn loader_rejects_unknown_skills_and_invalid_arguments() {
 fn rejects_malformed_and_unregistered_tool_calls_before_execution() {
     for (name, arguments) in [
         ("call_tool", json!({})),
-        ("call_tool", json!({"name": "util.echo"})),
-        ("call_tool", json!({"name": 1, "arguments": {}})),
+        ("call_tool", json!({"tool_name": "util.echo"})),
+        ("call_tool", json!({"tool_name": 1, "arguments": {}})),
         (
             "call_tool",
-            json!({"name": "util.echo", "arguments": {}, "extra": true}),
+            json!({"tool_name": "util.echo", "arguments": {}, "extra": true}),
         ),
-        ("call_tool", json!({"name": "other.echo", "arguments": {}})),
         (
             "call_tool",
-            json!({"name": "load_skill", "arguments": {"name": "util"}}),
+            json!({"tool_name": "other.echo", "arguments": {}}),
         ),
-        ("call_tool", json!({"name": "call_tool", "arguments": {}})),
+        (
+            "call_tool",
+            json!({"tool_name": "load_skill", "arguments": {"name": "util"}}),
+        ),
+        (
+            "call_tool",
+            json!({"tool_name": "call_tool", "arguments": {}}),
+        ),
         ("util.echo", json!({})),
         ("skills.load", json!({"name": "util"})),
     ] {

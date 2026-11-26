@@ -46,7 +46,7 @@ fn prepares_a_bounded_summary_request_and_preserves_the_recent_exchange() -> Res
         matches!(request.messages.last(), Some(Message::User(instruction)) if instruction.contains("Preserve relevant tool facts"))
     );
     assert!(request.tools.is_empty());
-    assert!(request.assistant_context.is_empty());
+    assert!(request.assistant_replay_data.is_empty());
     assert!(request.messages.iter().map(message_bytes).sum::<u128>() <= 400);
 
     let summary = String::from("The first notebook costs 350 cents.");
@@ -97,7 +97,10 @@ fn rejects_an_oversized_summary_before_replacing_history() -> Result<(), RunErro
     );
     assert!(matches!(
         result,
-        Err(RunError::ContextBudgetExceeded { limit: 400, .. })
+        Err(RunError::ContextBudgetExceeded {
+            limit_bytes: 400,
+            ..
+        })
     ));
     assert_eq!(messages, original);
     assert_eq!(context, [None, None]);
@@ -113,7 +116,7 @@ fn an_oversized_current_exchange_cannot_be_compacted() {
 
     assert!(matches!(
         ContextSizes::default().prepare(&messages, &context, 100),
-        Err(RunError::ContextBudgetExceeded { limit: 100, required }) if required > 500
+        Err(RunError::ContextBudgetExceeded { limit_bytes: 100, required_bytes }) if required_bytes > 500
     ));
 }
 
@@ -142,7 +145,7 @@ fn repeated_compaction_preserves_loaded_schemas_and_mixed_call_turns() -> Result
                 ToolCall::new(
                     "write",
                     "call_tool",
-                    json!({"name": "notes.write", "arguments": {"text": "saved"}}),
+                    json!({"tool_name": "notes.write", "arguments": {"text": "saved"}}),
                 ),
             ],
         }),

@@ -21,14 +21,14 @@ pub enum WorkspaceError {
 /// Native paths available to trusted host tools for one agent run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunWorkspace {
-    root: PathBuf,
+    chat_root: PathBuf,
     agent_id: i64,
 }
 
 impl RunWorkspace {
     /// The shared chat directory against which artifact paths are resolved.
-    pub fn root(&self) -> &Path {
-        &self.root
+    pub fn chat_root(&self) -> &Path {
+        &self.chat_root
     }
 
     /// The stable ID assigned to this run's agent by the store.
@@ -37,7 +37,7 @@ impl RunWorkspace {
     }
 
     /// The agent's directory relative to the chat root.
-    pub fn agent_directory(&self) -> PathBuf {
+    pub fn agent_relative_directory(&self) -> PathBuf {
         Path::new("agents").join(self.agent_id.to_string())
     }
 }
@@ -105,14 +105,14 @@ impl WorkspaceStore {
         chat_key: &str,
         run_key: &str,
     ) -> Result<crate::RunJournal<'_>, WorkspaceError> {
-        let run = self.open_run(chat_key, run_key)?;
+        let run = self.open_run_workspace(chat_key, run_key)?;
         let locks = self.state.join("run-locks");
         fs::create_dir_all(&locks)?;
         let lock_path = locks.join(run.agent_id().to_string());
         Ok(crate::RunJournal::new(&mut self.connection, run, lock_path))
     }
 
-    /// Open a new or existing run using the caller's stable chat and run keys.
+    /// Open or create a run's workspace using stable chat and run keys.
     ///
     /// A new run receives its own agent directory. Reusing both keys restores
     /// the same directories. Only database-generated IDs appear in host paths.
@@ -121,7 +121,7 @@ impl WorkspaceStore {
     ///
     /// Returns an error if the mapping or directories cannot be opened.
     /// Retrying with the same keys is safe after a partial failure.
-    pub fn open_run(
+    pub fn open_run_workspace(
         &mut self,
         chat_key: &str,
         run_key: &str,
@@ -153,10 +153,14 @@ impl WorkspaceStore {
         // initialization can then finish without reassigning the directory.
         tx.commit()?;
         let workspace = RunWorkspace {
-            root: self.state.join("workspaces").join(workspace_id.to_string()),
+            chat_root: self.state.join("workspaces").join(workspace_id.to_string()),
             agent_id,
         };
-        fs::create_dir_all(workspace.root.join(workspace.agent_directory()))?;
+        fs::create_dir_all(
+            workspace
+                .chat_root
+                .join(workspace.agent_relative_directory()),
+        )?;
         Ok(workspace)
     }
 }

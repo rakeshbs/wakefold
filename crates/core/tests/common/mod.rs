@@ -28,10 +28,10 @@ pub fn definitions(name: &str, tools: &[ToolSpec]) -> JsonValue {
     json!({"loaded": name, "tools": tools})
 }
 
-pub fn call_tool(id: &str, name: &str, arguments: JsonValue) -> ToolCall {
+pub fn call_tool(id: &str, tool_name: &str, arguments: JsonValue) -> ToolCall {
     ToolCall::new(
         id,
         "call_tool",
-        json!({"name": name, "arguments": arguments}),
+        json!({"tool_name": tool_name, "arguments": arguments}),
     )
 }

@@ -78,7 +78,7 @@ impl Tool for Operation<'_> {
         arguments: &JsonValue,
     ) -> Result<JsonValue, ToolError> {
         let key = context
-            .idempotency_key()
+            .tool_call_key()
             .expect("agent calls must have an idempotency key");
         append_line(self.root.join(format!("{}-attempts", self.name)), key);
         let result = match self.name {
@@ -89,7 +89,7 @@ impl Tool for Operation<'_> {
                 service
                     .execute_batch(
                         "CREATE TABLE IF NOT EXISTS reservations (
-                    id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+                    id INTEGER PRIMARY KEY, tool_call_key TEXT NOT NULL UNIQUE,
                     arguments TEXT NOT NULL)",
                     )
                     .unwrap();
@@ -97,14 +97,14 @@ impl Tool for Operation<'_> {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .unwrap();
                 tx.execute(
-                    "INSERT INTO reservations(idempotency_key, arguments)
-                    VALUES (?1, ?2) ON CONFLICT(idempotency_key) DO NOTHING",
+                    "INSERT INTO reservations(tool_call_key, arguments)
+                    VALUES (?1, ?2) ON CONFLICT(tool_call_key) DO NOTHING",
                     params![key, arguments.to_string()],
                 )
                 .unwrap();
                 let (id, original): (i64, String) = tx
                     .query_row(
-                        "SELECT id, arguments FROM reservations WHERE idempotency_key = ?1",
+                        "SELECT id, arguments FROM reservations WHERE tool_call_key = ?1",
                         [key],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
@@ -145,11 +145,11 @@ struct ReservationInput {
 
 #[async_trait]
 impl Provider for Workflow<'_> {
-    async fn complete(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+    async fn complete_response(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
         unreachable!("the driver requests complete turns")
     }
 
-    async fn complete_turn(
+    async fn stream_turn(
         &self,
         request: ModelRequest<'_>,
         _: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
@@ -168,7 +168,7 @@ impl Provider for Workflow<'_> {
             Message::Tool(result) if result.value["loaded"] == "workflow" => ModelResponse::ToolCalls {
                 text: None,
                 calls: ["read", "reserve", "notify"].into_iter().map(|name| ToolCall::new(
-                    name, "call_tool", json!({"name": format!("workflow.{name}"), "arguments": {"quantity": 1}}))).collect(),
+                    name, "call_tool", json!({"tool_name": format!("workflow.{name}"), "arguments": {"quantity": 1}}))).collect(),
             },
             Message::Tool(result) if result.value == "sent" => ModelResponse::Final("reserved and notified".into()),
             other => panic!("unexpected model boundary {other:?}"),
@@ -177,7 +177,7 @@ impl Provider for Workflow<'_> {
             pause_at("model-response");
         }
         let mut turn = ModelTurn::new(response, Some(TokenUsage::new(1, 1)));
-        turn.context = Some(json!({"saved": request.messages.len()}));
+        turn.replay_data = Some(json!({"saved": request.messages.len()}));
         Ok(turn)
     }
 }
@@ -303,7 +303,7 @@ fn process_crashes_at_every_durable_boundary() {
         kill_at(root.path(), &point);
         let before = events(root.path());
         let notification_attempts = lines(root.path(), "notify-attempts");
-        let interrupted_notification = matches!(before.last(), Some(RunEvent::ToolCallStarted { call, .. }) if call.id == "notify".into());
+        let interrupted_notification = matches!(before.last(), Some(RunEvent::ToolCallPrepared { call, .. }) if call.id == "notify".into());
         let result = run_workflow(root.path(), POLICIES, None);
         if interrupted_notification {
             assert!(
@@ -318,7 +318,11 @@ fn process_crashes_at_every_durable_boundary() {
         } else {
             let report = result.unwrap_or_else(|error| panic!("{point}: {error}"));
             assert_eq!(report.answer, "reserved and notified", "{point}");
-            assert_eq!(report.usage.reported, TokenUsage::new(3, 3), "{point}");
+            assert_eq!(
+                report.usage.reported_tokens,
+                TokenUsage::new(3, 3),
+                "{point}"
+            );
             assert_eq!(
                 lines(root.path(), "model-calls").len(),
                 if point == "model-response" { 4 } else { 3 },
@@ -337,11 +341,11 @@ fn process_crashes_at_every_durable_boundary() {
         let starts: Vec<_> = saved
             .iter()
             .filter_map(|event| match event {
-                RunEvent::ToolCallStarted {
+                RunEvent::ToolCallPrepared {
                     call,
-                    idempotency_key,
+                    tool_call_key,
                     ..
-                } => Some((call.id.to_string(), idempotency_key.as_str())),
+                } => Some((call.id.to_string(), tool_call_key.as_str())),
                 _ => None,
             })
             .collect();
@@ -382,7 +386,7 @@ fn recovery_requires_the_original_and_current_policies_to_allow_repetition() {
         ("read", ToolRecovery::StopAfterCrash),
         ("notify", ToolRecovery::RetryAfterCrash),
     ] {
-        let end = history.iter().position(|event| matches!(event, RunEvent::ToolCallStarted { call, .. } if call.id == name.into())).unwrap();
+        let end = history.iter().position(|event| matches!(event, RunEvent::ToolCallPrepared { call, .. } if call.id == name.into())).unwrap();
         let root = tempfile::tempdir().unwrap();
         let mut store = WorkspaceStore::open(root.path()).unwrap();
         store
@@ -424,5 +428,5 @@ fn tool_specs_default_to_stop_after_crash_and_round_trip_recovery() {
             serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
         assert_eq!(restored, spec);
     }
-    assert_eq!(ToolContext::default().idempotency_key(), None);
+    assert_eq!(ToolContext::default().tool_call_key(), None);
 }

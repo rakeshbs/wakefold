@@ -55,7 +55,7 @@ where
 /// Register a typed asynchronous handler that also receives the run context.
 ///
 /// Use [`ToolContext::cancellation_token`] to observe the caller's signal.
-/// Use [`ToolContext::idempotency_key`] to prevent duplicate changes when opting
+/// Use [`ToolContext::tool_call_key`] to prevent duplicate changes when opting
 /// into [`ToolRecovery::RetryAfterCrash`].
 pub fn typed_tool_with_context<Input, Handler, Output>(handler: Handler) -> impl Tool
 where

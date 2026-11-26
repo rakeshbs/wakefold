@@ -83,8 +83,10 @@ async fn classify_response(response: Response) -> Result<Response, ProviderError
     );
     Err(if requires_action {
         error
+    } else if let Some(delay) = retry_after {
+        error.retry_after(delay)
     } else {
-        error.with_retry(retry_after)
+        error.retry_with_backoff()
     })
 }
 
@@ -105,7 +107,7 @@ pub(super) fn opening_error(source: OpenAIError) -> ProviderError {
             Err(source) => ProviderError::with_source(MESSAGE, OpenAIError::Boxed(source)),
         },
         OpenAIError::Reqwest(ref error) if error.is_connect() => {
-            ProviderError::with_source(MESSAGE, source).with_retry(None)
+            ProviderError::with_source(MESSAGE, source).retry_with_backoff()
         }
         source => ProviderError::with_source(MESSAGE, source),
     }

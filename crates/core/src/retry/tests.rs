@@ -29,7 +29,7 @@ impl Script {
         cancellation: Option<&CancellationToken>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelTurn, RunError> {
-        complete_turn_with_clock(
+        stream_turn_with_clock(
             self,
             ModelRequest::new(&[Message::User(String::from("Hello"))], &[]),
             on_text,
@@ -44,11 +44,14 @@ impl Script {
 
 #[async_trait]
 impl Provider for Script {
-    async fn complete(&self, request: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
-        self.complete_streaming(request, &mut |_| {}).await
+    async fn complete_response(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        self.stream_response(request, &mut |_| {}).await
     }
 
-    async fn complete_streaming(
+    async fn stream_response(
         &self,
         request: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
@@ -84,8 +87,8 @@ fn final_answer() -> Attempt {
 #[tokio::test(start_paused = true)]
 async fn waits_for_server_delay_then_backs_off_when_no_delay_is_supplied() -> Result<(), RunError> {
     let provider = Script::new([
-        refusal(ProviderError::new("busy").with_retry(Some(Duration::from_secs(4)))),
-        refusal(ProviderError::new("busy").with_retry(None)),
+        refusal(ProviderError::new("busy").retry_after(Duration::from_secs(4))),
+        refusal(ProviderError::new("busy").retry_with_backoff()),
         final_answer(),
     ]);
     let start = TestInstant::now();
@@ -106,8 +109,8 @@ async fn waits_for_server_delay_then_backs_off_when_no_delay_is_supplied() -> Re
 #[tokio::test(start_paused = true)]
 async fn stops_when_attempts_run_out_or_the_server_delay_exceeds_the_window() {
     let provider = Script::new([
-        refusal(ProviderError::new("first error").with_retry(Some(Duration::ZERO))),
-        refusal(ProviderError::new("last error").with_retry(Some(Duration::ZERO))),
+        refusal(ProviderError::new("first error").retry_after(Duration::ZERO)),
+        refusal(ProviderError::new("last error").retry_after(Duration::ZERO)),
         final_answer(),
     ]);
     let error = provider
@@ -122,7 +125,7 @@ async fn stops_when_attempts_run_out_or_the_server_delay_exceeds_the_window() {
     assert_eq!(provider.remaining(), 1);
 
     let provider = Script::new([
-        refusal(ProviderError::new("try later").with_retry(Some(Duration::from_secs(10)))),
+        refusal(ProviderError::new("try later").retry_after(Duration::from_secs(10))),
         final_answer(),
     ]);
     let start = TestInstant::now();
@@ -141,7 +144,7 @@ async fn stops_when_attempts_run_out_or_the_server_delay_exceeds_the_window() {
 
 #[tokio::test(start_paused = true)]
 async fn permanent_and_partial_stream_errors_surface_immediately() {
-    let mut streamed = refusal(ProviderError::new("disconnected").with_retry(Some(Duration::ZERO)));
+    let mut streamed = refusal(ProviderError::new("disconnected").retry_after(Duration::ZERO));
     streamed.text = Some("partial answer");
     for (attempt, expected_text) in [
         (refusal(ProviderError::new("invalid request")), ""),
@@ -163,7 +166,7 @@ async fn permanent_and_partial_stream_errors_surface_immediately() {
 #[tokio::test(start_paused = true)]
 async fn cancellation_interrupts_the_wait_before_another_attempt() {
     let provider = Script::new([
-        refusal(ProviderError::new("busy").with_retry(Some(Duration::from_secs(5)))),
+        refusal(ProviderError::new("busy").retry_after(Duration::from_secs(5))),
         final_answer(),
     ]);
     let cancellation = CancellationToken::new();
@@ -182,7 +185,7 @@ async fn cancellation_interrupts_the_wait_before_another_attempt() {
 #[test]
 fn retries_a_model_turn_without_a_tokio_runtime_or_an_extra_turn() -> Result<(), RunError> {
     let provider = Script::new([
-        refusal(ProviderError::new("busy").with_retry(Some(Duration::from_millis(1)))),
+        refusal(ProviderError::new("busy").retry_after(Duration::from_millis(1))),
         final_answer(),
     ]);
     let report = futures_executor::block_on(run_with_options(

@@ -49,7 +49,7 @@ pub(crate) const DISPATCHER: &str = "call_tool";
 pub(crate) struct RunSkills<'a> {
     available: BTreeMap<&'a str, Vec<(ToolSpec, &'a dyn Tool)>>,
     loaded: Vec<String>,
-    pub(crate) advertised: Vec<ToolSpec>,
+    pub(crate) built_in_tool_specs: Vec<ToolSpec>,
     handlers: BTreeMap<String, (ToolRecovery, &'a dyn Tool)>,
 }
 
@@ -57,7 +57,7 @@ impl<'a> RunSkills<'a> {
     pub(crate) fn new(skills: &[Skill<'a>]) -> Result<Self, RunError> {
         let mut available = BTreeMap::new();
         let mut description = String::from(
-            "Load a skill by name to receive its tool definitions. Use call_tool with a returned tool name and arguments on subsequent turns. Available skills:",
+            "Load a skill by name to receive its tool definitions. Use call_tool with a returned name as tool_name and the tool arguments on subsequent turns. Available skills:",
         );
         for skill in skills {
             validate_name(skill.name)?;
@@ -92,21 +92,21 @@ impl<'a> RunSkills<'a> {
         );
         let dispatcher = ToolSpec::new(
             DISPATCHER,
-            "Execute a tool from a loaded skill. Supply its qualified name and arguments matching the schema returned by load_skill.",
+            "Execute a tool from a loaded skill. Supply its qualified name as tool_name and arguments matching the schema returned by load_skill.",
             json!({
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
+                    "tool_name": {"type": "string"},
                     "arguments": {}
                 },
-                "required": ["name", "arguments"],
+                "required": ["tool_name", "arguments"],
                 "additionalProperties": false
             }),
         );
         Ok(Self {
             available,
             loaded: Vec::new(),
-            advertised: vec![loader, dispatcher],
+            built_in_tool_specs: vec![loader, dispatcher],
             handlers: BTreeMap::new(),
         })
     }
@@ -173,11 +173,13 @@ impl<'a> RunSkills<'a> {
             .arguments
             .as_object()
             .filter(|fields| fields.len() == 2)
-            .ok_or_else(|| ToolError::new("expected name and arguments fields"))?;
+            .ok_or_else(|| ToolError::new("expected tool_name and arguments fields"))?;
+        // Existing journals may contain dispatcher calls made before the field was renamed.
         let name = fields
-            .get("name")
+            .get("tool_name")
+            .or_else(|| fields.get("name"))
             .and_then(JsonValue::as_str)
-            .ok_or_else(|| ToolError::new("expected a string tool name"))?;
+            .ok_or_else(|| ToolError::new("expected a string tool_name"))?;
         let arguments = fields
             .get("arguments")
             .ok_or_else(|| ToolError::new("expected tool arguments"))?;

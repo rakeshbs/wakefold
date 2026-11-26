@@ -2,7 +2,7 @@
 
 mod recovery;
 pub use recovery::RunCheckpoint;
-use recovery::{Boundary, Driver};
+use recovery::{RunDriver, RunPhase};
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -24,7 +24,7 @@ use crate::{
 pub struct RunOptions {
     max_model_turns: usize,
     token_budget: Option<u64>,
-    context_budget: Option<usize>,
+    context_byte_budget: Option<usize>,
     retry_policy: RetryPolicy,
     workspace: Option<RunWorkspace>,
     cancellation: Option<CancellationToken>,
@@ -36,7 +36,7 @@ impl RunOptions {
         Self {
             max_model_turns,
             token_budget: None,
-            context_budget: None,
+            context_byte_budget: None,
             retry_policy: RetryPolicy::default(),
             workspace: None,
             cancellation: None,
@@ -52,15 +52,15 @@ impl RunOptions {
         self
     }
 
-    /// Limit the transcript and provider context used for model calls, in bytes.
+    /// Limit the transcript and provider replay data used for model calls, in bytes.
     ///
     /// The budget counts message text, tool call IDs and names, and compact
-    /// JSON for tool arguments, results, and provider context. When needed,
+    /// JSON for tool arguments, results, and provider replay data. When needed,
     /// the model summarizes older exchanges in a separate request. The
     /// original prompt, loaded tool definitions, and latest exchange are kept.
     /// Summary requests count toward token usage and have one opportunity per agent turn.
-    pub fn with_context_budget(mut self, max_bytes: usize) -> Self {
-        self.context_budget = Some(max_bytes);
+    pub fn with_context_byte_budget(mut self, max_bytes: usize) -> Self {
+        self.context_byte_budget = Some(max_bytes);
         self
     }
 
@@ -93,22 +93,24 @@ impl RunOptions {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RunUsage {
-    /// Sum of counts reported by completed model turns.
-    pub reported: TokenUsage,
-    /// Completed model turns for which the provider omitted usage.
-    pub unreported_turns: usize,
+    /// Tokens reported by the provider, including for compaction summaries.
+    #[serde(rename = "reported")]
+    pub reported_tokens: TokenUsage,
+    /// Completed model calls without token counts, including compaction summaries.
+    #[serde(rename = "unreported_turns")]
+    pub model_calls_without_usage: usize,
 }
 
 impl RunUsage {
     fn record(&mut self, usage: Option<TokenUsage>) -> Result<(), RunError> {
         match usage {
             Some(usage) => {
-                self.reported = self
-                    .reported
+                self.reported_tokens = self
+                    .reported_tokens
                     .checked_add(usage)
                     .ok_or(RunError::TokenUsageOverflow)?;
             }
-            None => self.unreported_turns += 1,
+            None => self.model_calls_without_usage += 1,
         }
         Ok(())
     }
@@ -117,10 +119,10 @@ impl RunUsage {
         let Some(limit) = budget else {
             return Ok(());
         };
-        if self.unreported_turns > 0 {
+        if self.model_calls_without_usage > 0 {
             return Err(RunError::TokenUsageUnavailable { usage: self });
         }
-        if self.reported.total_tokens() >= u128::from(limit) {
+        if self.reported_tokens.total_tokens() >= u128::from(limit) {
             return Err(RunError::TokenBudgetReached { limit, usage: self });
         }
         Ok(())
@@ -229,19 +231,19 @@ pub enum RunError {
 
     /// The transcript payload is too large to send after compaction.
     #[error(
-        "agent context requires {required} bytes after compaction, exceeding its {limit}-byte budget"
+        "agent context requires {required_bytes} bytes after compaction, exceeding its {limit_bytes}-byte budget"
     )]
     ContextBudgetExceeded {
         /// Configured transcript budget in bytes.
-        limit: usize,
+        limit_bytes: usize,
         /// Transcript payload size in bytes when the run stopped.
-        required: u128,
+        required_bytes: u128,
     },
 
     /// The run needed another action but had incomplete token counts.
     #[error("provider omitted token usage required to continue a budgeted run")]
     TokenUsageUnavailable {
-        /// Known counts and the number of turns without reports.
+        /// Known counts and the number of model calls without token counts.
         usage: RunUsage,
     },
 
@@ -253,7 +255,8 @@ pub enum RunError {
 /// Run a single agent until it returns a final answer or reaches a limit.
 ///
 /// The model sees the fixed `load_skill` and `call_tool` functions. It calls `load_skill`
-/// to receive its tool definitions, then uses `call_tool` to execute them.
+/// to receive its tool definitions, then passes a qualified `tool_name` and
+/// the tool's arguments to `call_tool`.
 ///
 /// If the last allowed model turn requests tools, the run stops before
 /// executing them because no follow-up turn remains.
@@ -392,11 +395,11 @@ async fn drive(
         }
     };
 
-    let mut run = Driver::open(prompt, journal, RunSkills::new(skills)?, &options)?;
+    let mut run = RunDriver::open(prompt, journal, RunSkills::new(skills)?, &options)?;
     let mut context_sizes = crate::context::ContextSizes::default();
     loop {
         check_cancelled(cancellation)?;
-        if let Boundary::Finished(answer) = run.boundary {
+        if let RunPhase::Finished(answer) = run.phase {
             return Ok(RunReport {
                 answer,
                 usage: run.state.usage,
@@ -414,15 +417,15 @@ async fn drive(
         match action {
             Action::CallModel => {
                 run.state.usage.check_budget(options.token_budget)?;
-                if matches!(run.boundary, Boundary::Ready)
-                    && let Some(limit) = options.context_budget
+                if matches!(run.phase, RunPhase::Ready)
+                    && let Some(limit) = options.context_byte_budget
                     && let Some(compaction) = context_sizes.prepare(
                         &run.state.messages,
-                        &run.state.assistant_context,
+                        &run.state.assistant_replay_data,
                         limit,
                     )?
                 {
-                    let summary = crate::retry::complete_turn(
+                    let summary = crate::retry::stream_turn(
                         provider,
                         compaction.request(),
                         &mut |_| {},
@@ -433,15 +436,15 @@ async fn drive(
                     run.compact(compaction, summary)?;
                     run.state.usage.check_budget(options.token_budget)?;
                 }
-                if !matches!(run.boundary, Boundary::ModelRequested) {
+                if !matches!(run.phase, RunPhase::ModelRequested) {
                     run.commit([RunEvent::ModelCallRequested])?;
                 }
-                let turn = crate::retry::complete_turn(
+                let turn = crate::retry::stream_turn(
                     provider,
                     ModelRequest {
                         messages: &run.state.messages,
-                        tools: &run.skills.advertised,
-                        assistant_context: &run.state.assistant_context,
+                        tools: &run.skills.built_in_tool_specs,
+                        assistant_replay_data: &run.state.assistant_replay_data,
                     },
                     &mut emit_text,
                     options.retry_policy,
@@ -452,14 +455,14 @@ async fn drive(
             }
             Action::RunTool(call) => {
                 run.state.usage.check_budget(options.token_budget)?;
-                if matches!(run.boundary, Boundary::Ready) {
-                    run.start_tool(call.clone())?;
+                if matches!(run.phase, RunPhase::Ready) {
+                    run.prepare_tool_call(call.clone())?;
                     continue;
                 }
                 let context = ToolContext::new(
                     cancellation.cloned(),
                     options.workspace.clone(),
-                    run.idempotency_key().map(str::to_owned),
+                    run.tool_call_key().map(str::to_owned),
                 );
                 let events = await_cancellable(run.skills.call(call, context), cancellation)
                     .await?

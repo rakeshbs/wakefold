@@ -40,14 +40,14 @@ impl Default for RetryPolicy {
     }
 }
 
-pub(crate) async fn complete_turn(
+pub(crate) async fn stream_turn(
     provider: &dyn Provider,
     request: ModelRequest<'_>,
     on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     policy: RetryPolicy,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ModelTurn, RunError> {
-    complete_turn_with_clock(
+    stream_turn_with_clock(
         provider,
         request,
         on_text,
@@ -59,7 +59,7 @@ pub(crate) async fn complete_turn(
     .await
 }
 
-async fn complete_turn_with_clock<Sleep: Future<Output = ()>>(
+async fn stream_turn_with_clock<Sleep: Future<Output = ()>>(
     provider: &dyn Provider,
     request: ModelRequest<'_>,
     on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
@@ -73,7 +73,7 @@ async fn complete_turn_with_clock<Sleep: Future<Output = ()>>(
     loop {
         let mut streamed = false;
         let result = await_cancellable(
-            provider.complete_turn(request, &mut |chunk| {
+            provider.stream_turn(request, &mut |chunk| {
                 streamed = true;
                 on_text(chunk);
             }),

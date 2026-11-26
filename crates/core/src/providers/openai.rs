@@ -101,19 +101,22 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
-    async fn complete(&self, request: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
-        self.complete_streaming(request, &mut |_| {}).await
+    async fn complete_response(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        self.stream_response(request, &mut |_| {}).await
     }
 
-    async fn complete_streaming(
+    async fn stream_response(
         &self,
         request: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelResponse, ProviderError> {
-        Ok(self.complete_turn(request, on_text).await?.response)
+        Ok(self.stream_turn(request, on_text).await?.response)
     }
 
-    async fn complete_turn(
+    async fn stream_turn(
         &self,
         request: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
@@ -215,15 +218,15 @@ fn response_tools(specs: &[crate::ToolSpec]) -> Vec<Tool> {
 
 fn input_items(request: ModelRequest<'_>) -> Result<Vec<InputItem>, ProviderError> {
     let mut items = Vec::new();
-    let mut context = request.assistant_context.iter();
+    let mut replay_data = request.assistant_replay_data.iter();
     for message in request.messages {
         match message {
             Message::User(prompt) => items.push(text_message(Role::User, prompt)),
             Message::Summary(summary) => items.push(text_message(Role::Assistant, summary)),
             Message::Assistant(response) => {
-                if let Some(Some(context)) = context.next() {
-                    let output = Vec::<OutputItem>::deserialize(context).map_err(|source| {
-                        ProviderError::with_source("invalid Responses turn context", source)
+                if let Some(Some(data)) = replay_data.next() {
+                    let output = Vec::<OutputItem>::deserialize(data).map_err(|source| {
+                        ProviderError::with_source("invalid Responses replay data", source)
                     })?;
                     items.extend(output.into_iter().map(InputItem::from));
                     continue;
@@ -327,8 +330,8 @@ fn completed_turn(response: Response) -> Result<ModelTurn, ProviderError> {
         )
     });
     let mut turn = ModelTurn::new(result, usage);
-    turn.context = Some(serde_json::to_value(response.output).map_err(|source| {
-        ProviderError::with_source("could not preserve Responses turn context", source)
+    turn.replay_data = Some(serde_json::to_value(response.output).map_err(|source| {
+        ProviderError::with_source("could not preserve Responses replay data", source)
     })?);
     Ok(turn)
 }

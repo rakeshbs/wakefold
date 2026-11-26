@@ -43,7 +43,7 @@ pub enum ToolRecovery {
     /// Retry an interrupted call. The handler must make repetition safe.
     ///
     /// Calls that only read data can repeat directly. Calls that change state
-    /// must use [`ToolContext::idempotency_key`] to prevent duplicate changes
+    /// must use [`ToolContext::tool_call_key`] to prevent duplicate changes
     /// and recover the original result.
     RetryAfterCrash,
     /// Stop with an unknown outcome if the call's result was never saved.
@@ -143,19 +143,19 @@ impl ToolResult {
 pub struct ToolContext {
     cancellation: Option<CancellationToken>,
     workspace: Option<RunWorkspace>,
-    idempotency_key: Option<String>,
+    tool_call_key: Option<String>,
 }
 
 impl ToolContext {
     pub(crate) fn new(
         cancellation: Option<CancellationToken>,
         workspace: Option<RunWorkspace>,
-        idempotency_key: Option<String>,
+        tool_call_key: Option<String>,
     ) -> Self {
         Self {
             cancellation,
             workspace,
-            idempotency_key,
+            tool_call_key,
         }
     }
 
@@ -172,11 +172,11 @@ impl ToolContext {
     /// The stable key assigned to this call before the agent executes its handler.
     ///
     /// Journaled runs persist this key and reuse it after restart. A handler
-    /// that changes state and opts into retries must use the key with its backing
-    /// service or record it with the change in one transaction. The default
-    /// context has no assigned key.
-    pub fn idempotency_key(&self) -> Option<&str> {
-        self.idempotency_key.as_deref()
+    /// that changes state and opts into retries must pass it as an idempotency
+    /// key to its backing service or record it with the change in one transaction.
+    /// The default context has no assigned key.
+    pub fn tool_call_key(&self) -> Option<&str> {
+        self.tool_call_key.as_deref()
     }
 }
 

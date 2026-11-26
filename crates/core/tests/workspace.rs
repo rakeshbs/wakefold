@@ -25,10 +25,11 @@ fn run_note_tool(workspace: RunWorkspace, read_from: Option<&Path>) {
     let tool = typed_tool_with_context(|_: Note, ctx: ToolContext| async move {
         let workspace = ctx.workspace().expect("agent should receive its workspace");
         let content = match read_from {
-            Some(artifact) => fs::read_to_string(workspace.root().join(artifact)),
+            Some(artifact) => fs::read_to_string(workspace.chat_root().join(artifact)),
             None => {
-                let artifact = workspace.agent_directory().join("note.txt");
-                fs::write(workspace.root().join(artifact), CONTENT).map(|()| CONTENT.to_owned())
+                let artifact = workspace.agent_relative_directory().join("note.txt");
+                fs::write(workspace.chat_root().join(artifact), CONTENT)
+                    .map(|()| CONTENT.to_owned())
             }
         }
         .map_err(|e| ToolError::new(e.to_string()))?;
@@ -62,11 +63,11 @@ fn shared_workspace_survives_restart() {
     const CHILD_STATE: &str = "WAKEFOLD_TEST_CHILD_STATE";
     if let Some(state) = std::env::var_os(CHILD_STATE) {
         let mut store = WorkspaceStore::open(state).unwrap();
-        let writer = store.open_run(CHAT, "writer").unwrap();
-        let reader = store.open_run(CHAT, "reader").unwrap();
-        assert_eq!(writer.root(), reader.root());
+        let writer = store.open_run_workspace(CHAT, "writer").unwrap();
+        let reader = store.open_run_workspace(CHAT, "reader").unwrap();
+        assert_eq!(writer.chat_root(), reader.chat_root());
         assert_ne!(writer.agent_id(), reader.agent_id());
-        let artifact = writer.agent_directory().join("note.txt");
+        let artifact = writer.agent_relative_directory().join("note.txt");
         run_note_tool(writer, None);
         run_note_tool(reader, Some(&artifact));
         return;
@@ -88,23 +89,23 @@ fn shared_workspace_survives_restart() {
     );
 
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    let writer = store.open_run(CHAT, "writer").unwrap();
-    let artifact = writer.agent_directory().join("note.txt");
-    let reader = store.open_run(CHAT, "reader").unwrap();
+    let writer = store.open_run_workspace(CHAT, "writer").unwrap();
+    let artifact = writer.agent_relative_directory().join("note.txt");
+    let reader = store.open_run_workspace(CHAT, "reader").unwrap();
     run_note_tool(reader, Some(&artifact));
 
-    let other = store.open_run("chat-two", "writer").unwrap();
-    assert_ne!(other.root(), writer.root());
+    let other = store.open_run_workspace("chat-two", "writer").unwrap();
+    assert_ne!(other.chat_root(), writer.chat_root());
     assert_eq!(
-        fs::read_to_string(other.root().join(&artifact))
+        fs::read_to_string(other.chat_root().join(&artifact))
             .unwrap_err()
             .kind(),
         std::io::ErrorKind::NotFound
     );
-    fs::create_dir_all(other.root().join(&artifact).parent().unwrap()).unwrap();
-    fs::write(other.root().join(&artifact), "second chat").unwrap();
+    fs::create_dir_all(other.chat_root().join(&artifact).parent().unwrap()).unwrap();
+    fs::write(other.chat_root().join(&artifact), "second chat").unwrap();
     assert_eq!(
-        fs::read_to_string(writer.root().join(&artifact)).unwrap(),
+        fs::read_to_string(writer.chat_root().join(&artifact)).unwrap(),
         CONTENT
     );
 }
@@ -117,15 +118,18 @@ fn concurrent_first_runs_share_one_workspace() {
         let worker = scope.spawn(|| {
             start.wait();
             let mut first = WorkspaceStore::open(state.path()).unwrap();
-            first.open_run("new-chat", "first").unwrap()
+            first.open_run_workspace("new-chat", "first").unwrap()
         });
         start.wait();
         let mut second = WorkspaceStore::open(state.path()).unwrap();
-        let right = second.open_run("new-chat", "second").unwrap();
+        let right = second.open_run_workspace("new-chat", "second").unwrap();
         let left = worker.join().unwrap();
-        assert_eq!(second.open_run("new-chat", "first").unwrap(), left);
+        assert_eq!(
+            second.open_run_workspace("new-chat", "first").unwrap(),
+            left
+        );
         (left, right)
     });
-    assert_eq!(left.root(), right.root());
+    assert_eq!(left.chat_root(), right.chat_root());
     assert_ne!(left.agent_id(), right.agent_id());
 }

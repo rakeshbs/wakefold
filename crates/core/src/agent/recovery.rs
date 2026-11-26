@@ -19,14 +19,15 @@ pub struct RunCheckpoint {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct RunState {
     pub messages: Vec<Message>,
-    pub assistant_context: Vec<Option<JsonValue>>,
+    #[serde(rename = "assistant_context")]
+    pub assistant_replay_data: Vec<Option<JsonValue>>,
     used_call_ids: HashSet<CallId>,
     pub model_turns: usize,
     pub usage: RunUsage,
 }
 
 impl RunState {
-    fn complete_turn(
+    fn record_model_turn(
         &mut self,
         turn: ModelTurn,
         skills: &RunSkills<'_>,
@@ -48,33 +49,33 @@ impl RunState {
             validate_calls(response.tool_calls(), &mut self.used_call_ids, skills)?;
         }
         self.messages.push(Message::Assistant(response));
-        self.assistant_context.push(turn.context);
+        self.assistant_replay_data.push(turn.replay_data);
         Ok(())
     }
 }
 
-pub(super) enum Boundary {
+pub(super) enum RunPhase {
     Ready,
     ModelRequested,
-    ToolStarted {
+    ToolPrepared {
         call: ToolCall,
         recovery: ToolRecovery,
-        idempotency_key: String,
+        tool_call_key: String,
     },
     Finished(String),
 }
 
 /// Fresh and resumed runs advance through the same event transitions.
-pub(super) struct Driver<'a, 'db, 'skills> {
+pub(super) struct RunDriver<'a, 'db, 'skills> {
     journal: Option<&'a mut RunJournal<'db>>,
     tail: u64,
     options: &'a RunOptions,
     pub state: RunState,
     pub skills: RunSkills<'skills>,
-    pub boundary: Boundary,
+    pub phase: RunPhase,
 }
 
-impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
+impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
     pub fn open(
         prompt: String,
         mut journal: Option<&'a mut RunJournal<'db>>,
@@ -91,7 +92,7 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
             options,
             state: RunState::default(),
             skills,
-            boundary: Boundary::Ready,
+            phase: RunPhase::Ready,
         };
         let Some(first) = entries.first() else {
             run.commit([RunEvent::RunStarted(prompt)])?;
@@ -99,7 +100,7 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
         };
         let matches_prompt = match &first.event {
             RunEvent::RunStarted(original) => original == &prompt,
-            RunEvent::Compacted(snapshot) => {
+            RunEvent::TranscriptCompacted(snapshot) => {
                 matches!(snapshot.state.messages.first(), Some(Message::User(original)) if original == &prompt)
             }
             _ => false,
@@ -113,7 +114,7 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
             run.apply(entry.event)?;
             run.tail = entry.sequence;
         }
-        if let Boundary::ToolStarted { call, recovery, .. } = &run.boundary
+        if let RunPhase::ToolPrepared { call, recovery, .. } = &run.phase
             && (*recovery != ToolRecovery::RetryAfterCrash
                 || run.skills.recovery(call).ok() != Some(ToolRecovery::RetryAfterCrash))
         {
@@ -125,7 +126,7 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
         Ok(run)
     }
 
-    pub fn start_tool(&mut self, call: ToolCall) -> Result<(), RunError> {
+    pub fn prepare_tool_call(&mut self, call: ToolCall) -> Result<(), RunError> {
         let recovery = self
             .skills
             .recovery(&call)
@@ -133,18 +134,16 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
                 name: call.name.clone(),
                 source,
             })?;
-        self.commit([RunEvent::ToolCallStarted {
+        self.commit([RunEvent::ToolCallPrepared {
             call,
             recovery,
-            idempotency_key: format!("wakefold-{:032x}", rand::random::<u128>()),
+            tool_call_key: format!("wakefold-{:032x}", rand::random::<u128>()),
         }])
     }
 
-    pub fn idempotency_key(&self) -> Option<&str> {
-        match &self.boundary {
-            Boundary::ToolStarted {
-                idempotency_key, ..
-            } => Some(idempotency_key),
+    pub fn tool_call_key(&self) -> Option<&str> {
+        match &self.phase {
+            RunPhase::ToolPrepared { tool_call_key, .. } => Some(tool_call_key),
             _ => None,
         }
     }
@@ -160,9 +159,9 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
         compaction.apply(
             summary.response,
             &mut state.messages,
-            &mut state.assistant_context,
+            &mut state.assistant_replay_data,
         )?;
-        self.commit([RunEvent::Compacted(RunCheckpoint {
+        self.commit([RunEvent::TranscriptCompacted(RunCheckpoint {
             state,
             loaded_skills: self.skills.loaded().to_vec(),
         })])
@@ -183,50 +182,51 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
 
     fn apply(&mut self, event: RunEvent) -> Result<(), RunError> {
         let action = || next_action(&self.state.messages, usize::MAX);
-        self.boundary = match (&self.boundary, event) {
-            (Boundary::Ready, RunEvent::RunStarted(prompt)) if self.state.messages.is_empty() => {
+        self.phase = match (&self.phase, event) {
+            (RunPhase::Ready, RunEvent::RunStarted(prompt)) if self.state.messages.is_empty() => {
                 self.state.messages.push(Message::User(prompt));
-                Boundary::Ready
+                RunPhase::Ready
             }
-            (Boundary::Ready, RunEvent::Compacted(snapshot)) => {
+            (RunPhase::Ready, RunEvent::TranscriptCompacted(snapshot)) => {
                 for name in snapshot.loaded_skills {
                     activate_skill(&mut self.skills, &name)?;
                 }
                 self.state = snapshot.state;
-                Boundary::Ready
+                RunPhase::Ready
             }
-            (Boundary::Ready, RunEvent::ModelCallRequested)
+            (RunPhase::Ready, RunEvent::ModelCallRequested)
                 if matches!(action(), Some(Action::CallModel)) =>
             {
-                Boundary::ModelRequested
+                RunPhase::ModelRequested
             }
-            (Boundary::ModelRequested, RunEvent::ModelCallCompleted(turn)) => {
-                self.state.complete_turn(turn, &self.skills, self.options)?;
-                Boundary::Ready
+            (RunPhase::ModelRequested, RunEvent::ModelCallCompleted(turn)) => {
+                self.state
+                    .record_model_turn(turn, &self.skills, self.options)?;
+                RunPhase::Ready
             }
             (
-                Boundary::Ready,
-                RunEvent::ToolCallStarted {
+                RunPhase::Ready,
+                RunEvent::ToolCallPrepared {
                     call,
                     recovery,
-                    idempotency_key,
+                    tool_call_key,
                 },
-            ) if !idempotency_key.is_empty()
+            ) if !tool_call_key.is_empty()
                 && matches!(action(), Some(Action::RunTool(expected)) if expected == &call) =>
             {
-                Boundary::ToolStarted {
+                RunPhase::ToolPrepared {
                     call,
                     recovery,
-                    idempotency_key,
+                    tool_call_key,
                 }
             }
-            (Boundary::ToolStarted { call, .. }, RunEvent::SkillLoaded(name))
+            (RunPhase::ToolPrepared { call, .. }, RunEvent::SkillLoaded(name))
                 if call.name == LOADER && call.arguments["name"].as_str() == Some(&name) =>
             {
                 activate_skill(&mut self.skills, &name)?;
                 return Ok(());
             }
-            (Boundary::ToolStarted { call, .. }, RunEvent::ToolCallCompleted(result))
+            (RunPhase::ToolPrepared { call, .. }, RunEvent::ToolCallCompleted(result))
                 if call.id == result.call_id =>
             {
                 if call.name == LOADER
@@ -241,10 +241,10 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
                     ));
                 }
                 self.state.messages.push(Message::Tool(result));
-                Boundary::Ready
+                RunPhase::Ready
             }
-            (Boundary::Ready, RunEvent::RunFinished(answer)) if matches!(action(), Some(Action::Finish(expected)) if expected == answer) => {
-                Boundary::Finished(answer)
+            (RunPhase::Ready, RunEvent::RunFinished(answer)) if matches!(action(), Some(Action::Finish(expected)) if expected == answer) => {
+                RunPhase::Finished(answer)
             }
             _ => return Err(RunError::InvalidJournal("unexpected event at run boundary")),
         };

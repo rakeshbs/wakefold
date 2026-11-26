@@ -30,23 +30,29 @@ pub enum RunEvent {
     RunStarted(String),
     /// The run is about to request its next model turn.
     ModelCallRequested,
-    /// A full model response, including usage and provider replay context.
+    /// A full model response, including usage and provider replay data.
     ModelCallCompleted(ModelTurn),
-    /// A tool is about to execute with a durable recovery policy and key.
-    ToolCallStarted {
+    /// The recovery policy and key were recorded before dispatch.
+    ///
+    /// The handler may have run if this event has no matching completion.
+    #[serde(rename = "tool_call_started")]
+    ToolCallPrepared {
         /// The original model request, including its dispatcher arguments.
         call: ToolCall,
         /// The recovery policy declared before the first attempt.
         recovery: ToolRecovery,
         /// Stable key reused by all recovery attempts for this call.
-        idempotency_key: String,
+        #[serde(rename = "idempotency_key")]
+        tool_call_key: String,
     },
     /// The tool returned a result for its call ID.
     ToolCallCompleted(ToolResult),
     /// A skill became available with the loader result in the same transaction.
     SkillLoaded(String),
     /// State at a model-call boundary after transcript compaction.
-    Compacted(RunCheckpoint),
+    // The SQLite checkpoint index and recovery query use this tag.
+    #[serde(rename = "compacted")]
+    TranscriptCompacted(RunCheckpoint),
     /// The run returned its final answer.
     RunFinished(String),
 }

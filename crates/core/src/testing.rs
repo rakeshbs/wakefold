@@ -11,7 +11,7 @@ use crate::{Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderE
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptedTurn {
     messages: Vec<Message>,
-    tools: Option<Vec<String>>,
+    expected_tool_names: Option<Vec<String>>,
     turn: ModelTurn,
 }
 
@@ -20,14 +20,14 @@ impl ScriptedTurn {
     pub fn new(messages: Vec<Message>, response: ModelResponse) -> Self {
         Self {
             messages,
-            tools: None,
+            expected_tool_names: None,
             turn: ModelTurn::new(response, None),
         }
     }
 
     /// Require exactly these advertised tool names in the given order.
-    pub fn with_tools(mut self, names: &[&str]) -> Self {
-        self.tools = Some(names.iter().map(|name| (*name).to_owned()).collect());
+    pub fn expect_tool_names(mut self, names: &[&str]) -> Self {
+        self.expected_tool_names = Some(names.iter().map(|name| (*name).to_owned()).collect());
         self
     }
 
@@ -55,11 +55,14 @@ impl ScriptedProvider {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
-    async fn complete(&self, request: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
-        Ok(self.complete_turn(request, &mut |_| {}).await?.response)
+    async fn complete_response(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        Ok(self.stream_turn(request, &mut |_| {}).await?.response)
     }
 
-    async fn complete_turn(
+    async fn stream_turn(
         &self,
         request: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
@@ -77,7 +80,7 @@ impl Provider for ScriptedProvider {
             ));
         }
 
-        if let Some(names) = scripted.tools
+        if let Some(names) = scripted.expected_tool_names
             && request.tools.iter().map(|spec| &spec.name).ne(&names)
         {
             return Err(ProviderError::new(format!(

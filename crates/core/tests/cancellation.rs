@@ -42,11 +42,14 @@ struct StreamingProvider {
 
 #[async_trait]
 impl Provider for StreamingProvider {
-    async fn complete(&self, _request: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+    async fn complete_response(
+        &self,
+        _request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
         Err(ProviderError::new("expected a streaming request"))
     }
 
-    async fn complete_streaming(
+    async fn stream_response(
         &self,
         _request: ModelRequest<'_>,
         on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
