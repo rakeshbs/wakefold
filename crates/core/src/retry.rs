@@ -81,7 +81,10 @@ async fn stream_turn_with_clock<Sleep: Future<Output = ()>>(
         )
         .await?;
         let error = match result {
-            Ok(turn) => return Ok(turn),
+            Ok(mut turn) => {
+                turn.response = turn.response.normalize_text_only();
+                return Ok(turn);
+            }
             Err(error) if streamed || retries >= policy.max_retries => return Err(error.into()),
             Err(error) => error,
         };

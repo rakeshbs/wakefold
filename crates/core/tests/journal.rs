@@ -7,6 +7,19 @@ use wakefold::{
 };
 
 #[test]
+fn stored_text_only_tool_response_decodes_as_a_final_answer() {
+    let turn: ModelTurn = serde_json::from_value(json!({
+        "response": {"ToolCalls": {"text": "answer", "calls": []}},
+        "usage": {"input_tokens": 3, "output_tokens": 1},
+        "context": {"trace": 7}
+    }))
+    .unwrap();
+    assert_eq!(turn.response, ModelResponse::Final("answer".into()));
+    assert_eq!(turn.usage, Some(TokenUsage::new(3, 1)));
+    assert_eq!(turn.replay_data, Some(json!({"trace": 7})));
+}
+
+#[test]
 fn reopens_run_events_in_order_with_provider_replay_data() {
     let state = tempfile::tempdir().unwrap();
     let call = ToolCall::new("call-1", "lookup", json!({"id": 3}));

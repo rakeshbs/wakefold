@@ -115,7 +115,10 @@ impl Provider for BeforeRestart {
         _: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelTurn, ProviderError> {
         let response = if req.tools.is_empty() {
-            ModelResponse::Final(SUMMARY.into())
+            ModelResponse::ToolCalls {
+                text: Some(SUMMARY.into()),
+                calls: vec![],
+            }
         } else if req.messages.len() == 1 {
             load("load")
         } else if req
@@ -171,7 +174,10 @@ impl Provider for AfterRestart {
             );
             return Ok(read_note("after-restart"));
         }
-        Ok(ModelResponse::Final("done".into()))
+        Ok(ModelResponse::ToolCalls {
+            text: Some("done".into()),
+            calls: vec![],
+        })
     }
 }
 
@@ -218,6 +224,22 @@ fn process_restart_restores_loaded_tools_after_compaction() {
     assert_eq!(report.usage.reported_tokens, TokenUsage::new(8, 4));
     assert_eq!(report.usage.model_calls_without_usage, 2);
     assert_eq!(run_note(dir.path(), &NoCalls, 2000).unwrap(), report);
+
+    // Check the bytes written by the run before compatibility decoding can change their shape.
+    let db = rusqlite::Connection::open(dir.path().join("wakefold.sqlite3")).unwrap();
+    let saved_response: String = db
+        .query_row(
+            "SELECT json_extract(event_json, '$.data.response') FROM run_events
+         WHERE json_extract(event_json, '$.kind') = 'model_call_completed'
+         ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(&saved_response).unwrap(),
+        json!({"Final": "done"})
+    );
 
     let mut store = WorkspaceStore::open(dir.path()).unwrap();
     let entries = store

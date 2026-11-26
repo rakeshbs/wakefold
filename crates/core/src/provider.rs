@@ -32,6 +32,7 @@ pub enum ModelResponse {
     /// The final answer to the user.
     Final(String),
     /// An assistant message with an ordered list of tool calls and optional text.
+    /// Wakefold treats nonempty text with zero calls as a final answer.
     ToolCalls {
         /// Text emitted before or alongside the calls.
         text: Option<String>,
@@ -64,13 +65,25 @@ impl From<StoredModelResponse> for ModelResponse {
     fn from(stored: StoredModelResponse) -> Self {
         match stored {
             StoredModelResponse::Final(answer) => Self::Final(answer),
-            StoredModelResponse::ToolCalls { text, calls } => Self::ToolCalls { text, calls },
+            StoredModelResponse::ToolCalls { text, calls } => {
+                Self::ToolCalls { text, calls }.normalize_text_only()
+            }
             StoredModelResponse::ToolCall(call) => call.into(),
         }
     }
 }
 
 impl ModelResponse {
+    pub(crate) fn normalize_text_only(self) -> Self {
+        match self {
+            Self::ToolCalls {
+                text: Some(text),
+                calls,
+            } if calls.is_empty() && !text.is_empty() => Self::Final(text),
+            response => response,
+        }
+    }
+
     /// Text emitted by the model during this turn, if any.
     pub fn text(&self) -> Option<&str> {
         match self {
