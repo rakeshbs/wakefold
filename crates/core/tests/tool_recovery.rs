@@ -10,9 +10,9 @@ use futures_executor::block_on;
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde_json::json;
 use wakefold::{
-    JsonValue, Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError, RunError,
-    RunEvent, RunOptions, RunReport, Skill, TokenUsage, Tool, ToolCall, ToolContext, ToolError,
-    ToolRecovery, ToolSpec, WorkspaceStore,
+    JsonValue, Message, ModelRequest, ModelResponse, ModelToolSpec, ModelTurn, Provider,
+    ProviderError, RunError, RunEvent, RunOptions, RunReport, Skill, TokenUsage, Tool, ToolCall,
+    ToolContext, ToolError, ToolRecovery, ToolSpec, WorkspaceStore,
 };
 
 const WORKER_ROOT: &str = "WAKEFOLD_RECOVERY_WORKER_ROOT";
@@ -158,9 +158,12 @@ impl Provider for Workflow<'_> {
             request
                 .tools
                 .iter()
-                .map(|tool| tool.name.as_str())
+                .map(|tool| (tool.name.as_str(), tool.recovery))
                 .collect::<Vec<_>>(),
-            ["load_skill", "call_tool"]
+            [
+                ("load_skill", Some(ToolRecovery::RetryAfterCrash)),
+                ("call_tool", None),
+            ]
         );
         append_line(self.0.join("model-calls"), "called");
         let response = match request.messages.last().unwrap() {
@@ -281,6 +284,22 @@ fn process_crashes_at_every_durable_boundary() {
     fs::write(baseline.path().join("catalog"), "notebook").unwrap();
     run_workflow(baseline.path(), POLICIES, None).unwrap();
     let baseline_events = events(baseline.path());
+    let prepared: Vec<_> = baseline_events
+        .iter()
+        .filter_map(|event| match event {
+            RunEvent::ToolCallPrepared { call, recovery, .. } => Some((call.id.clone(), *recovery)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        prepared,
+        [
+            ("load".into(), ToolRecovery::RetryAfterCrash),
+            ("read".into(), ToolRecovery::RetryAfterCrash),
+            ("reserve".into(), ToolRecovery::RetryAfterCrash),
+            ("notify".into(), ToolRecovery::StopAfterCrash),
+        ]
+    );
     let mut points = baseline_events
         .iter()
         .enumerate()
@@ -420,6 +439,10 @@ fn tool_specs_default_to_stop_after_crash_and_round_trip_recovery() {
     let default_spec =
         json!({"name": "write", "description": "Write", "parameters": {"type": "object"}});
     let spec: ToolSpec = serde_json::from_value(default_spec.clone()).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ModelToolSpec>(default_spec.clone()).unwrap(),
+        ModelToolSpec::from(spec.clone()),
+    );
     assert_eq!(spec.recovery, ToolRecovery::StopAfterCrash);
     assert_eq!(serde_json::to_value(&spec).unwrap(), default_spec);
     for recovery in [ToolRecovery::RetryAfterCrash, ToolRecovery::StopAfterCrash] {

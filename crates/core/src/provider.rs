@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::{JsonValue, ToolCall, ToolResult, ToolSpec};
+use crate::{JsonValue, ToolCall, ToolRecovery, ToolResult, ToolSpec};
 
 /// A completed message in the agent's transcript.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -163,6 +163,38 @@ impl ModelTurn {
     }
 }
 
+/// A function advertised to a model provider.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ModelToolSpec {
+    /// Function name the model can call.
+    pub name: String,
+    /// Description shown to the model.
+    pub description: String,
+    /// JSON Schema describing the function's arguments.
+    #[serde(rename = "parameters")]
+    pub argument_schema: JsonValue,
+    /// A fixed recovery policy, or `None` when `call_tool` uses the selected tool's policy.
+    #[serde(default = "default_fixed_recovery")]
+    pub recovery: Option<ToolRecovery>,
+}
+
+// Older serialized tool specs omit the default StopAfterCrash policy.
+fn default_fixed_recovery() -> Option<ToolRecovery> {
+    Some(ToolRecovery::StopAfterCrash)
+}
+
+impl From<ToolSpec> for ModelToolSpec {
+    fn from(spec: ToolSpec) -> Self {
+        Self {
+            name: spec.name,
+            description: spec.description,
+            argument_schema: spec.argument_schema,
+            recovery: Some(spec.recovery),
+        }
+    }
+}
+
 /// The transcript and available tools for one model call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -170,7 +202,7 @@ pub struct ModelRequest<'a> {
     /// Messages in chronological order, including any tool results.
     pub messages: &'a [Message],
     /// Tool schemas advertised for this turn. Agent runs expose `load_skill` and `call_tool`.
-    pub tools: &'a [ToolSpec],
+    pub tools: &'a [ModelToolSpec],
     /// Provider replay data for each [`Message::Assistant`], in chronological order.
     ///
     /// Entries may be `None` when the provider returned no replay data. An
@@ -180,7 +212,7 @@ pub struct ModelRequest<'a> {
 
 impl<'a> ModelRequest<'a> {
     /// Create a model request from a transcript and its available tools.
-    pub fn new(messages: &'a [Message], tools: &'a [ToolSpec]) -> Self {
+    pub fn new(messages: &'a [Message], tools: &'a [ModelToolSpec]) -> Self {
         Self {
             messages,
             tools,

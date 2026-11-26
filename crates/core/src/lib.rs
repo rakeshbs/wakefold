@@ -25,7 +25,8 @@ pub use agent::{
 };
 pub use journal::{JournalEntry, JournalError, RunEvent, RunJournal};
 pub use provider::{
-    Message, ModelRequest, ModelResponse, ModelTurn, Provider, ProviderError, TokenUsage,
+    Message, ModelRequest, ModelResponse, ModelToolSpec, ModelTurn, Provider, ProviderError,
+    TokenUsage,
 };
 #[cfg(feature = "openai")]
 pub use providers::openai::{OpenAiProvider, ReasoningEffort};

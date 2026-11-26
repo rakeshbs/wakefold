@@ -180,7 +180,7 @@ impl Provider for OpenAiProvider {
     }
 }
 
-fn response_tools(specs: &[crate::ToolSpec]) -> Vec<Tool> {
+fn response_tools(specs: &[crate::ModelToolSpec]) -> Vec<Tool> {
     let mut tools = Vec::new();
     let mut namespaces = BTreeMap::<&str, Vec<NamespaceToolParamTool>>::new();
     for spec in specs {

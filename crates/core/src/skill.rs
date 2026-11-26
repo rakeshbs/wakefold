@@ -6,8 +6,8 @@ use std::fmt::{self, Write};
 use serde_json::json;
 
 use crate::{
-    JsonValue, RunError, RunEvent, Tool, ToolCall, ToolContext, ToolError, ToolRecovery,
-    ToolResult, ToolSpec,
+    JsonValue, ModelToolSpec, RunError, RunEvent, Tool, ToolCall, ToolContext, ToolError,
+    ToolRecovery, ToolResult, ToolSpec,
 };
 
 /// A named group of tools the agent can load together.
@@ -44,12 +44,13 @@ impl fmt::Debug for Skill<'_> {
 }
 
 pub(crate) const LOADER: &str = "load_skill";
+const LOADER_RECOVERY: ToolRecovery = ToolRecovery::RetryAfterCrash;
 pub(crate) const DISPATCHER: &str = "call_tool";
 
 pub(crate) struct RunSkills<'a> {
     available: BTreeMap<&'a str, Vec<(ToolSpec, &'a dyn Tool)>>,
     loaded: Vec<String>,
-    pub(crate) built_in_tool_specs: Vec<ToolSpec>,
+    pub(crate) built_in_tool_specs: Vec<ModelToolSpec>,
     handlers: BTreeMap<String, (ToolRecovery, &'a dyn Tool)>,
 }
 
@@ -80,20 +81,21 @@ impl<'a> RunSkills<'a> {
             write!(description, "\n{}: {}", skill.name, skill.description)
                 .expect("writing a skill description into a String succeeds");
         }
-        let loader = ToolSpec::new(
-            LOADER,
+        let loader = ModelToolSpec {
+            name: LOADER.into(),
             description,
-            json!({
+            argument_schema: json!({
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
                 "required": ["name"],
                 "additionalProperties": false
             }),
-        );
-        let dispatcher = ToolSpec::new(
-            DISPATCHER,
-            "Execute a tool from a loaded skill. Supply its qualified name as tool_name and arguments matching the schema returned by load_skill.",
-            json!({
+            recovery: Some(LOADER_RECOVERY),
+        };
+        let dispatcher = ModelToolSpec {
+            name: DISPATCHER.into(),
+            description: "Execute a tool from a loaded skill. Supply its qualified name as tool_name and arguments matching the schema returned by load_skill.".into(),
+            argument_schema: json!({
                 "type": "object",
                 "properties": {
                     "tool_name": {"type": "string"},
@@ -102,7 +104,8 @@ impl<'a> RunSkills<'a> {
                 "required": ["tool_name", "arguments"],
                 "additionalProperties": false
             }),
-        );
+            recovery: None,
+        };
         Ok(Self {
             available,
             loaded: Vec::new(),
@@ -148,7 +151,7 @@ impl<'a> RunSkills<'a> {
 
     pub(crate) fn recovery(&self, call: &ToolCall) -> Result<ToolRecovery, ToolError> {
         if call.name == LOADER {
-            return Ok(ToolRecovery::RetryAfterCrash);
+            return Ok(LOADER_RECOVERY);
         }
         let (name, _) = self.dispatch_arguments(call)?;
         self.handlers
