@@ -195,7 +195,7 @@ impl ToolContext {
     }
 }
 
-/// The result of a handler, including a request to suspend a durable run.
+/// The result of a handler, including requests for durable run operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ToolOutput {
@@ -203,6 +203,13 @@ pub enum ToolOutput {
     Value(JsonValue),
     /// Suspend the run and use the wake event as this call's result.
     Wait(WaitOn),
+    /// Queue a message for another run in the same chat.
+    SendMessage {
+        /// Recipient's stable agent ID.
+        to_agent_id: i64,
+        /// Message to deliver.
+        payload: JsonValue,
+    },
 }
 
 /// A tool that can be registered with the agent.
@@ -236,10 +243,10 @@ pub trait Tool: Send + Sync {
         self.call(arguments).await
     }
 
-    /// Run the tool, optionally asking the journaled driver to suspend.
+    /// Run the tool, optionally asking the journaled driver to perform a durable operation.
     ///
     /// The default wraps an ordinary handler result in [`ToolOutput::Value`].
-    /// A tool returning [`ToolOutput::Wait`] can be invoked by a durable run.
+    /// Waiting and sending messages require a journaled run.
     ///
     /// # Errors
     ///

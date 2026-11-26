@@ -32,6 +32,13 @@ pub(crate) fn record_transition(
     event: &RunEvent,
 ) -> Result<(), JournalError> {
     match event {
+        RunEvent::MailboxMessageSent {
+            message_id,
+            to_agent_id,
+            payload,
+        } => {
+            crate::mailbox::record_sent_message(tx, message_id, agent_id, *to_agent_id, payload)?;
+        }
         RunEvent::WaitStarted(wait) => {
             let wake_at = match wait.on {
                 WaitOn::Timer { wake_at } => Some(

@@ -44,3 +44,14 @@ arguments before dispatch. Hosts can recover those requests with
 `WorkspaceStore::pending_tool_approvals` and deliver a decision with
 `WakeEvent::Approval`. A declined call returns `{"approved": false}` to the
 model.
+
+## Sending messages between agents
+
+Add `SendMessage` and `WaitForMessage` to a skill named `mailbox`. Give sending
+agents the recipient's ID from `RunWorkspace::agent_id`. A sender in the same
+chat can call `mailbox.send` with `to_agent_id` and a JSON `payload`.
+
+`mailbox.receive` returns the oldest matching message with its ID, sender ID,
+and payload. It accepts an optional `from_agent_id` filter. When no matching
+message is queued, the run suspends. A later matching send wakes it.
+Wakefold commits delivery and the receiver's wake together in SQLite.

@@ -50,6 +50,10 @@ pub(crate) const DISPATCHER: &str = "call_tool";
 pub(crate) enum ToolExecution {
     Completed(Vec<RunEvent>),
     Waiting(WaitOn),
+    SendMessage {
+        to_agent_id: i64,
+        payload: JsonValue,
+    },
 }
 
 pub(crate) struct RunSkills<'a> {
@@ -237,6 +241,15 @@ impl<'a> RunSkills<'a> {
                     ));
                 }
                 ToolOutput::Wait(on) => return Ok(ToolExecution::Waiting(on)),
+                ToolOutput::SendMessage {
+                    to_agent_id,
+                    payload,
+                } => {
+                    return Ok(ToolExecution::SendMessage {
+                        to_agent_id,
+                        payload,
+                    });
+                }
             }
         };
         events.push(RunEvent::ToolCallCompleted(ToolResult::new(

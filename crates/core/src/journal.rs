@@ -9,11 +9,11 @@ use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::wait::record_transition;
 use crate::{
     JsonValue, ModelTurn, PendingWait, RunCheckpoint, RunWorkspace, ToolCall, ToolRecovery,
     ToolResult,
 };
+use crate::{mailbox, wait::record_transition};
 
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS run_events (
@@ -53,6 +53,15 @@ pub enum RunEvent {
     },
     /// The tool returned a result for its call ID.
     ToolCallCompleted(ToolResult),
+    /// A tool sent a durable message and receives its message ID as its result.
+    MailboxMessageSent {
+        /// Stable ID from the sending tool call.
+        message_id: String,
+        /// Recipient's stable agent ID in this chat.
+        to_agent_id: i64,
+        /// Message queued for the recipient.
+        payload: JsonValue,
+    },
     /// The prepared tool call is suspended until its wait resolves.
     WaitStarted(PendingWait),
     /// The wait resolved and its payload becomes the prepared tool call's result.
@@ -102,6 +111,12 @@ pub enum JournalError {
     /// A wait transition conflicts with the durable wait for the run.
     #[error("journal wait transition is invalid: {0}")]
     InvalidWait(&'static str),
+    /// The message recipient does not exist in the sender's chat.
+    #[error("agent {agent_id} is unavailable in the sender's chat")]
+    InvalidMailboxRecipient {
+        /// The requested recipient.
+        agent_id: i64,
+    },
     /// The operating system could not open or lock the run's lock file.
     #[error("run lock: {0}")]
     Lock(#[from] std::io::Error),
@@ -167,6 +182,7 @@ impl<'a> RunJournal<'a> {
     ///
     /// Pass zero for an empty journal or the last observed sequence.
     /// An empty batch simply checks the supplied tail.
+    /// A mailbox wait can also append its wake if a matching message is queued.
     ///
     /// # Errors
     ///
@@ -176,6 +192,15 @@ impl<'a> RunJournal<'a> {
         expected_last_sequence: u64,
         events: &[RunEvent],
     ) -> Result<u64, JournalError> {
+        self.append_with_mailbox_wake(expected_last_sequence, events)
+            .map(|(sequence, _)| sequence)
+    }
+
+    pub(crate) fn append_with_mailbox_wake(
+        &mut self,
+        expected_last_sequence: u64,
+        events: &[RunEvent],
+    ) -> Result<(u64, Option<RunEvent>), JournalError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -185,13 +210,29 @@ impl<'a> RunJournal<'a> {
             expected_last_sequence,
             events,
         )?;
+        let wake = match events.last() {
+            Some(RunEvent::WaitStarted(PendingWait {
+                on: crate::WaitOn::MailboxMessage { .. },
+                ..
+            })) => mailbox::deliver_waiting_message(&tx, self.workspace.agent_id())?,
+            _ => None,
+        };
+        let (sequence, wake) = wake.map_or((sequence, None), |entry| {
+            (entry.sequence, Some(entry.event))
+        });
         tx.commit()?;
         if !events.is_empty()
             && let Some(hook) = self.commit_hook
         {
-            hook(sequence, events);
+            if let Some(woken) = &wake {
+                let mut committed = events.to_vec();
+                committed.push(woken.clone());
+                hook(sequence, &committed);
+            } else {
+                hook(sequence, events);
+            }
         }
-        Ok(sequence)
+        Ok((sequence, wake))
     }
 
     pub(crate) fn recovery_entries(&mut self) -> Result<Vec<JournalEntry>, JournalError> {

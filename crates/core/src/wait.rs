@@ -22,6 +22,11 @@ pub enum WaitOn {
     },
     /// Resume with a message delivered by the host.
     Message,
+    /// Receive the oldest matching message from this run's durable mailbox.
+    MailboxMessage {
+        /// Restrict the wait to this sender. With no filter, accept any sender.
+        from_agent_id: Option<i64>,
+    },
     /// Resume with an external event delivered by the host.
     Webhook,
     /// Resume with a human decision delivered by the host.
@@ -47,6 +52,7 @@ impl WaitOn {
         match self {
             Self::Timer { .. } => "timer",
             Self::Message => "message",
+            Self::MailboxMessage { .. } => "mailbox_message",
             Self::Webhook => "webhook",
             Self::Approval => "approval",
             Self::ToolApproval { .. } => "tool_approval",
@@ -69,7 +75,7 @@ pub struct PendingWait {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WakeEvent {
-    /// A message from another agent.
+    /// A message supplied by the host to resolve an existing message wait.
     Message(JsonValue),
     /// Data from an external webhook.
     Webhook(JsonValue),

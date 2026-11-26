@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use super::{Action, RunError, RunOptions, RunUsage, next_action, validate_calls};
 use crate::context::Compaction;
@@ -208,10 +209,14 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         &mut self,
         events: impl AsRef<[RunEvent]> + IntoIterator<Item = RunEvent>,
     ) -> Result<(), RunError> {
-        if let Some(journal) = &mut self.journal {
-            self.tail = journal.append(self.tail, events.as_ref())?;
-        }
-        for event in events {
+        let mailbox_wake = if let Some(journal) = &mut self.journal {
+            let (sequence, wake) = journal.append_with_mailbox_wake(self.tail, events.as_ref())?;
+            self.tail = sequence;
+            wake
+        } else {
+            None
+        };
+        for event in events.into_iter().chain(mailbox_wake) {
             self.apply(event)?;
         }
         Ok(())
@@ -279,6 +284,24 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                     ));
                 }
                 self.state.messages.push(Message::Tool(result));
+                RunPhase::Ready
+            }
+            (
+                RunPhase::ToolPrepared {
+                    call,
+                    tool_call_key,
+                    ..
+                },
+                RunEvent::MailboxMessageSent {
+                    message_id,
+                    to_agent_id,
+                    ..
+                },
+            ) if call.name != LOADER && message_id == *tool_call_key => {
+                self.state.messages.push(Message::Tool(ToolResult::new(
+                    call.id.clone(),
+                    json!({ "message_id": message_id, "to_agent_id": to_agent_id }),
+                )));
                 RunPhase::Ready
             }
             (RunPhase::Ready, RunEvent::WaitStarted(wait)) => {

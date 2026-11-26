@@ -205,6 +205,13 @@ pub enum RunError {
         name: String,
     },
 
+    /// A non-durable run tried to send a message to another agent.
+    #[error("tool {name} requires a journaled run to send a message")]
+    MessageRequiresJournal {
+        /// The tool that requested the send.
+        name: String,
+    },
+
     /// The host did not grant this run access to the requested tool.
     #[error("tool {name} is not granted to this run")]
     ToolAccessDenied {
@@ -639,6 +646,25 @@ async fn drive(
                             on,
                         };
                         run.commit([RunEvent::WaitStarted(wait)])?;
+                    }
+                    ToolExecution::SendMessage {
+                        to_agent_id,
+                        payload,
+                    } => {
+                        if !durable {
+                            return Err(RunError::MessageRequiresJournal {
+                                name: run.skills.target_name(call).to_owned(),
+                            });
+                        }
+                        let message_id = run
+                            .tool_call_key()
+                            .expect("prepared tool call has a key")
+                            .into();
+                        run.commit([RunEvent::MailboxMessageSent {
+                            message_id,
+                            to_agent_id,
+                            payload,
+                        }])?;
                     }
                 }
             }
