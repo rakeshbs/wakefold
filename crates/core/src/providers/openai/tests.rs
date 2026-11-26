@@ -125,34 +125,33 @@ fn catalog_schema() -> JsonValue {
 }
 
 fn loader_tools() -> JsonValue {
-    json!([{
-        "type": "namespace", "name": "skills", "description": "Tools from the skills skill.",
-        "tools": [{
-            "type": "function", "name": "load",
-            "description": "Load a skill by name to enable its tools on the next turn.\ncatalog: Look up prices",
+    json!([
+        {
+            "type": "function", "name": "load_skill",
+            "description": "Load a skill by name to receive its tool definitions. Use call_tool with a returned tool name and arguments on subsequent turns. Available skills:\ncatalog: Look up prices",
             "parameters": {
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
                 "required": ["name"], "additionalProperties": false
             },
             "strict": false
-        }]
-    }])
-}
-
-fn advertised_tools() -> JsonValue {
-    json!([{
-        "type": "namespace", "name": "catalog", "description": "Tools from the catalog skill.",
-        "tools": [{
-            "type": "function", "name": "lookup_price", "description": "Look up an item price",
-            "parameters": catalog_schema(), "strict": false
-        }]
-    }, loader_tools()[0]])
+        },
+        {
+            "type": "function", "name": "call_tool",
+            "description": "Execute a tool from a loaded skill. Supply its qualified name and arguments matching the schema returned by load_skill.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "arguments": {}},
+                "required": ["name", "arguments"], "additionalProperties": false
+            },
+            "strict": false
+        }
+    ])
 }
 
 fn load_call() -> JsonValue {
     json!({
-        "type": "function_call", "namespace": "skills", "name": "load",
+        "type": "function_call", "name": "load_skill",
         "id": "fc_load", "call_id": "load_catalog", "arguments": r#"{"name":"catalog"}"#,
         "status": "completed"
     })
@@ -164,7 +163,10 @@ fn loaded_transcript() -> Vec<JsonValue> {
         load_call(),
         json!({
             "type": "function_call_output", "call_id": "load_catalog",
-            "output": r#"{"loaded":"catalog"}"#
+            "output": json!({"loaded": "catalog", "tools": [{
+                "name": "catalog.lookup_price", "description": "Look up an item price",
+                "parameters": catalog_schema()
+            }]}).to_string()
         }),
     ]
 }
@@ -211,9 +213,8 @@ fn call() -> JsonValue {
         "type": "function_call",
         "id": "fc_offline",
         "call_id": "call_notebook",
-        "name": "lookup_price",
-        "namespace": "catalog",
-        "arguments": "{\"item\":\"notebook\"}",
+        "name": "call_tool",
+        "arguments": json!({"name": "catalog.lookup_price", "arguments": {"item": "notebook"}}).to_string(),
         "status": "completed"
     })
 }
@@ -255,12 +256,12 @@ async fn streams_function_calls_and_replays_reasoning_at_every_effort() -> Resul
                 },
                 Exchange {
                     input: json!(loaded_transcript()),
-                    tools: Some(advertised_tools()),
+                    tools: Some(loader_tools()),
                     events: vec![terminal_event("completed", output)],
                 },
                 Exchange {
                     input: json!(followup),
-                    tools: Some(advertised_tools()),
+                    tools: Some(loader_tools()),
                     events: vec![
                         text_delta("A notebook ", 0),
                         text_delta("costs $3.50.", 1),

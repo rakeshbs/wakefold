@@ -6,8 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{Action, RunError, RunOptions, RunUsage, next_action, validate_calls};
 use crate::context::Compaction;
-use crate::skill::{LOADER, RunSkills};
-use crate::{CallId, JsonValue, Message, ModelTurn, RunEvent, RunJournal, ToolCall};
+use crate::skill::{LOADER, RunSkills, is_loader};
+use crate::{
+    CallId, JsonValue, Message, ModelResponse, ModelTurn, RunEvent, RunJournal, ToolCall,
+    ToolResult,
+};
 
 /// A durable model-call boundary containing the compacted transcript and run bookkeeping.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,14 +113,74 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
             run.tail = entry.sequence;
         }
         if let Boundary::ToolStarted(call) = &run.boundary
-            && call.name != LOADER
+            && !is_loader(&call.name)
         {
             return Err(RunError::ToolOutcomeUnknown {
                 id: call.id.clone(),
-                name: call.name.clone(),
+                name: run
+                    .skills
+                    .resolve(call)
+                    .map(|(name, _)| name)
+                    .unwrap_or(&call.name)
+                    .to_owned(),
             });
         }
+        run.restore_definitions()?;
         Ok(run)
+    }
+
+    fn restore_definitions(&mut self) -> Result<(), RunError> {
+        // Older checkpoints retained only skill names. Restore ordinary loader
+        // exchanges so their definitions can be replayed and compacted as usual.
+        let mut restored = Vec::new();
+        let mut contexts = Vec::new();
+        for name in self.skills.loaded() {
+            let loader_calls = self
+                .state
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Assistant(response) => Some(response.tool_calls()),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|call| {
+                    is_loader(&call.name) && call.arguments["name"].as_str() == Some(name)
+                })
+                .map(|call| &call.id)
+                .collect::<HashSet<_>>();
+            if self.state.messages.iter().any(|message| {
+                matches!(message,
+                Message::Tool(result) if loader_calls.contains(&result.call_id)
+                    && result.value["loaded"].as_str() == Some(name)
+                    && result.value["tools"].is_array())
+            }) {
+                continue;
+            }
+            let mut index = 0;
+            let mut id = CallId::from(format!("wakefold-load-{index}"));
+            while !self.state.used_call_ids.insert(id.clone()) {
+                index += 1;
+                id = CallId::from(format!("wakefold-load-{index}"));
+            }
+            let value = self
+                .skills
+                .definitions(name)
+                .map_err(|source| RunError::Tool {
+                    name: LOADER.to_owned(),
+                    source,
+                })?;
+            restored.push(Message::Assistant(ModelResponse::ToolCall(ToolCall::new(
+                id.clone(),
+                LOADER,
+                serde_json::json!({"name": name}),
+            ))));
+            restored.push(Message::Tool(ToolResult::new(id, value)));
+            contexts.push(None);
+        }
+        self.state.messages.splice(1..1, restored);
+        self.state.assistant_context.splice(..0, contexts);
+        Ok(())
     }
 
     pub fn compact(
@@ -179,7 +242,7 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
                 Boundary::ToolStarted(call)
             }
             (Boundary::ToolStarted(call), RunEvent::SkillLoaded(name))
-                if call.name == LOADER && call.arguments["name"].as_str() == Some(&name) =>
+                if is_loader(&call.name) && call.arguments["name"].as_str() == Some(&name) =>
             {
                 activate_skill(&mut self.skills, &name)?;
                 return Ok(());
@@ -188,7 +251,7 @@ impl<'a, 'db, 'skills> Driver<'a, 'db, 'skills> {
                 if call.id == result.call_id =>
             {
                 // Earlier journals recorded successful loader calls without a SkillLoaded event.
-                if call.name == LOADER {
+                if is_loader(&call.name) {
                     let name = call.arguments["name"]
                         .as_str()
                         .filter(|name| result.value["loaded"].as_str() == Some(*name))

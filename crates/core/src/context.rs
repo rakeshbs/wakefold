@@ -1,5 +1,6 @@
 //! Summarize older tool exchanges before model requests exceed the context budget.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 
 use crate::{JsonValue, Message, ModelRequest, ModelResponse, ProviderError, RunError};
@@ -21,6 +22,8 @@ pub(crate) struct Compaction<'a> {
     input: Vec<Message>,
     transcript_end: usize,
     assistant_turns: usize,
+    retained_messages: Vec<usize>,
+    retained_context: Vec<usize>,
     retained_bytes: u128,
     limit: usize,
 }
@@ -51,15 +54,36 @@ impl Compaction<'_> {
             });
         }
 
-        messages.splice(
-            1..self.transcript_end,
-            [Message::Summary(summary.to_owned())],
-        );
-        assistant_context.drain(..self.assistant_turns);
+        let retained = self
+            .retained_messages
+            .iter()
+            .map(|&index| messages[index].clone())
+            .chain([Message::Summary(summary.to_owned())])
+            .collect::<Vec<_>>();
+        messages.splice(1..self.transcript_end, retained);
+        let retained = self
+            .retained_context
+            .iter()
+            .map(|&index| assistant_context[index].clone())
+            .collect::<Vec<_>>();
+        assistant_context.splice(..self.assistant_turns, retained);
+        let retained_sizes = self
+            .retained_messages
+            .iter()
+            .map(|&index| self.sizes.messages[index])
+            .chain([summary.len() as u128])
+            .collect::<Vec<_>>();
         self.sizes
             .messages
-            .splice(1..self.transcript_end, [summary.len() as u128]);
-        self.sizes.assistant_context.drain(..self.assistant_turns);
+            .splice(1..self.transcript_end, retained_sizes);
+        let retained_sizes = self
+            .retained_context
+            .iter()
+            .map(|&index| self.sizes.assistant_context[index])
+            .collect::<Vec<_>>();
+        self.sizes
+            .assistant_context
+            .splice(..self.assistant_turns, retained_sizes);
         self.sizes.total = required;
         Ok(())
     }
@@ -94,26 +118,64 @@ impl ContextSizes {
         let mut retained_bytes = self.total;
         let mut assistant_turns = 0;
         let mut candidate = None;
+        let mut loaded = HashSet::new();
+        let mut keep_exchange = false;
+        let mut retained_messages = Vec::new();
+        let mut retained_context = Vec::new();
         for (index, message) in messages.iter().enumerate().skip(1) {
-            if matches!(message, Message::Assistant(_)) {
+            if let Message::Assistant(response) = message {
                 if assistant_turns > 0 && retained_bytes < budget {
                     let instruction = summary_instruction(budget - retained_bytes);
                     if input_bytes + instruction.len() as u128 <= budget {
-                        candidate = Some((index, assistant_turns, retained_bytes, instruction));
+                        candidate = Some((
+                            index,
+                            assistant_turns,
+                            retained_bytes,
+                            instruction,
+                            retained_messages.len(),
+                            retained_context.len(),
+                        ));
                     }
                 }
                 if assistant_turns == latest {
                     break;
                 }
-                retained_bytes -= self.assistant_context[assistant_turns];
+                // Keep the first loader exchange for every skill, including all
+                // calls in a mixed turn so the provider's call/result pairs stay intact.
+                keep_exchange = false;
+                for name in response
+                    .tool_calls()
+                    .iter()
+                    .filter(|call| crate::skill::is_loader(&call.name))
+                    .filter_map(|call| call.arguments["name"].as_str())
+                {
+                    keep_exchange |= loaded.insert(name);
+                }
+                if keep_exchange {
+                    retained_context.push(assistant_turns);
+                } else {
+                    retained_bytes -= self.assistant_context[assistant_turns];
+                }
                 assistant_turns += 1;
             }
             let size = self.messages[index];
             input_bytes += size;
-            retained_bytes -= size;
+            if keep_exchange && !matches!(message, Message::Summary(_)) {
+                retained_messages.push(index);
+            } else {
+                retained_bytes -= size;
+            }
         }
 
-        let Some((transcript_end, assistant_turns, retained_bytes, instruction)) = candidate else {
+        let Some((
+            transcript_end,
+            assistant_turns,
+            retained_bytes,
+            instruction,
+            message_count,
+            context_count,
+        )) = candidate
+        else {
             return Err(RunError::ContextBudgetExceeded {
                 limit,
                 required: self.total,
@@ -121,11 +183,15 @@ impl ContextSizes {
         };
         let mut input = messages[..transcript_end].to_vec();
         input.push(Message::User(instruction));
+        retained_messages.truncate(message_count);
+        retained_context.truncate(context_count);
         Ok(Some(Compaction {
             sizes: self,
             input,
             transcript_end,
             assistant_turns,
+            retained_messages,
+            retained_context,
             retained_bytes,
             limit,
         }))

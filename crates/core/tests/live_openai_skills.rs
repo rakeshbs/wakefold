@@ -10,8 +10,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use wakefold::{
-    JsonValue, ModelRequest, ModelResponse, ModelTurn, OpenAiProvider, Provider, ProviderError,
-    RetryPolicy, RunEvent, RunOptions, Skill, Tool, ToolError, ToolSpec, WorkspaceStore,
+    JsonValue, Message, ModelRequest, ModelResponse, ModelTurn, OpenAiProvider, Provider,
+    ProviderError, RetryPolicy, RunEvent, RunOptions, Skill, Tool, ToolError, ToolSpec,
+    WorkspaceStore,
 };
 
 const PROMPT: &str = "Retrieve the pickup code for order WF-206 from the order records. Reply with just the pickup code.";
@@ -58,7 +59,7 @@ impl Provider for LiveProvider {
         req: ModelRequest<'_>,
         on_text: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<ModelTurn, ProviderError> {
-        if self.stop_after_activation && req.tools.iter().any(|spec| spec.name == "orders.lookup") {
+        if self.stop_after_activation && req.messages.iter().any(|message| matches!(message, Message::Tool(result) if result.value["loaded"] == "orders")) {
             std::process::exit(73);
         }
         self.inner.complete_turn(req, on_text).await
@@ -97,7 +98,7 @@ async fn drive(state: &Path, stop_after_activation: bool) -> Result<String, Box<
             .count(),
         1
     );
-    assert_eq!(entries.iter().filter(|entry| matches!(&entry.event, RunEvent::ToolCallStarted(call) if call.name == "orders.lookup")).count(), 1);
+    assert_eq!(entries.iter().filter(|entry| matches!(&entry.event, RunEvent::ToolCallStarted(call) if call.name == "call_tool" && call.arguments["name"] == "orders.lookup")).count(), 1);
     Ok(report.answer)
 }
 

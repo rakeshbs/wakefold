@@ -2,16 +2,36 @@
 
 use serde_json::json;
 use wakefold::testing::ScriptedTurn;
-use wakefold::{Message, ModelResponse, TokenUsage, ToolCall, ToolResult};
+use wakefold::{JsonValue, Message, ModelResponse, TokenUsage, ToolCall, ToolResult, ToolSpec};
 
-pub fn load_skill(user: &Message, name: &str) -> (ScriptedTurn, Vec<Message>) {
-    let call = ModelResponse::ToolCall(ToolCall::new("load", "skills.load", json!({"name": name})));
+pub fn load_skill(user: &Message, name: &str, tools: &[ToolSpec]) -> (ScriptedTurn, Vec<Message>) {
+    let call = ModelResponse::ToolCall(ToolCall::new("load", "load_skill", json!({"name": name})));
     let turn =
         ScriptedTurn::new(vec![user.clone()], call.clone()).with_usage(TokenUsage::default());
     let messages = vec![
         user.clone(),
         Message::Assistant(call),
-        Message::Tool(ToolResult::new("load", json!({"loaded": name}))),
+        Message::Tool(ToolResult::new("load", definitions(name, tools))),
     ];
     (turn, messages)
+}
+
+pub fn definitions(name: &str, tools: &[ToolSpec]) -> JsonValue {
+    let tools = tools
+        .iter()
+        .cloned()
+        .map(|mut spec| {
+            spec.name = format!("{name}.{}", spec.name);
+            spec
+        })
+        .collect::<Vec<_>>();
+    json!({"loaded": name, "tools": tools})
+}
+
+pub fn call_tool(id: &str, name: &str, arguments: JsonValue) -> ToolCall {
+    ToolCall::new(
+        id,
+        "call_tool",
+        json!({"name": name, "arguments": arguments}),
+    )
 }

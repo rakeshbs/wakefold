@@ -11,7 +11,7 @@ use serde_json::json;
 use wakefold::testing::{ScriptedProvider, ScriptedTurn};
 use wakefold::{
     CancellationToken, JsonValue, Message, ModelRequest, ModelResponse, Provider, ProviderError,
-    RunError, RunOptions, Skill, Tool, ToolCall, ToolContext, ToolError, ToolSpec,
+    RunError, RunOptions, Skill, Tool, ToolContext, ToolError, ToolSpec,
     run_streaming_with_options, run_with_options,
 };
 
@@ -121,13 +121,13 @@ impl Tool for PendingTool {
     }
 }
 
-fn scripted_tool_call(prompt: &str, name: &str) -> ScriptedProvider {
-    let (load, messages) = common::load_skill(&Message::User(prompt.to_owned()), "util");
+fn scripted_tool_call(prompt: &str, name: &str, spec: ToolSpec) -> ScriptedProvider {
+    let (load, messages) = common::load_skill(&Message::User(prompt.to_owned()), "util", &[spec]);
     ScriptedProvider::new([
         load,
         ScriptedTurn::new(
             messages,
-            ModelResponse::ToolCall(ToolCall::new("call-1", name, json!({}))),
+            ModelResponse::ToolCall(common::call_tool("call-1", name, json!({}))),
         ),
     ])
 }
@@ -135,7 +135,7 @@ fn scripted_tool_call(prompt: &str, name: &str) -> ScriptedProvider {
 #[test]
 fn in_flight_tool_can_observe_cancellation_before_it_is_dropped() {
     let prompt = "Wait for an event";
-    let provider = scripted_tool_call(prompt, "util.wait");
+    let provider = scripted_tool_call(prompt, "util.wait", PendingTool::default().spec());
     let tool = PendingTool::default();
     let tools: [&dyn Tool; 1] = [&tool];
     let skills = [Skill::new("util", "Utility tools", &tools)];
@@ -169,7 +169,6 @@ fn typed_tool_receives_the_run_cancellation_signal() {
     struct Stop {}
 
     let prompt = "Stop the current run";
-    let provider = scripted_tool_call(prompt, "util.stop");
     let cancellation = CancellationToken::new();
     let options = RunOptions::new(3).with_cancellation(cancellation.clone());
     let tool = typed_tool_with_context(|_input: Stop, context| async move {
@@ -180,6 +179,7 @@ fn typed_tool_receives_the_run_cancellation_signal() {
         Ok(json!({}))
     });
 
+    let provider = scripted_tool_call(prompt, "util.stop", tool.spec());
     let result = block_on(run_with_options(
         prompt,
         &provider,

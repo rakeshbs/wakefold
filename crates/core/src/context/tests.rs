@@ -116,3 +116,88 @@ fn an_oversized_current_exchange_cannot_be_compacted() {
         Err(RunError::ContextBudgetExceeded { limit: 100, required }) if required > 500
     ));
 }
+
+#[test]
+fn repeated_compaction_preserves_loaded_schemas_and_mixed_call_turns() -> Result<(), RunError> {
+    let tools = json!([{
+        "name": "notes.write", "description": "Write a note",
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+    }]);
+    let loader = [
+        Message::Assistant(ModelResponse::ToolCall(ToolCall::new(
+            "load-notes",
+            "load_skill",
+            json!({"name": "notes"}),
+        ))),
+        Message::Tool(ToolResult::new(
+            "load-notes",
+            json!({"loaded": "notes", "tools": tools}),
+        )),
+    ];
+    let mixed = [
+        Message::Assistant(ModelResponse::ToolCalls {
+            text: None,
+            calls: vec![
+                ToolCall::new("load-math", "load_skill", json!({"name": "math"})),
+                ToolCall::new(
+                    "write",
+                    "call_tool",
+                    json!({"name": "notes.write", "arguments": {"text": "saved"}}),
+                ),
+            ],
+        }),
+        Message::Tool(ToolResult::new(
+            "load-math",
+            json!({"loaded": "math", "tools": []}),
+        )),
+        Message::Tool(ToolResult::new("write", json!("saved"))),
+    ];
+    let mut messages = vec![Message::User("Keep the notes.".into())];
+    messages.extend(loader.clone());
+    messages.extend([
+        Message::Assistant(ModelResponse::ToolCall(ToolCall::new(
+            "reload-notes",
+            "load_skill",
+            json!({"name": "notes"}),
+        ))),
+        Message::Tool(ToolResult::new(
+            "reload-notes",
+            json!({"loaded": "notes", "tools": tools}),
+        )),
+    ]);
+    messages.extend(tool_turn("old", "x".repeat(250)));
+    messages.extend(mixed.clone());
+    messages.extend(tool_turn("current", "y".repeat(500)));
+    let mut context = vec![
+        Some(json!("notes")),
+        Some(json!("reloaded")),
+        Some(json!("old")),
+        Some(json!("math")),
+        Some(json!("current")),
+    ];
+    let mut sizes = ContextSizes::default();
+
+    for id in ["next", "last"] {
+        let measured = messages.iter().map(message_bytes).sum::<u128>()
+            + context.iter().flatten().map(json_bytes).sum::<u128>();
+        let limit = usize::try_from(measured - 100).unwrap();
+        let compaction = sizes
+            .prepare(&messages, &context, limit)?
+            .expect("older task history can be summarized");
+        compaction.apply(
+            ModelResponse::Final("Notes saved.".into()),
+            &mut messages,
+            &mut context,
+        )?;
+        assert_eq!(&messages[1..3], &loader);
+        assert_eq!(&messages[3..6], &mixed);
+        assert_eq!(&context[..2], &[Some(json!("notes")), Some(json!("math"))]);
+        let measured = messages.iter().map(message_bytes).sum::<u128>()
+            + context.iter().flatten().map(json_bytes).sum::<u128>();
+        assert_eq!(sizes.total, measured);
+        assert!(measured <= limit as u128);
+        messages.extend(tool_turn(id, "z".repeat(700)));
+        context.push(None);
+    }
+    Ok(())
+}

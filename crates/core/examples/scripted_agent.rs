@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 use wakefold::testing::{ScriptedProvider, ScriptedTurn};
 use wakefold::{
-    JsonValue, Message, ModelResponse, RunError, RunOptions, RunReport, Skill, TokenUsage,
+    JsonValue, Message, ModelResponse, RunError, RunOptions, RunReport, Skill, TokenUsage, Tool,
     ToolCall, ToolError, ToolResult, WakefoldTool, run_with_options, typed_tool,
 };
 
@@ -49,6 +49,13 @@ async fn calculate_total(input: CalculateTotal) -> Result<JsonValue, ToolError> 
 }
 
 fn notebook_total() -> Result<RunReport, RunError> {
+    let lookup_tool = typed_tool(lookup_price);
+    let total_tool = typed_tool(calculate_total);
+    let mut definitions = vec![lookup_tool.spec(), total_tool.spec()];
+    for spec in &mut definitions {
+        spec.name = format!("pricing.{}", spec.name);
+    }
+    let loaded = json!({"loaded": "pricing", "tools": definitions});
     let prompt = "What do three notebooks cost?";
     let user = Message::User(prompt.to_owned());
     let lookup = ModelResponse::ToolCalls {
@@ -57,8 +64,8 @@ fn notebook_total() -> Result<RunReport, RunError> {
         )),
         calls: vec![ToolCall::new(
             "price-1",
-            "pricing.lookup_price",
-            json!({"item": "notebook"}),
+            "call_tool",
+            json!({"name": "pricing.lookup_price", "arguments": {"item": "notebook"}}),
         )],
     };
     let calculate = ModelResponse::ToolCalls {
@@ -69,28 +76,25 @@ fn notebook_total() -> Result<RunReport, RunError> {
         ))),
         calls: vec![ToolCall::new(
             "total-1",
-            "pricing.calculate_total",
-            json!({"unit_price_cents": 350, "quantity": 3}),
+            "call_tool",
+            json!({"name": "pricing.calculate_total", "arguments": {"unit_price_cents": 350, "quantity": 3}}),
         )],
     };
 
     let load = ModelResponse::ToolCall(ToolCall::new(
         "load-1",
-        "skills.load",
+        "load_skill",
         json!({"name": "pricing"}),
     ));
-    let load_turn =
-        ScriptedTurn::new(vec![user.clone()], load.clone()).with_tools(&["skills.load"]);
-    let loaded_tools = [
-        "skills.load",
-        "pricing.lookup_price",
-        "pricing.calculate_total",
-    ];
+    let load_turn = ScriptedTurn::new(vec![user.clone()], load.clone())
+        .with_tools(&["load_skill", "call_tool"]);
+    let loaded_tools = ["load_skill", "call_tool"];
     let mut earlier = vec![
         user.clone(),
         Message::Assistant(load),
-        Message::Tool(ToolResult::new("load-1", json!({"loaded": "pricing"}))),
+        Message::Tool(ToolResult::new("load-1", loaded)),
     ];
+    let pinned = earlier[1..].to_vec();
     let lookup_turn = ScriptedTurn::new(earlier.clone(), lookup.clone()).with_tools(&loaded_tools);
     earlier.push(Message::Assistant(lookup));
     earlier.push(Message::Tool(ToolResult::new(
@@ -111,13 +115,15 @@ fn notebook_total() -> Result<RunReport, RunError> {
     let summary = String::from("Catalog lookup confirmed 350 cents per notebook.");
     let summary_turn = ScriptedTurn::new(summary_request, ModelResponse::Final(summary.clone()))
         .with_usage(TokenUsage::new(80, 12));
+    let mut final_messages = vec![user];
+    final_messages.extend(pinned);
+    final_messages.extend([
+        Message::Summary(summary),
+        Message::Assistant(calculate),
+        Message::Tool(ToolResult::new("total-1", json!({"total_cents": 1050}))),
+    ]);
     let final_turn = ScriptedTurn::new(
-        vec![
-            user,
-            Message::Summary(summary),
-            Message::Assistant(calculate),
-            Message::Tool(ToolResult::new("total-1", json!({"total_cents": 1050}))),
-        ],
+        final_messages,
         ModelResponse::Final(String::from("Three notebooks cost $10.50.")),
     )
     .with_tools(&loaded_tools);
@@ -129,9 +135,7 @@ fn notebook_total() -> Result<RunReport, RunError> {
         summary_turn,
         final_turn,
     ]);
-    let lookup_tool = typed_tool(lookup_price);
-    let total_tool = typed_tool(calculate_total);
-    let options = RunOptions::new(4).with_context_budget(440);
+    let options = RunOptions::new(4).with_context_budget(1260);
     block_on(run_with_options(
         prompt,
         &provider,

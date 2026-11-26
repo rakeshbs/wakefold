@@ -40,14 +40,64 @@ impl Tool for WriteNote {
     }
 }
 
+struct ReadNote;
+
+#[async_trait]
+impl Tool for ReadNote {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new("read", "Read the note", json!({"type": "object"}))
+    }
+
+    async fn call(&self, _: &JsonValue) -> Result<JsonValue, ToolError> {
+        panic!("expected the run workspace")
+    }
+
+    async fn call_with_context(
+        &self,
+        ctx: ToolContext,
+        _: &JsonValue,
+    ) -> Result<JsonValue, ToolError> {
+        let workspace = ctx.workspace().unwrap();
+        let path = workspace
+            .root()
+            .join(workspace.agent_directory())
+            .join("note.txt");
+        fs::read(path).unwrap();
+        Ok(json!("read"))
+    }
+}
+
+fn definitions() -> JsonValue {
+    let mut specs = vec![WriteNote.spec(), ReadNote.spec()];
+    for spec in &mut specs {
+        spec.name = format!("notes.{}", spec.name);
+    }
+    json!({"loaded": "notes", "tools": specs})
+}
+
 fn load(id: &str) -> ModelResponse {
-    ModelResponse::ToolCall(ToolCall::new(id, "skills.load", json!({"name": "notes"})))
+    ModelResponse::ToolCall(ToolCall::new(id, "load_skill", json!({"name": "notes"})))
 }
 
 fn write_note() -> ModelResponse {
     ModelResponse::ToolCalls {
         text: Some("x".repeat(200)),
-        calls: vec![ToolCall::new("write", "notes.write", json!({}))],
+        calls: vec![ToolCall::new(
+            "write",
+            "call_tool",
+            json!({"name": "notes.write", "arguments": {}}),
+        )],
+    }
+}
+
+fn read_note(id: &str) -> ModelResponse {
+    ModelResponse::ToolCalls {
+        text: Some("y".repeat(500)),
+        calls: vec![ToolCall::new(
+            id,
+            "call_tool",
+            json!({"name": "notes.read", "arguments": {}}),
+        )],
     }
 }
 
@@ -68,9 +118,16 @@ impl Provider for BeforeRestart {
             ModelResponse::Final(SUMMARY.into())
         } else if req.messages.len() == 1 {
             load("load")
-        } else if matches!(req.messages.get(1), Some(Message::Summary(_))) {
+        } else if req
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Summary(_)))
+        {
             // The checkpoint and next request are already committed. Skip all destructors.
             std::process::exit(73);
+        } else if matches!(req.messages.last(), Some(Message::Tool(result)) if result.value == "written")
+        {
+            read_note("read")
         } else {
             write_note()
         };
@@ -90,30 +147,47 @@ impl Provider for AfterRestart {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            ["skills.load", "notes.write"]
+            ["load_skill", "call_tool"]
         );
-        assert_eq!(
-            req.messages,
-            &[
-                Message::User(PROMPT.into()),
-                Message::Summary(SUMMARY.into()),
-                Message::Assistant(write_note()),
-                Message::Tool(wakefold::ToolResult::new("write", json!("written"))),
-            ]
-        );
-        assert_eq!(req.assistant_context, &[Some(json!("ctx"))]);
+        if matches!(req.messages.last(), Some(Message::Tool(result)) if result.call_id == "read".into())
+        {
+            assert_eq!(
+                req.messages,
+                &[
+                    Message::User(PROMPT.into()),
+                    Message::Assistant(load("load")),
+                    Message::Tool(wakefold::ToolResult::new("load", definitions())),
+                    Message::Summary(SUMMARY.into()),
+                    Message::Assistant(read_note("read")),
+                    Message::Tool(wakefold::ToolResult::new("read", json!("read"))),
+                ]
+            );
+            assert_eq!(
+                req.assistant_context,
+                &[Some(json!("ctx")), Some(json!("ctx"))]
+            );
+            return Ok(read_note("after-restart"));
+        }
         Ok(ModelResponse::Final("done".into()))
     }
 }
 
-fn run_note(path: &Path, provider: &dyn Provider) -> Result<wakefold::RunReport, RunError> {
+fn run_note(
+    path: &Path,
+    provider: &dyn Provider,
+    budget: usize,
+) -> Result<wakefold::RunReport, RunError> {
     let mut store = WorkspaceStore::open(path).unwrap();
     let mut journal = store.open_journal("chat", "notes").unwrap();
     block_on(journal.run(
         PROMPT,
         provider,
-        &[Skill::new("notes", "Manage notes", &[&WriteNote])],
-        RunOptions::new(3).with_context_budget(265),
+        &[Skill::new(
+            "notes",
+            "Manage notes",
+            &[&WriteNote, &ReadNote],
+        )],
+        RunOptions::new(5).with_context_budget(budget),
     ))
 }
 
@@ -122,7 +196,7 @@ fn process_restart_restores_loaded_tools_after_compaction() {
     if let Some(path) = std::env::var_os(CHILD_STATE) {
         panic!(
             "expected process exit during next model request, got {:?}",
-            run_note(Path::new(&path), &BeforeRestart)
+            run_note(Path::new(&path), &BeforeRestart, 1000)
         );
     }
     let dir = tempfile::tempdir().unwrap();
@@ -136,11 +210,11 @@ fn process_restart_restores_loaded_tools_after_compaction() {
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(73));
-    let report = run_note(dir.path(), &AfterRestart).unwrap();
+    let report = run_note(dir.path(), &AfterRestart, 2000).unwrap();
     assert_eq!(report.answer, "done");
-    assert_eq!(report.usage.reported, TokenUsage::new(6, 3));
-    assert_eq!(report.usage.unreported_turns, 1);
-    assert_eq!(run_note(dir.path(), &NoCalls).unwrap(), report);
+    assert_eq!(report.usage.reported, TokenUsage::new(8, 4));
+    assert_eq!(report.usage.unreported_turns, 2);
+    assert_eq!(run_note(dir.path(), &NoCalls, 2000).unwrap(), report);
 
     let mut store = WorkspaceStore::open(dir.path()).unwrap();
     let entries = store
@@ -187,7 +261,7 @@ impl Provider for LoadTwice {
                         .iter()
                         .map(|tool| tool.name.as_str())
                         .collect::<Vec<_>>(),
-                    ["skills.load", "notes.write"]
+                    ["load_skill", "call_tool"]
                 );
                 Ok(ModelResponse::Final("done".into()))
             }
@@ -285,7 +359,11 @@ fn interrupted_application_tool_is_never_dispatched_again() {
 fn resumes_a_saved_tool_request_from_an_earlier_journal_without_a_checkpoint() {
     // Existing journals may have only the loader's successful ToolCallCompleted.
     let dir = tempfile::tempdir().unwrap();
-    let loader = load("first");
+    let loader = ModelResponse::ToolCall(ToolCall::new(
+        "first",
+        "skills.load",
+        json!({"name": "notes"}),
+    ));
     {
         let mut store = WorkspaceStore::open(dir.path()).unwrap();
         store
@@ -303,7 +381,10 @@ fn resumes_a_saved_tool_request_from_an_earlier_journal_without_a_checkpoint() {
                         json!({"loaded": "notes"}),
                     )),
                     RunEvent::ModelCallRequested,
-                    RunEvent::ModelCallCompleted(ModelTurn::new(write_note(), None)),
+                    RunEvent::ModelCallCompleted(ModelTurn::new(
+                        ModelResponse::ToolCall(ToolCall::new("write", "notes.write", json!({}))),
+                        None,
+                    )),
                 ],
             )
             .unwrap();
@@ -320,7 +401,7 @@ fn resumes_a_saved_tool_request_from_an_earlier_journal_without_a_checkpoint() {
                     .iter()
                     .map(|s| s.name.as_str())
                     .collect::<Vec<_>>(),
-                ["skills.load", "notes.write"]
+                ["load_skill", "call_tool"]
             );
             Ok(ModelResponse::Final("saved".into()))
         }
@@ -328,34 +409,79 @@ fn resumes_a_saved_tool_request_from_an_earlier_journal_without_a_checkpoint() {
     let mut store = WorkspaceStore::open(dir.path()).unwrap();
     let mut journal = store.open_journal("chat", "old").unwrap();
     let skills = [Skill::new("notes", "Manage notes", &[&WriteNote])];
-    // Include the recovered loader exchange and the newly completed write.
-    let loader_bytes = concat!(
-        "first",
-        "skills.load",
-        r#"{"name":"notes"}"#,
-        "first",
-        r#"{"loaded":"notes"}"#
-    )
-    .len();
-    let write_bytes = 200 + concat!("write", "notes.write", "{}", "write", r#""written""#).len();
-    let required = PROMPT.len() + loader_bytes + write_bytes;
     let result = block_on(journal.run(
         PROMPT,
         &NoCalls,
         &skills,
         RunOptions::new(3).with_context_budget(1),
     ));
-    assert!(matches!(result,
-        Err(RunError::ContextBudgetExceeded { required: bytes, .. }) if bytes == required as u128
-    ));
+    let Err(RunError::ContextBudgetExceeded { required, .. }) = result else {
+        panic!("expected context to include restored definitions, got {result:?}");
+    };
     let report = block_on(journal.run(
         PROMPT,
         &Finish,
         &skills,
-        RunOptions::new(3).with_context_budget(required),
+        RunOptions::new(3).with_context_budget(required.try_into().unwrap()),
     ))
     .unwrap();
     assert_eq!(report.answer, "saved");
+}
+
+#[test]
+fn an_older_checkpoint_restores_definitions_before_dispatching() {
+    struct Resume;
+    #[async_trait]
+    impl Provider for Resume {
+        async fn complete(&self, req: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
+            assert_eq!(
+                req.tools
+                    .iter()
+                    .map(|spec| spec.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["load_skill", "call_tool"]
+            );
+            let Message::Tool(result) = &req.messages[2] else {
+                panic!("restored loader definitions should follow the prompt");
+            };
+            assert_eq!(result.call_id, "wakefold-load-1".into());
+            assert_eq!(result.value["tools"][0]["name"], "notes.write");
+            assert_eq!(
+                result.value["tools"][0]["parameters"],
+                WriteNote.spec().parameters
+            );
+            if matches!(req.messages.last(), Some(Message::Tool(result)) if result.value == "written")
+            {
+                return Ok(ModelResponse::Final("saved".into()));
+            }
+            Ok(write_note())
+        }
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let mut store = WorkspaceStore::open(state.path()).unwrap();
+    let mut journal = store.open_journal("chat", "old-checkpoint").unwrap();
+    let checkpoint = serde_json::from_value(json!({
+        "state": {
+            "messages": [Message::User(PROMPT.into()), Message::Summary("Notes loaded.".into())],
+            "assistant_context": [],
+            "used_call_ids": ["wakefold-load-0"],
+            "model_turns": 1,
+            "usage": wakefold::RunUsage::default()
+        },
+        "loaded_skills": ["notes"]
+    }))
+    .unwrap();
+    journal
+        .append(0, &[RunEvent::Compacted(checkpoint)])
+        .unwrap();
+    let skills = [Skill::new("notes", "Manage notes", &[&WriteNote])];
+    let report = block_on(journal.run(PROMPT, &Resume, &skills, RunOptions::new(3))).unwrap();
+    assert_eq!(report.answer, "saved");
+    assert_eq!(
+        block_on(journal.run(PROMPT, &NoCalls, &skills, RunOptions::new(3))).unwrap(),
+        report
+    );
 }
 
 #[test]

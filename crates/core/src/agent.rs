@@ -57,8 +57,8 @@ impl RunOptions {
     /// The budget counts message text, tool call IDs and names, and compact
     /// JSON for tool arguments, results, and provider context. When needed,
     /// the model summarizes older exchanges in a separate request. The
-    /// original prompt and latest exchange are kept. Summary requests count
-    /// toward token usage and have one opportunity per agent turn.
+    /// original prompt, loaded tool definitions, and latest exchange are kept.
+    /// Summary requests count toward token usage and have one opportunity per agent turn.
     pub fn with_context_budget(mut self, max_bytes: usize) -> Self {
         self.context_budget = Some(max_bytes);
         self
@@ -252,8 +252,8 @@ pub enum RunError {
 
 /// Run a single agent until it returns a final answer or reaches a limit.
 ///
-/// The model sees a description of each supplied skill and calls `skills.load`
-/// to activate its tools on subsequent turns.
+/// The model sees the fixed `load_skill` and `call_tool` functions. It calls `load_skill`
+/// to receive its tool definitions, then uses `call_tool` to execute them.
 ///
 /// If the last allowed model turn requests tools, the run stops before
 /// executing them because no follow-up turn remains.
@@ -458,7 +458,12 @@ async fn drive(
                 let events = await_cancellable(run.skills.call(call, context), cancellation)
                     .await?
                     .map_err(|source| RunError::Tool {
-                        name: call.name.clone(),
+                        name: run
+                            .skills
+                            .resolve(call)
+                            .map(|(name, _)| name)
+                            .unwrap_or(&call.name)
+                            .to_owned(),
                         source,
                     })?;
                 run.commit(events)?;
@@ -529,11 +534,7 @@ fn validate_calls(
     skills: &RunSkills<'_>,
 ) -> Result<(), RunError> {
     for call in calls {
-        if !skills.can_call(&call.name) {
-            return Err(RunError::UnknownTool {
-                name: call.name.clone(),
-            });
-        }
+        skills.validate_call(call)?;
         if !used_call_ids.insert(call.id.clone()) {
             return Err(RunError::DuplicateCallId {
                 id: call.id.clone(),

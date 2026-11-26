@@ -36,7 +36,7 @@ impl fmt::Display for CallId {
 }
 
 /// A registered tool and the shape of its accepted arguments.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ToolSpec {
     /// Name used by the provider to request the tool.

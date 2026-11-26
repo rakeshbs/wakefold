@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use wakefold::testing::{ScriptedProvider, ScriptedTurn};
 use wakefold::{
-    Message, ModelResponse, RunOptions, RunWorkspace, Skill, ToolCall, ToolContext, ToolError,
+    Message, ModelResponse, RunOptions, RunWorkspace, Skill, Tool, ToolContext, ToolError,
     ToolResult, WakefoldTool, WorkspaceStore, run_with_options, typed_tool_with_context,
 };
 
@@ -37,9 +37,9 @@ fn run_note_tool(workspace: RunWorkspace, read_from: Option<&Path>) {
     let user = Message::User("use the note".into());
     let response = ModelResponse::ToolCalls {
         text: None,
-        calls: vec![ToolCall::new("1", "notes.note", json!({}))],
+        calls: vec![common::call_tool("1", "notes.note", json!({}))],
     };
-    let (load, mut messages) = common::load_skill(&user, "notes");
+    let (load, mut messages) = common::load_skill(&user, "notes", &[tool.spec()]);
     let note = ScriptedTurn::new(messages.clone(), response.clone());
     messages.push(Message::Assistant(response));
     messages.push(Message::Tool(ToolResult::new("1", json!(CONTENT))));

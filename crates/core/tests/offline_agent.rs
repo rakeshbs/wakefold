@@ -33,8 +33,8 @@ fn returns_the_tool_result_and_accumulates_usage_across_turns() -> Result<(), Ru
     let prompt = "Echo the value";
     let user = Message::User(prompt.to_owned());
     let args = json!({"value": 42});
-    let call = ModelResponse::ToolCall(ToolCall::new("call-1", "util.echo", args.clone()));
-    let (load, mut messages) = common::load_skill(&user, "util");
+    let call = ModelResponse::ToolCall(common::call_tool("call-1", "util.echo", args.clone()));
+    let (load, mut messages) = common::load_skill(&user, "util", &[Echo::default().spec()]);
     let call_turn =
         ScriptedTurn::new(messages.clone(), call.clone()).with_usage(TokenUsage::new(20, 5));
     messages.push(Message::Assistant(call.clone()));
@@ -86,7 +86,11 @@ fn stops_before_running_a_tool_when_no_follow_up_turn_remains() {
     let prompt = "Echo the value";
     let provider = ScriptedProvider::new([ScriptedTurn::new(
         vec![Message::User(prompt.to_owned())],
-        ModelResponse::ToolCall(ToolCall::new("call-1", "util.echo", json!({"value": 42}))),
+        ModelResponse::ToolCall(common::call_tool(
+            "call-1",
+            "util.echo",
+            json!({"value": 42}),
+        )),
     )]);
     let tool = Echo::default();
 
@@ -109,8 +113,8 @@ fn rejects_a_repeated_call_id_without_running_the_tool_again() {
     let prompt = "Echo the value";
     let user = Message::User(prompt.to_owned());
     let args = json!({"value": 42});
-    let call = ModelResponse::ToolCall(ToolCall::new("repeated", "util.echo", args.clone()));
-    let (load, mut messages) = common::load_skill(&user, "util");
+    let call = ModelResponse::ToolCall(common::call_tool("repeated", "util.echo", args.clone()));
+    let (load, mut messages) = common::load_skill(&user, "util", &[Echo::default().spec()]);
     let call_turn = ScriptedTurn::new(messages.clone(), call.clone());
     messages.push(Message::Assistant(call.clone()));
     messages.push(Message::Tool(ToolResult::new("repeated", args)));
@@ -136,7 +140,7 @@ fn rejects_a_tool_from_an_unloaded_skill() {
     let prompt = "Echo the value";
     let provider = ScriptedProvider::new([ScriptedTurn::new(
         vec![Message::User(prompt.to_owned())],
-        ModelResponse::ToolCall(ToolCall::new("call-1", "util.echo", json!({}))),
+        ModelResponse::ToolCall(common::call_tool("call-1", "util.echo", json!({}))),
     )]);
     let tool = Echo::default();
 
@@ -159,7 +163,11 @@ fn stops_before_a_tool_or_follow_up_when_usage_reaches_the_budget() {
     let prompt = "Echo the value";
     let turn = ScriptedTurn::new(
         vec![Message::User(prompt.to_owned())],
-        ModelResponse::ToolCall(ToolCall::new("call-1", "util.echo", json!({"value": 42}))),
+        ModelResponse::ToolCall(common::call_tool(
+            "call-1",
+            "util.echo",
+            json!({"value": 42}),
+        )),
     )
     .with_usage(TokenUsage::new(92, 8));
 
@@ -203,7 +211,11 @@ fn budgeted_run_stops_when_a_tool_turn_has_no_usage_report() {
     let prompt = "Echo the value";
     let provider = ScriptedProvider::new([ScriptedTurn::new(
         vec![Message::User(prompt.to_owned())],
-        ModelResponse::ToolCall(ToolCall::new("call-1", "util.echo", json!({"value": 42}))),
+        ModelResponse::ToolCall(common::call_tool(
+            "call-1",
+            "util.echo",
+            json!({"value": 42}),
+        )),
     )]);
     let tool = Echo::default();
     let options = RunOptions::new(2).with_token_budget(100);
@@ -227,8 +239,8 @@ fn budgeted_run_stops_when_a_tool_turn_has_no_usage_report() {
 fn reported_zero_allows_continuation_and_missing_final_usage_is_counted() -> Result<(), RunError> {
     let prompt = "Echo an empty object";
     let user = Message::User(prompt.to_owned());
-    let call = ModelResponse::ToolCall(ToolCall::new("call-1", "util.echo", json!({})));
-    let (load, mut messages) = common::load_skill(&user, "util");
+    let call = ModelResponse::ToolCall(common::call_tool("call-1", "util.echo", json!({})));
+    let (load, mut messages) = common::load_skill(&user, "util", &[Echo::default().spec()]);
     let call_turn =
         ScriptedTurn::new(messages.clone(), call.clone()).with_usage(TokenUsage::default());
     messages.push(Message::Assistant(call.clone()));
@@ -279,17 +291,18 @@ fn compacted_tool_call_ids_still_reject_duplicates() {
     let prompt = "Echo twice.";
     let user = Message::User(String::from(prompt));
     let args = json!({"value": 42});
-    let first_call = ToolCall::new("first", "util.echo", args.clone());
+    let first_call = common::call_tool("first", "util.echo", args.clone());
     let first_turn = ModelResponse::ToolCalls {
         text: Some("a".repeat(30)),
         calls: vec![first_call.clone()],
     };
     let second_turn = ModelResponse::ToolCalls {
-        text: Some("b".repeat(200)),
-        calls: vec![ToolCall::new("second", "util.echo", args.clone())],
+        text: Some("b".repeat(600)),
+        calls: vec![common::call_tool("second", "util.echo", args.clone())],
     };
-    let (load, mut first_exchange) = common::load_skill(&user, "util");
+    let (load, mut first_exchange) = common::load_skill(&user, "util", &[Echo::default().spec()]);
     let first_request = first_exchange.clone();
+    let pinned = first_exchange[1..].to_vec();
     first_exchange.push(Message::Assistant(first_turn.clone()));
     first_exchange.push(Message::Tool(ToolResult::new("first", args.clone())));
     let mut summary_input = first_exchange.clone();
@@ -299,20 +312,19 @@ fn compacted_tool_call_ids_still_reject_duplicates() {
         "Return only the summary, up to 64 UTF-8 bytes."
     ))));
     let summary = String::from("First echo returned 42.");
+    let mut compacted = vec![user];
+    compacted.extend(pinned);
+    compacted.extend([
+        Message::Summary(summary.clone()),
+        Message::Assistant(second_turn.clone()),
+        Message::Tool(ToolResult::new("second", args.clone())),
+    ]);
     let provider = ScriptedProvider::new([
         load,
         ScriptedTurn::new(first_request, first_turn),
         ScriptedTurn::new(first_exchange, second_turn.clone()),
         ScriptedTurn::new(summary_input, ModelResponse::Final(summary.clone())),
-        ScriptedTurn::new(
-            vec![
-                user,
-                Message::Summary(summary),
-                Message::Assistant(second_turn),
-                Message::Tool(ToolResult::new("second", args)),
-            ],
-            ModelResponse::ToolCall(first_call),
-        ),
+        ScriptedTurn::new(compacted, ModelResponse::ToolCall(first_call)),
     ]);
     let tool = Echo::default();
 
@@ -320,7 +332,7 @@ fn compacted_tool_call_ids_still_reject_duplicates() {
         prompt,
         &provider,
         &[Skill::new("util", "Utility tools", &[&tool])],
-        RunOptions::new(5).with_context_budget(320),
+        RunOptions::new(5).with_context_budget(902),
     ));
 
     assert!(
@@ -333,22 +345,22 @@ fn compacted_tool_call_ids_still_reject_duplicates() {
 #[test]
 fn loading_twice_exposes_only_one_copy_and_leaves_other_skills_unloaded() -> Result<(), RunError> {
     let user = Message::User("Use the echo skill".into());
-    let (load, mut messages) = common::load_skill(&user, "first");
-    let loaded_tools = ["skills.load", "first.echo"];
+    let (load, mut messages) = common::load_skill(&user, "first", &[Echo::default().spec()]);
+    let loaded_tools = ["load_skill", "call_tool"];
     let again = ModelResponse::ToolCall(ToolCall::new(
         "again",
-        "skills.load",
+        "load_skill",
         json!({"name": "first"}),
     ));
     let repeat = ScriptedTurn::new(messages.clone(), again.clone()).with_tools(&loaded_tools);
     messages.push(Message::Assistant(again));
     messages.push(Message::Tool(ToolResult::new(
         "again",
-        json!({"loaded": "first"}),
+        common::definitions("first", &[Echo::default().spec()]),
     )));
     let done =
         ScriptedTurn::new(messages, ModelResponse::Final("done".into())).with_tools(&loaded_tools);
-    let provider = ScriptedProvider::new([load.with_tools(&["skills.load"]), repeat, done]);
+    let provider = ScriptedProvider::new([load.with_tools(&loaded_tools), repeat, done]);
     let first = Echo::default();
     let second = Echo::default();
     let answer = block_on(run(
@@ -372,8 +384,8 @@ fn a_load_and_premature_tool_call_in_one_turn_are_rejected_before_dispatch() {
         ModelResponse::ToolCalls {
             text: None,
             calls: vec![
-                ToolCall::new("load", "skills.load", json!({"name": "util"})),
-                ToolCall::new("early", "util.echo", json!({})),
+                ToolCall::new("load", "load_skill", json!({"name": "util"})),
+                common::call_tool("early", "util.echo", json!({})),
             ],
         },
     )]);
@@ -398,11 +410,133 @@ fn loader_rejects_unknown_skills_and_invalid_arguments() {
     ] {
         let provider = ScriptedProvider::new([ScriptedTurn::new(
             vec![Message::User("test".into())],
-            ModelResponse::ToolCall(ToolCall::new("load", "skills.load", args)),
+            ModelResponse::ToolCall(ToolCall::new("load", "load_skill", args)),
         )]);
         let result = block_on(run("test", &provider, &[], 2));
-        assert!(matches!(result, Err(RunError::Tool { name, .. }) if name == "skills.load"));
+        assert!(matches!(result, Err(RunError::Tool { name, .. }) if name == "load_skill"));
     }
+}
+
+#[test]
+fn dispatcher_rejects_malformed_calls_and_unknown_targets_before_execution() {
+    for arguments in [
+        json!({}),
+        json!({"name": "util.echo"}),
+        json!({"name": 1, "arguments": {}}),
+        json!({"name": "util.echo", "arguments": {}, "extra": true}),
+        json!({"name": "other.echo", "arguments": {}}),
+        json!({"name": "load_skill", "arguments": {"name": "util"}}),
+        json!({"name": "call_tool", "arguments": {}}),
+    ] {
+        let user = Message::User("test".into());
+        let (load, messages) = common::load_skill(&user, "util", &[Echo::default().spec()]);
+        let provider = ScriptedProvider::new([
+            load,
+            ScriptedTurn::new(
+                messages,
+                ModelResponse::ToolCall(ToolCall::new("bad", "call_tool", arguments)),
+            ),
+        ]);
+        let tool = Echo::default();
+        let result = block_on(run(
+            "test",
+            &provider,
+            &[Skill::new("util", "Echo", &[&tool])],
+            3,
+        ));
+        assert!(
+            matches!(
+                result,
+                Err(RunError::Tool { .. } | RunError::UnknownTool { .. })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(tool.calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(feature = "derive")]
+#[test]
+fn dispatcher_deserializes_inner_arguments_before_running_a_typed_tool() {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+    use wakefold::{WakefoldTool, typed_tool};
+
+    #[derive(Deserialize, JsonSchema, WakefoldTool)]
+    #[serde(deny_unknown_fields)]
+    #[tool(name = "echo", description = "Echo a message")]
+    struct EchoInput {
+        message: String,
+    }
+
+    let calls = AtomicUsize::new(0);
+    let tool = typed_tool(|input: EchoInput| {
+        calls.fetch_add(1, Ordering::Relaxed);
+        async move { Ok(json!(input.message)) }
+    });
+    let user = Message::User("test".into());
+    let (load, messages) = common::load_skill(&user, "util", &[tool.spec()]);
+    let provider = ScriptedProvider::new([
+        load,
+        ScriptedTurn::new(
+            messages,
+            ModelResponse::ToolCall(common::call_tool(
+                "bad",
+                "util.echo",
+                json!({"message": 42}),
+            )),
+        ),
+    ]);
+    let result = block_on(run(
+        "test",
+        &provider,
+        &[Skill::new("util", "Echo", &[&tool])],
+        3,
+    ));
+    assert!(matches!(result, Err(RunError::Tool { .. })));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn dispatcher_preserves_non_object_tool_arguments() -> Result<(), RunError> {
+    use async_trait::async_trait;
+
+    struct TextTool;
+    #[async_trait]
+    impl Tool for TextTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new("text", "Return a string", json!({"type": "string"}))
+        }
+
+        async fn call(&self, arguments: &JsonValue) -> Result<JsonValue, ToolError> {
+            let text = arguments
+                .as_str()
+                .ok_or_else(|| ToolError::new("expected a string"))?;
+            Ok(json!(text))
+        }
+    }
+
+    let user = Message::User("Echo text".into());
+    let (load, mut messages) = common::load_skill(&user, "util", &[TextTool.spec()]);
+    let call = ModelResponse::ToolCall(common::call_tool("text", "util.text", json!("hello")));
+    let turn = ScriptedTurn::new(messages.clone(), call.clone());
+    messages.push(Message::Assistant(call));
+    messages.push(Message::Tool(ToolResult::new("text", json!("hello"))));
+    let provider = ScriptedProvider::new([
+        load,
+        turn,
+        ScriptedTurn::new(messages, ModelResponse::Final("hello".into())),
+    ]);
+    assert_eq!(
+        block_on(run(
+            "Echo text",
+            &provider,
+            &[Skill::new("util", "Text", &[&TextTool])],
+            3
+        ))?,
+        "hello"
+    );
+    Ok(())
 }
 
 #[test]

@@ -14,7 +14,7 @@ use crate::{
 /// The loader shows the model the skill's name and short description at startup.
 /// Tool names are local to their skill. Skill and local tool names may contain
 /// ASCII letters, digits, underscores, and hyphens. Wakefold reserves `skills`
-/// for the built-in loader.
+/// for compatibility with the built-in loader in earlier journals.
 #[derive(Clone, Copy)]
 pub struct Skill<'a> {
     name: &'a str,
@@ -43,10 +43,14 @@ impl fmt::Debug for Skill<'_> {
     }
 }
 
-pub(crate) const LOADER: &str = "skills.load";
+pub(crate) const LOADER: &str = "load_skill";
+pub(crate) const DISPATCHER: &str = "call_tool";
+
+pub(crate) fn is_loader(name: &str) -> bool {
+    matches!(name, LOADER | "skills.load")
+}
 
 pub(crate) struct RunSkills<'a> {
-    // Activation moves each skill's entries into the advertised set exactly once.
     available: BTreeMap<&'a str, Vec<(ToolSpec, &'a dyn Tool)>>,
     loaded: Vec<String>,
     pub(crate) advertised: Vec<ToolSpec>,
@@ -56,8 +60,9 @@ pub(crate) struct RunSkills<'a> {
 impl<'a> RunSkills<'a> {
     pub(crate) fn new(skills: &[Skill<'a>]) -> Result<Self, RunError> {
         let mut available = BTreeMap::from([("skills", Vec::new())]);
-        let mut description =
-            String::from("Load a skill by name to enable its tools on the next turn.");
+        let mut description = String::from(
+            "Load a skill by name to receive its tool definitions. Use call_tool with a returned tool name and arguments on subsequent turns. Available skills:",
+        );
         for skill in skills {
             validate_name(skill.name)?;
             let mut tools = Vec::with_capacity(skill.tools.len());
@@ -89,10 +94,23 @@ impl<'a> RunSkills<'a> {
                 "additionalProperties": false
             }),
         );
+        let dispatcher = ToolSpec::new(
+            DISPATCHER,
+            "Execute a tool from a loaded skill. Supply its qualified name and arguments matching the schema returned by load_skill.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "arguments": {}
+                },
+                "required": ["name", "arguments"],
+                "additionalProperties": false
+            }),
+        );
         Ok(Self {
             available,
             loaded: Vec::new(),
-            advertised: vec![loader],
+            advertised: vec![loader, dispatcher],
             handlers: BTreeMap::new(),
         })
     }
@@ -101,8 +119,51 @@ impl<'a> RunSkills<'a> {
         &self.loaded
     }
 
-    pub(crate) fn can_call(&self, name: &str) -> bool {
-        name == LOADER || self.handlers.contains_key(name)
+    pub(crate) fn validate_call(&self, call: &ToolCall) -> Result<(), RunError> {
+        if is_loader(&call.name) {
+            return Ok(());
+        }
+        let (name, _) = self.resolve(call).map_err(|source| RunError::Tool {
+            name: call.name.clone(),
+            source,
+        })?;
+        if !self.handlers.contains_key(name) {
+            return Err(RunError::UnknownTool {
+                name: name.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn definitions(&self, name: &str) -> Result<JsonValue, ToolError> {
+        let tools = self.available.get(name).ok_or_else(|| unavailable(name))?;
+        Ok(json!({
+            "loaded": name,
+            "tools": tools.iter().map(|(spec, _)| spec).collect::<Vec<_>>()
+        }))
+    }
+
+    pub(crate) fn resolve<'call>(
+        &self,
+        call: &'call ToolCall,
+    ) -> Result<(&'call str, &'call JsonValue), ToolError> {
+        if call.name != DISPATCHER {
+            // Direct names are retained for journals created before the dispatcher.
+            return Ok((&call.name, &call.arguments));
+        }
+        let fields = call
+            .arguments
+            .as_object()
+            .filter(|fields| fields.len() == 2)
+            .ok_or_else(|| ToolError::new("expected name and arguments fields"))?;
+        let name = fields
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| ToolError::new("expected a string tool name"))?;
+        let arguments = fields
+            .get("arguments")
+            .ok_or_else(|| ToolError::new("expected tool arguments"))?;
+        Ok((name, arguments))
     }
 
     pub(crate) async fn call(
@@ -111,21 +172,19 @@ impl<'a> RunSkills<'a> {
         context: ToolContext,
     ) -> Result<Vec<RunEvent>, ToolError> {
         let mut events = Vec::new();
-        let value = if call.name == LOADER {
+        let value = if is_loader(&call.name) {
             let name = load_name(&call.arguments)?;
+            let definitions = self.definitions(name)?;
             if !self.is_loaded(name) {
-                if !self.available.contains_key(name) {
-                    return Err(unavailable(name));
-                }
                 events.push(RunEvent::SkillLoaded(name.to_owned()));
             }
-            json!({"loaded": name})
+            definitions
         } else {
-            let handler = self
-                .handlers
-                .get(&call.name)
-                .expect("tool names are validated before dispatch");
-            handler.call_with_context(context, &call.arguments).await?
+            let (name, arguments) = self.resolve(call)?;
+            let handler = self.handlers.get(name).ok_or_else(|| {
+                ToolError::new(format!("tool {name} is unavailable to this agent"))
+            })?;
+            handler.call_with_context(context, arguments).await?
         };
         events.push(RunEvent::ToolCallCompleted(ToolResult::new(
             call.id.clone(),
@@ -142,13 +201,9 @@ impl<'a> RunSkills<'a> {
         if self.is_loaded(name) {
             return Ok(());
         }
-        let tools = self
-            .available
-            .remove(name)
-            .ok_or_else(|| unavailable(name))?;
+        let tools = self.available.get(name).ok_or_else(|| unavailable(name))?;
         for (spec, tool) in tools {
-            self.handlers.insert(spec.name.clone(), tool);
-            self.advertised.push(spec);
+            self.handlers.insert(spec.name.clone(), *tool);
         }
         self.loaded.push(name.to_owned());
         Ok(())
