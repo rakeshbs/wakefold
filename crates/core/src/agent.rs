@@ -194,6 +194,10 @@ impl RunOutcome {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RunError {
+    /// The host recorded a terminal failure for this run.
+    #[error("run failed: {0}")]
+    RunFailed(String),
+
     /// A caller expecting a final answer reached a durable wait.
     #[error("run suspended on wait {}", .0.id)]
     Suspended(PendingWait),
@@ -531,6 +535,7 @@ async fn drive(
                 }));
             }
             RunPhase::Waiting { wait, .. } => return Ok(RunOutcome::Suspended(wait)),
+            RunPhase::Failed(error) => return Err(RunError::RunFailed(error)),
             _ => {}
         }
         let action = next_action(

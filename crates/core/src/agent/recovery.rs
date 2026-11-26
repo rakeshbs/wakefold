@@ -77,6 +77,7 @@ pub(super) enum RunPhase {
     },
     ToolApproved,
     Finished(String),
+    Failed(String),
 }
 
 /// Fresh and resumed runs advance through the same event transitions.
@@ -368,6 +369,14 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             }
             (RunPhase::Ready, RunEvent::RunFinished(answer)) if matches!(action(), Some(Action::Finish(expected)) if expected == answer) => {
                 RunPhase::Finished(answer)
+            }
+            (phase, RunEvent::RunFailed(error))
+                if !matches!(
+                    phase,
+                    RunPhase::Finished(_) | RunPhase::Failed(_) | RunPhase::Waiting { .. }
+                ) =>
+            {
+                RunPhase::Failed(error)
             }
             _ => return Err(RunError::InvalidJournal("unexpected event at run boundary")),
         };

@@ -95,6 +95,7 @@ impl WorkspaceStore {
         connection.execute_batch(crate::wait::SCHEMA)?;
         connection.execute_batch(crate::delegation::SCHEMA)?;
         connection.execute_batch(crate::mailbox::SCHEMA)?;
+        connection.execute_batch(crate::queued_run::SCHEMA)?;
         Ok(Self { connection, state })
     }
 
@@ -132,26 +133,7 @@ impl WorkspaceStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "INSERT INTO workspaces(chat_key) VALUES (?1) ON CONFLICT(chat_key) DO NOTHING",
-            [chat_key],
-        )?;
-        let workspace_id: i64 = tx.query_row(
-            "SELECT id FROM workspaces WHERE chat_key = ?1",
-            [chat_key],
-            |row| row.get(0),
-        )?;
-        let keys = params![workspace_id, run_key];
-        tx.execute(
-            "INSERT INTO workspace_runs(workspace_id, run_key) VALUES (?1, ?2)
-             ON CONFLICT(workspace_id, run_key) DO NOTHING",
-            keys,
-        )?;
-        let agent_id = tx.query_row(
-            "SELECT agent_id FROM workspace_runs WHERE workspace_id = ?1 AND run_key = ?2",
-            keys,
-            |row| row.get(0),
-        )?;
+        let (workspace_id, agent_id) = reserve_run(&tx, chat_key, run_key)?;
         // Reserve both IDs durably before creating files. An interrupted
         // initialization can then finish without reassigning the directory.
         tx.commit()?;
@@ -166,4 +148,32 @@ impl WorkspaceStore {
         )?;
         Ok(workspace)
     }
+}
+
+pub(crate) fn reserve_run(
+    tx: &rusqlite::Transaction<'_>,
+    chat_key: &str,
+    run_key: &str,
+) -> Result<(i64, i64), rusqlite::Error> {
+    tx.execute(
+        "INSERT INTO workspaces(chat_key) VALUES (?1) ON CONFLICT(chat_key) DO NOTHING",
+        [chat_key],
+    )?;
+    let workspace_id: i64 = tx.query_row(
+        "SELECT id FROM workspaces WHERE chat_key = ?1",
+        [chat_key],
+        |row| row.get(0),
+    )?;
+    let keys = params![workspace_id, run_key];
+    tx.execute(
+        "INSERT INTO workspace_runs(workspace_id, run_key) VALUES (?1, ?2)
+         ON CONFLICT(workspace_id, run_key) DO NOTHING",
+        keys,
+    )?;
+    let agent_id = tx.query_row(
+        "SELECT agent_id FROM workspace_runs WHERE workspace_id = ?1 AND run_key = ?2",
+        keys,
+        |row| row.get(0),
+    )?;
+    Ok((workspace_id, agent_id))
 }

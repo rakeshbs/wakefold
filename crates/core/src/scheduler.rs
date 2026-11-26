@@ -36,6 +36,8 @@ pub struct ScheduledRun {
     pub run_key: String,
     /// Parent and worker configuration for a delegated run.
     pub delegation: Option<DelegatedRun>,
+    /// The saved agent definition for an admitted run or delegated worker.
+    pub agent_name: Option<String>,
 }
 
 /// Configuration the host supplies when the scheduler resumes a run.
@@ -83,6 +85,9 @@ pub enum SchedulerError {
     /// A scheduled run's workspace could not be opened.
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
+    /// The host has no configuration for a ready run.
+    #[error("no agent configuration for run {} in chat {}", .0.run_key, .0.chat_key)]
+    MissingAgent(ScheduledRun),
     /// A driver returned an error while resuming a scheduled run.
     #[error("could not resume run {} in chat {}", run.run_key, run.chat_key)]
     Resume {
@@ -105,7 +110,7 @@ struct Schedule {
 }
 
 impl WorkspaceStore {
-    /// Drive resolved waits and delegated runs until cancelled or a run fails.
+    /// Drive queued runs and resolved waits until cancelled or a run fails.
     ///
     /// Startup finds overdue timers and wakes already committed before a restart.
     /// Supply the original provider, skill catalog and limits for each run from
@@ -126,6 +131,28 @@ impl WorkspaceStore {
         max_concurrent: NonZeroUsize,
         cancellation: &CancellationToken,
         mut configure: impl FnMut(&ScheduledRun) -> ScheduledRunConfig<'a>,
+        on_outcome: impl FnMut(&ScheduledRun, &RunOutcome),
+    ) -> Result<(), SchedulerError> {
+        self.run_scheduler_with_agent_lookup(
+            max_concurrent,
+            cancellation,
+            |run| Some(configure(run)),
+            on_outcome,
+        )
+        .await
+    }
+
+    /// Drive ready runs using a host lookup that may lack a saved agent definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::MissingAgent`] when the lookup returns `None`, or
+    /// any failure reported by [`Self::run_scheduler`].
+    pub async fn run_scheduler_with_agent_lookup<'a>(
+        self,
+        max_concurrent: NonZeroUsize,
+        cancellation: &CancellationToken,
+        mut configure: impl FnMut(&ScheduledRun) -> Option<ScheduledRunConfig<'a>>,
         mut on_outcome: impl FnMut(&ScheduledRun, &RunOutcome),
     ) -> Result<(), SchedulerError> {
         let state = self.state.clone();
@@ -159,7 +186,8 @@ impl WorkspaceStore {
                 delay = schedule.delay;
                 for ready in schedule.ready {
                     if active.insert(ready.run.agent_id) {
-                        let config = configure(&ready.run);
+                        let config = configure(&ready.run)
+                            .ok_or_else(|| SchedulerError::MissingAgent(ready.run.clone()))?;
                         running.push(resume(&state, ready, config));
                         if active.len() == max_concurrent.get() {
                             break;
@@ -216,14 +244,18 @@ impl WorkspaceStore {
                 SELECT agent_id FROM run_waits WHERE resolved = 1
                 UNION ALL
                 SELECT child_agent_id FROM delegated_runs WHERE needs_start = 1
+                UNION ALL
+                SELECT agent_id FROM queued_runs WHERE ready = 1
                 ORDER BY 1 LIMIT ?1
             )
-            SELECT ready.agent_id, w.chat_key, wr.run_key, e.event_json, d.parent_agent_id, d.worker
+            SELECT ready.agent_id, w.chat_key, wr.run_key, e.event_json,
+                   d.parent_agent_id, d.worker, COALESCE(q.agent_name, d.worker)
             FROM ready
             JOIN workspace_runs wr USING (agent_id)
             JOIN workspaces w ON w.id = wr.workspace_id
             JOIN run_events e ON e.agent_id = ready.agent_id AND e.sequence = 1
             LEFT JOIN delegated_runs d ON d.child_agent_id = ready.agent_id
+            LEFT JOIN queued_runs q ON q.agent_id = ready.agent_id
             ORDER BY ready.agent_id",
         )?;
         let limit = i64::try_from(limit.get()).unwrap_or(i64::MAX);
@@ -250,6 +282,7 @@ impl WorkspaceStore {
                     chat_key: row.get(1)?,
                     run_key: row.get(2)?,
                     delegation,
+                    agent_name: row.get(6)?,
                 },
                 prompt,
             });

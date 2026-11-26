@@ -128,7 +128,7 @@ pub(crate) fn clear_start(tx: &Transaction<'_>, child: i64) -> Result<(), Journa
 pub(crate) fn finish_worker(
     tx: &Transaction<'_>,
     child: i64,
-    answer: &str,
+    outcome: Result<&str, &str>,
 ) -> Result<(), JournalError> {
     let delegation = tx
         .query_row(
@@ -159,14 +159,15 @@ pub(crate) fn finish_worker(
             "delegated run has no pending parent wait",
         ))?;
     clear_start(tx, child)?;
+    let payload = match outcome {
+        Ok(answer) => json!({"worker": worker, "answer": answer}),
+        Err(error) => json!({"worker": worker, "error": error}),
+    };
     append_events(
         tx,
         parent,
         sequence,
-        &[RunEvent::Woken {
-            wait_id,
-            payload: json!({"worker": worker, "answer": answer}),
-        }],
+        &[RunEvent::Woken { wait_id, payload }],
     )?;
     Ok(())
 }

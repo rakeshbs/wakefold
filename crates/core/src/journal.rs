@@ -2,16 +2,17 @@
 
 use std::{
     fs::{File, TryLockError},
+    num::NonZeroUsize,
     path::PathBuf,
 };
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
     JsonValue, ModelTurn, PendingWait, RunCheckpoint, RunWorkspace, ToolCall, ToolRecovery,
-    ToolResult,
+    ToolResult, WorkspaceStore,
 };
 use crate::{mailbox, wait::record_transition};
 
@@ -79,6 +80,8 @@ pub enum RunEvent {
     TranscriptCompacted(RunCheckpoint),
     /// The run returned its final answer.
     RunFinished(String),
+    /// The host ended the run after an execution failure.
+    RunFailed(String),
 }
 
 /// A stored event and its one-based position within this run.
@@ -88,6 +91,16 @@ pub struct JournalEntry {
     pub sequence: u64,
     /// The recorded transition.
     pub event: RunEvent,
+}
+
+/// A bounded batch of events for a reader following a saved run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RunEventPage {
+    /// Events strictly after the requested sequence.
+    pub entries: Vec<JournalEntry>,
+    /// This page has reached the end of a finished or failed run.
+    pub complete: bool,
 }
 
 /// A failure to read or extend a run journal.
@@ -258,6 +271,82 @@ impl<'a> RunJournal<'a> {
     pub fn load_after(&self, sequence: u64) -> Result<Vec<JournalEntry>, JournalError> {
         read_entries(self.connection, self.workspace.agent_id(), sequence)
     }
+
+    /// Record an execution failure for a run, returning whether it changed.
+    ///
+    /// An empty, finished, failed, or suspended run is left alone. A failed
+    /// worker sends the failure back to its parent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a journal error if the run is active or the write fails.
+    pub fn record_failure(&mut self, error: String) -> Result<bool, JournalError> {
+        let _driver_lock = self.lock_driver()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = self.workspace.agent_id();
+        let Some((sequence, terminal)) = tail(&tx, id)? else {
+            return Ok(false);
+        };
+        let suspended: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_waits WHERE agent_id = ?1 AND resolved = 0)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if terminal || suspended {
+            return Ok(false);
+        }
+        append_events(&tx, id, sequence, &[RunEvent::RunFailed(error)])?;
+        tx.commit()?;
+        Ok(true)
+    }
+}
+
+impl WorkspaceStore {
+    /// Read a page of one run's journal without opening or creating its workspace.
+    ///
+    /// Returns `None` if the run has no journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a journal error if the page cannot be read or decoded.
+    pub fn run_event_page(
+        &self,
+        agent_id: i64,
+        after: u64,
+        limit: NonZeroUsize,
+    ) -> Result<Option<RunEventPage>, JournalError> {
+        // Read the completion marker and page from the same snapshot so that
+        // a finishing run cannot close a stream before its final event is sent.
+        let tx = self.connection.unchecked_transaction()?;
+        let Some((last, terminal)) = tail(&tx, agent_id)? else {
+            return Ok(None);
+        };
+        let entries = read_entry_page(
+            &tx,
+            agent_id,
+            after,
+            i64::try_from(limit.get()).unwrap_or(i64::MAX),
+        )?;
+        let through = entries.last().map_or(after, |entry| entry.sequence);
+        tx.commit()?;
+        Ok(Some(RunEventPage {
+            entries,
+            complete: terminal && through >= last,
+        }))
+    }
+}
+
+fn tail(connection: &Connection, agent_id: i64) -> Result<Option<(u64, bool)>, JournalError> {
+    Ok(connection
+        .query_row(
+            "SELECT sequence, json_extract(event_json, '$.kind') IN ('run_finished', 'run_failed')
+         FROM run_events WHERE agent_id = ?1 ORDER BY sequence DESC LIMIT 1",
+            [agent_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
 }
 
 pub(crate) fn append_events(
@@ -293,14 +382,23 @@ fn read_entries(
     agent_id: i64,
     sequence: u64,
 ) -> Result<Vec<JournalEntry>, JournalError> {
+    read_entry_page(connection, agent_id, sequence, -1)
+}
+
+fn read_entry_page(
+    connection: &Connection,
+    agent_id: i64,
+    sequence: u64,
+    limit: i64,
+) -> Result<Vec<JournalEntry>, JournalError> {
     if sequence >= i64::MAX as u64 {
         return Ok(Vec::new());
     }
     let mut stmt = connection.prepare_cached(
         "SELECT sequence, event_json FROM run_events
-             WHERE agent_id = ?1 AND sequence > ?2 ORDER BY sequence",
+             WHERE agent_id = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
     )?;
-    let mut rows = stmt.query(params![agent_id, sequence])?;
+    let mut rows = stmt.query(params![agent_id, sequence, limit])?;
     let mut entries = Vec::new();
     while let Some(row) = rows.next()? {
         entries.push(JournalEntry {
