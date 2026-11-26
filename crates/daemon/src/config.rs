@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use wakefold::{
-    DelegateTool, Provider, RunOptions, SendMessage, TimerWait, Tool, ToolGrant, WaitForMessage,
+    DelegateTool, Provider, PublishArtifact, RunOptions, SendMessage, TimerWait, Tool, ToolGrant,
+    WaitForMessage,
 };
 
 use crate::DaemonError;
@@ -211,6 +212,12 @@ impl Runtime {
                 return Err(format!("duplicate skill {name}").into());
             }
         }
+        skills
+            .entry("artifacts".into())
+            .or_insert_with(|| RegisteredSkill {
+                description: "Publish finished files from the chat workspace".into(),
+                tools: vec![Box::new(PublishArtifact)],
+            });
         let mut agents = BTreeMap::new();
         for (name, agent) in config.agents {
             let mut available_tools = BTreeSet::new();

@@ -10,10 +10,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::artifact::SavedArtifact;
 use crate::mailbox;
 use crate::{
-    JsonValue, ModelTurn, PendingWait, RunCheckpoint, RunWorkspace, ToolCall, ToolRecovery,
-    ToolResult, WorkspaceStore,
+    ArtifactPublication, ArtifactRevision, JsonValue, ModelTurn, PendingWait, RunCheckpoint,
+    RunError, RunWorkspace, ToolCall, ToolCallId, ToolRecovery, ToolResult, WorkspaceStore,
 };
 
 mod write;
@@ -57,6 +58,8 @@ pub enum RunEvent {
     },
     /// The tool returned a result for its call ID.
     ToolCallCompleted(ToolResult),
+    /// One immutable revision became available to the chat.
+    ArtifactPublished(ArtifactRevision),
     /// A tool sent a durable message and receives its message ID as its result.
     MailboxMessageSent {
         /// Stable ID from the sending tool call.
@@ -150,6 +153,7 @@ pub struct RunJournal<'a> {
     connection: &'a mut Connection,
     pub(crate) workspace: RunWorkspace,
     lock_path: PathBuf,
+    pub(crate) artifact_directory: PathBuf,
     commit_hook: Option<fn(u64, &[RunEvent])>,
 }
 
@@ -158,11 +162,13 @@ impl<'a> RunJournal<'a> {
         connection: &'a mut Connection,
         workspace: RunWorkspace,
         lock_path: PathBuf,
+        artifact_directory: PathBuf,
     ) -> Self {
         Self {
             connection,
             workspace,
             lock_path,
+            artifact_directory,
             commit_hook: None,
         }
     }
@@ -256,6 +262,35 @@ impl<'a> RunJournal<'a> {
         let entries = read_entries(&tx, self.workspace.agent_id(), start.saturating_sub(1))?;
         tx.commit()?;
         Ok(entries)
+    }
+
+    pub(crate) fn validate_artifact_target(
+        &self,
+        publication: &ArtifactPublication,
+    ) -> Result<(), crate::ArtifactError> {
+        publication.validate_target(self.connection, self.workspace.agent_id())
+    }
+
+    pub(crate) fn commit_artifact(
+        &mut self,
+        expected_last_sequence: u64,
+        call_id: ToolCallId,
+        copy: SavedArtifact,
+    ) -> Result<(u64, [RunEvent; 2]), RunError> {
+        let tx = JournalTransaction::begin(self.connection)?;
+        let agent_id = self.workspace.agent_id();
+        let revision = copy.record(tx.sql(), agent_id)?;
+        let result = serde_json::to_value(&revision).map_err(JournalError::from)?;
+        let events = [
+            RunEvent::ArtifactPublished(revision),
+            RunEvent::ToolCallCompleted(ToolResult::new(call_id, result)),
+        ];
+        let sequence = tx.append(agent_id, expected_last_sequence, &events)?;
+        tx.commit()?;
+        if let Some(hook) = self.commit_hook {
+            hook(sequence, &events);
+        }
+        Ok((sequence, events))
     }
 
     /// Load committed entries strictly after the supplied position in order.

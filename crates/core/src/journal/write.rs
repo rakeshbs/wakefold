@@ -83,6 +83,8 @@ struct TraceDetails {
     wait_id: Option<String>,
     wait_source: Option<&'static str>,
     message_id: Option<String>,
+    artifact_id: Option<i64>,
+    artifact_revision: Option<u64>,
     to_agent_id: Option<i64>,
     usage: Option<TokenUsage>,
 }
@@ -114,6 +116,11 @@ impl EventTrace {
             RunEvent::ToolCallCompleted(result) => {
                 details.call_id = Some(result.call_id.clone());
                 "tool_call_completed"
+            }
+            RunEvent::ArtifactPublished(revision) => {
+                details.artifact_id = Some(revision.artifact_id);
+                details.artifact_revision = Some(revision.revision);
+                "artifact_published"
             }
             RunEvent::MailboxMessageSent {
                 message_id,
@@ -162,6 +169,8 @@ impl EventTrace {
             wait_id = details.wait_id.as_deref(),
             wait_source = details.wait_source,
             message_id = details.message_id.as_deref(),
+            artifact_id = details.artifact_id,
+            artifact_revision = details.artifact_revision,
             to_agent_id = details.to_agent_id,
             input_tokens = details.usage.map(|usage| usage.input_tokens),
             output_tokens = details.usage.map(|usage| usage.output_tokens),

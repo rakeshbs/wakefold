@@ -1,6 +1,7 @@
 //! Core library for the Wakefold agent harness.
 
 mod agent;
+mod artifact;
 mod context;
 mod delegation;
 mod journal;
@@ -28,6 +29,7 @@ pub use agent::{
     RunCheckpoint, RunError, RunOptions, RunOutcome, RunReport, RunUsage, run, run_streaming,
     run_streaming_with_options, run_with_options,
 };
+pub use artifact::{ArtifactError, ArtifactPublication, ArtifactRevision, PublishArtifact};
 pub use delegation::{DelegateTool, DelegatedRun};
 pub use journal::{JournalEntry, JournalError, JournalReplay, RunEvent, RunEventPage, RunJournal};
 pub use mailbox::{ClientMessageError, SendMessage, WaitForMessage};

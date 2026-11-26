@@ -201,6 +201,8 @@ impl ToolContext {
 pub enum ToolOutput {
     /// Deliver an immediate result to the model.
     Value(JsonValue),
+    /// Publish an existing workspace file as an immutable artifact revision.
+    PublishArtifact(crate::ArtifactPublication),
     /// Suspend the run and use the wake event as this call's result.
     Wait(WaitOn),
     /// Queue a message for another run in the same chat.

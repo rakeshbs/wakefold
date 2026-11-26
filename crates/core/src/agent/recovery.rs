@@ -5,12 +5,14 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Action, RunError, RunOptions, RunUsage, next_action, validate_calls};
+use super::{
+    Action, RunError, RunOptions, RunUsage, await_cancellable, next_action, validate_calls,
+};
 use crate::context::Compaction;
 use crate::skill::{LOADER, RunSkills};
 use crate::{
-    JsonValue, Message, ModelTurn, PendingWait, RunEvent, RunJournal, ToolCall, ToolCallId,
-    ToolRecovery, ToolResult, WaitOn,
+    ArtifactPublication, CancellationToken, JsonValue, Message, ModelTurn, PendingWait, RunEvent,
+    RunJournal, ToolCall, ToolCallId, ToolRecovery, ToolResult, WaitOn,
 };
 
 /// A durable model-call boundary containing the compacted transcript and run bookkeeping.
@@ -206,6 +208,45 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         })])
     }
 
+    pub async fn publish_artifact(
+        &mut self,
+        publication: ArtifactPublication,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), RunError> {
+        let RunPhase::ToolPrepared {
+            call,
+            tool_call_key,
+            ..
+        } = &self.phase
+        else {
+            return Err(RunError::InvalidJournal(
+                "publication requires a prepared tool call",
+            ));
+        };
+        let journal =
+            self.journal
+                .as_deref_mut()
+                .ok_or_else(|| RunError::ArtifactRequiresJournal {
+                    name: self.skills.target_name(call).to_owned(),
+                })?;
+        journal.validate_artifact_target(&publication)?;
+        let copy = await_cancellable(
+            publication.save_copy(
+                &journal.workspace,
+                &journal.artifact_directory,
+                tool_call_key,
+            ),
+            cancellation,
+        )
+        .await??;
+        let (sequence, events) = journal.commit_artifact(self.tail, call.id.clone(), copy)?;
+        self.tail = sequence;
+        for event in events {
+            self.apply(event)?;
+        }
+        Ok(())
+    }
+
     pub fn commit(
         &mut self,
         events: impl AsRef<[RunEvent]> + IntoIterator<Item = RunEvent>,
@@ -268,6 +309,11 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                 if call.name == LOADER && call.arguments["name"].as_str() == Some(&name) =>
             {
                 self.skills.activate(&name)?;
+                return Ok(());
+            }
+            (RunPhase::ToolPrepared { call, .. }, RunEvent::ArtifactPublished(_))
+                if call.name != LOADER =>
+            {
                 return Ok(());
             }
             (RunPhase::ToolPrepared { call, .. }, RunEvent::ToolCallCompleted(result))

@@ -12,25 +12,30 @@ test-util = []
 
 [dependencies]
 async-openai = { version = "0.43", default-features = false, features = ["middleware", "responses", "rustls"], optional = true }
+cap-std = "4"
 futures-channel = "0.3"
 futures-timer = "3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
 httpdate = { version = "1", optional = true }
+mime_guess = "2"
 rand = "0.10"
 rusqlite = { version = "0.38", features = ["bundled", "fallible_uint"] }
 reqwest = { version = "0.13", default-features = false, optional = true }
 schemars = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 thiserror = "2"
 tokio-util = "0.7"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tower = { version = "0.5", features = ["util"], optional = true }
 wakefold-macros = { version = "0.1.0", path = "../macros", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-tempfile = "3"
 futures-executor = "0.3"
 http = "1"
 tokio = { version = "1", features = ["macros", "rt", "test-util"] }

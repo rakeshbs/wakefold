@@ -1,3 +1,5 @@
+mod artifacts;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -596,7 +598,7 @@ async fn http_messages_survive_daemon_restart() {
     }).await.expect("the HTTP mailbox workflow must finish");
 }
 
-async fn mcp_approval(client: &Client, address: SocketAddr, previous: &str) -> Value {
+async fn next_approval(client: &Client, address: SocketAddr, previous: &str) -> Value {
     loop {
         if let Some(approval) = approvals(client, address)
             .await
@@ -653,7 +655,7 @@ async fn mcp_tool_works_after_daemon_restart() {
             "chat_key": "catalog", "run_key": "prices", "agent": "assistant", "prompt": MCP_PROMPT
         })).send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
         let agent_id = response["agent_id"].as_i64().unwrap();
-        let first = mcp_approval(&client, address, "").await;
+        let first = next_approval(&client, address, "").await;
         assert_eq!(first["agent_id"], agent_id);
         assert_eq!(first["wait"]["on"]["ToolApproval"]["tool_name"], "catalog.lookup_price");
         assert_eq!(first["wait"]["on"]["ToolApproval"]["arguments"], json!({"sku": "WF-318"}));
@@ -663,7 +665,7 @@ async fn mcp_tool_works_after_daemon_restart() {
             .json(&json!({"approved": true})).send().await.unwrap();
         assert_eq!(approval.status(), StatusCode::NO_CONTENT);
 
-        let second = mcp_approval(&client, address, first_wait).await;
+        let second = next_approval(&client, address, first_wait).await;
         assert_eq!(second["agent_id"], agent_id);
         assert_eq!(second["wait"]["on"]["ToolApproval"]["arguments"], json!({"sku": "WF-319"}));
         let calls = std::fs::read_to_string(&calls_path).unwrap();

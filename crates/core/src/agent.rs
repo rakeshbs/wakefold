@@ -216,6 +216,17 @@ pub enum RunError {
         name: String,
     },
 
+    /// A non-durable run attempted to publish an artifact.
+    #[error("tool {name} requires a journaled run to publish an artifact")]
+    ArtifactRequiresJournal {
+        /// The tool that requested publication.
+        name: String,
+    },
+
+    /// An artifact could not be published.
+    #[error(transparent)]
+    Artifact(#[from] crate::ArtifactError),
+
     /// The host did not grant this run access to the requested tool.
     #[error("tool {name} is not granted to this run")]
     ToolAccessDenied {
@@ -637,6 +648,9 @@ async fn drive(
                         })?;
                 match execution {
                     ToolExecution::Completed(events) => run.commit(events)?,
+                    ToolExecution::PublishArtifact(publication) => {
+                        run.publish_artifact(publication, cancellation).await?;
+                    }
                     ToolExecution::Waiting(on) => {
                         if !durable {
                             return Err(RunError::WaitRequiresJournal {

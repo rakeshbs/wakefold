@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header, uri::Authority};
@@ -12,11 +13,13 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio_util::io::ReaderStream;
 use wakefold::{
-    CancellationToken, ClientMessageError, PendingWait, QueueRunError, RunEvent, RunEventPage,
-    WakeEvent, WorkspaceStore,
+    ArtifactRevision, CancellationToken, ClientMessageError, PendingWait, QueueRunError, RunEvent,
+    RunEventPage, WakeEvent, WorkspaceStore,
 };
 
 const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(128).expect("page size is nonzero");
@@ -75,12 +78,67 @@ pub(crate) fn router(
         .route("/runs/{agent_id}/messages", post(post_message))
         .route("/approvals", get(pending_approvals))
         .route("/approvals/{wait_id}", post(resolve_approval))
+        .route("/artifacts", get(list_artifacts))
+        .route(
+            "/artifacts/{artifact_id}/revisions/{revision}",
+            get(download_artifact),
+        )
         .layer(middleware::from_fn(require_local_origin))
         .with_state(AppState {
             store: Arc::new(Mutex::new(store)),
             agents: Arc::new(agents),
             stop,
         })
+}
+
+#[derive(Deserialize)]
+struct ArtifactChat {
+    chat_key: String,
+}
+
+async fn list_artifacts(
+    State(state): State<AppState>,
+    Query(chat): Query<ArtifactChat>,
+) -> Result<Json<Vec<ArtifactRevision>>, ApiError> {
+    state
+        .database(move |store| store.artifacts(&chat.chat_key).map_err(ApiError::internal))
+        .await
+        .map(Json)
+}
+
+async fn download_artifact(
+    State(state): State<AppState>,
+    Path((artifact_id, revision)): Path<(i64, i64)>,
+    Query(chat): Query<ArtifactChat>,
+) -> Result<Response, ApiError> {
+    let revision = u64::try_from(revision)
+        .ok()
+        .filter(|&revision| revision > 0 && artifact_id > 0)
+        .ok_or(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid artifact identifier",
+        ))?;
+    let (metadata, file) = state
+        .database(move |store| {
+            store
+                .open_artifact(&chat.chat_key, artifact_id, revision)
+                .map_err(ApiError::internal)
+        })
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "unknown artifact revision"))?;
+    let name = utf8_percent_encode(&metadata.filename, NON_ALPHANUMERIC);
+    Response::builder()
+        .header(header::CONTENT_TYPE, metadata.media_type)
+        .header(header::CONTENT_LENGTH, metadata.size_bytes)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename*=UTF-8''{name}"),
+        )
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from_stream(ReaderStream::new(
+            tokio::fs::File::from_std(file),
+        )))
+        .map_err(ApiError::internal)
 }
 
 #[derive(Deserialize)]

@@ -49,6 +49,7 @@ pub(crate) const DISPATCHER: &str = "call_tool";
 
 pub(crate) enum ToolExecution {
     Completed(Vec<RunEvent>),
+    PublishArtifact(crate::ArtifactPublication),
     Waiting(WaitOn),
     SendMessage {
         to_agent_id: i64,
@@ -235,6 +236,9 @@ impl<'a> RunSkills<'a> {
             })?;
             match handler.call_with_output(context, arguments).await? {
                 ToolOutput::Value(value) => value,
+                ToolOutput::PublishArtifact(publication) => {
+                    return Ok(ToolExecution::PublishArtifact(publication));
+                }
                 ToolOutput::Wait(WaitOn::ToolApproval { .. }) => {
                     return Err(ToolError::new(
                         "tool approval must be requested by a grant before dispatch",

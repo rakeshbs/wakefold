@@ -96,6 +96,7 @@ impl WorkspaceStore {
         connection.execute_batch(crate::delegation::SCHEMA)?;
         crate::mailbox::initialize_schema(&mut connection)?;
         connection.execute_batch(crate::queued_run::SCHEMA)?;
+        connection.execute_batch(crate::artifact::SCHEMA)?;
         Ok(Self { connection, state })
     }
 
@@ -113,7 +114,13 @@ impl WorkspaceStore {
         let locks = self.state.join("run-locks");
         fs::create_dir_all(&locks)?;
         let lock_path = locks.join(run.agent_id().to_string());
-        Ok(crate::RunJournal::new(&mut self.connection, run, lock_path))
+        let artifact_directory = crate::artifact::directory(&self.state);
+        Ok(crate::RunJournal::new(
+            &mut self.connection,
+            run,
+            lock_path,
+            artifact_directory,
+        ))
     }
 
     /// Open or create a run's workspace using stable chat and run keys.
