@@ -242,11 +242,12 @@ fn process_restart_restores_loaded_tools_after_compaction() {
     );
 
     let mut store = WorkspaceStore::open(dir.path()).unwrap();
-    let entries = store
-        .open_journal("chat", "notes")
-        .unwrap()
-        .load_after(0)
-        .unwrap();
+    let mut journal = store.open_journal("chat", "notes").unwrap();
+    assert!(matches!(
+        block_on(journal.run_or_resume("different", &NoCalls, &[], RunOptions::new(5))),
+        Err(RunError::ResumePromptMismatch)
+    ));
+    let entries = journal.load_after(0).unwrap();
     assert_eq!(
         entries
             .iter()
@@ -270,6 +271,28 @@ impl Provider for NoCalls {
     async fn complete_response(&self, _: ModelRequest<'_>) -> Result<ModelResponse, ProviderError> {
         panic!("unexpected provider call during recovery")
     }
+}
+
+#[test]
+fn resume_distinguishes_a_wrong_workspace_from_invalid_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = WorkspaceStore::open(dir.path()).unwrap();
+    let other = store.open_run_workspace("chat", "other").unwrap();
+    let mut journal = store.open_journal("chat", "run").unwrap();
+    assert!(matches!(
+        block_on(journal.run_or_resume(
+            PROMPT,
+            &NoCalls,
+            &[],
+            RunOptions::new(1).with_workspace(other)
+        )),
+        Err(RunError::RunWorkspaceMismatch)
+    ));
+    journal.append(0, &[RunEvent::ModelCallRequested]).unwrap();
+    assert!(matches!(
+        block_on(journal.run_or_resume(PROMPT, &NoCalls, &[], RunOptions::new(1))),
+        Err(RunError::InvalidJournal(_))
+    ));
 }
 
 struct LoadTwice;
@@ -339,7 +362,7 @@ fn failed_loader_commit_rolls_back_activation_and_can_be_retried() {
     );
     assert!(matches!(
         block_on(journal.run_or_resume("different", &NoCalls, &skills, RunOptions::new(3))),
-        Err(RunError::InvalidJournal(_))
+        Err(RunError::ResumePromptMismatch)
     ));
     assert!(matches!(
         block_on(journal.run_or_resume(PROMPT, &NoCalls, &[], RunOptions::new(3))),
@@ -348,7 +371,7 @@ fn failed_loader_commit_rolls_back_activation_and_can_be_retried() {
 }
 
 #[test]
-fn interrupted_application_tool_is_never_dispatched_again() {
+fn stop_after_crash_returns_unknown_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(dir.path()).unwrap();
     let mut journal = store.open_journal("chat", "run").unwrap();

@@ -12,10 +12,14 @@ use crate::{
 };
 
 /// A durable model-call boundary containing the compacted transcript and run bookkeeping.
+///
+/// The transcript retains the tool definitions returned by `load_skill`.
+/// On resume, the saved skill names identify the handlers to restore from the host's catalog.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunCheckpoint {
     state: RunState,
-    loaded_skills: Vec<String>,
+    #[serde(rename = "loaded_skills")]
+    loaded_skill_names: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,17 +104,24 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             run.commit([RunEvent::RunStarted(prompt)])?;
             return Ok(run);
         };
-        let matches_prompt = match &first.event {
-            RunEvent::RunStarted(original) => original == &prompt,
+        let original_prompt = match &first.event {
+            RunEvent::RunStarted(original) => original,
             RunEvent::TranscriptCompacted(snapshot) => {
-                matches!(snapshot.state.messages.first(), Some(Message::User(original)) if original == &prompt)
+                let Some(Message::User(original)) = snapshot.state.messages.first() else {
+                    return Err(RunError::InvalidJournal(
+                        "checkpoint is missing the initial user prompt",
+                    ));
+                };
+                original
             }
-            _ => false,
+            _ => {
+                return Err(RunError::InvalidJournal(
+                    "expected a run start or checkpoint",
+                ));
+            }
         };
-        if !matches_prompt {
-            return Err(RunError::InvalidJournal(
-                "initial prompt or checkpoint does not match",
-            ));
+        if original_prompt != &prompt {
+            return Err(RunError::ResumePromptMismatch);
         }
         for entry in entries {
             run.apply(entry.event)?;
@@ -165,7 +176,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         )?;
         self.commit([RunEvent::TranscriptCompacted(RunCheckpoint {
             state,
-            loaded_skills: self.skills.loaded().to_vec(),
+            loaded_skill_names: self.skills.loaded().to_vec(),
         })])
     }
 
@@ -190,7 +201,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                 RunPhase::Ready
             }
             (RunPhase::Ready, RunEvent::TranscriptCompacted(snapshot)) => {
-                for name in snapshot.loaded_skills {
+                for name in snapshot.loaded_skill_names {
                     activate_skill(&mut self.skills, &name)?;
                 }
                 self.state = snapshot.state;

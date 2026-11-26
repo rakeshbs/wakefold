@@ -28,9 +28,11 @@ pub(crate) const SCHEMA: &str = "
 pub enum RunEvent {
     /// The initial user prompt.
     RunStarted(String),
-    /// The run is about to request its next model turn.
+    /// The run is about to request its next ordinary agent turn.
+    /// Provider retries share this event. Compaction summary requests have no request event.
     ModelCallRequested,
-    /// A full model response, including usage and provider replay data.
+    /// The response, usage, and replay data for a completed ordinary agent turn.
+    /// A compaction summary contributes usage to the [`RunEvent::TranscriptCompacted`] checkpoint.
     ModelCallCompleted(ModelTurn),
     /// The recovery policy and key were recorded before dispatch.
     ///
@@ -91,8 +93,8 @@ pub enum JournalError {
     #[error("run journal database: {0}")]
     Database(#[from] rusqlite::Error),
     /// An event could not be encoded or decoded.
-    #[error("run journal event: {0}")]
-    Encoding(#[from] serde_json::Error),
+    #[error("run journal event JSON: {0}")]
+    EventJson(#[from] serde_json::Error),
 }
 
 /// Blocking access to one run's journal on the workspace store connection.

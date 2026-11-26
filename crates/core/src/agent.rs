@@ -147,9 +147,17 @@ pub enum RunError {
     #[error(transparent)]
     Journal(#[from] crate::JournalError),
 
-    /// The recorded history is inconsistent with the requested run.
+    /// The recorded events do not form a valid run history.
     #[error("cannot resume run: {0}")]
     InvalidJournal(&'static str),
+
+    /// The supplied prompt differs from the one that started this run.
+    #[error("the supplied prompt differs from the run's original prompt")]
+    ResumePromptMismatch,
+
+    /// The supplied workspace belongs to a different run.
+    #[error("the supplied workspace belongs to a different run")]
+    RunWorkspaceMismatch,
 
     /// Recovery found an application tool start without its committed result.
     #[error("outcome of tool {name} (call {id}) is unknown")]
@@ -196,9 +204,9 @@ pub enum RunError {
         name: String,
     },
 
-    /// The provider reused an ID for a tool call already answered in the transcript.
-    #[error("model repeated tool call ID {id}")]
-    DuplicateCallId {
+    /// A tool call ID was reused within this run, including within a single batch.
+    #[error("tool call ID {id} was reused within this run")]
+    DuplicateToolCallId {
         /// The repeated call identifier.
         id: ToolCallId,
     },
@@ -229,9 +237,9 @@ pub enum RunError {
         usage: RunUsage,
     },
 
-    /// The transcript payload is too large to send after compaction.
+    /// The transcript payload exceeds the configured byte budget.
     #[error(
-        "agent context requires {required_bytes} bytes after compaction, exceeding its {limit_bytes}-byte budget"
+        "the transcript requires {required_bytes} bytes, exceeding the {limit_bytes}-byte budget"
     )]
     ContextBudgetExceeded {
         /// Configured transcript budget in bytes.
@@ -353,6 +361,8 @@ impl RunJournal<'_> {
     ///
     /// # Errors
     ///
+    /// Returns [`RunError::ResumePromptMismatch`] if the original prompt differs
+    /// and [`RunError::RunWorkspaceMismatch`] if the options specify another run's workspace.
     /// A concurrent driver receives [`crate::JournalError::AlreadyRunning`] inside
     /// [`RunError::Journal`]. Returns [`RunError::ToolOutcomeUnknown`] if an interrupted
     /// tool cannot safely retry under its recorded and current recovery policies.
@@ -369,9 +379,7 @@ impl RunJournal<'_> {
             .as_ref()
             .is_some_and(|other| other != &self.workspace)
         {
-            return Err(RunError::InvalidJournal(
-                "workspace belongs to a different run",
-            ));
+            return Err(RunError::RunWorkspaceMismatch);
         }
         let _driver_lock = self.lock_driver()?;
         let options = options.with_workspace(self.workspace.clone());
@@ -540,7 +548,7 @@ fn validate_calls(
     for call in calls {
         skills.validate_call(call)?;
         if !used_call_ids.insert(call.id.clone()) {
-            return Err(RunError::DuplicateCallId {
+            return Err(RunError::DuplicateToolCallId {
                 id: call.id.clone(),
             });
         }

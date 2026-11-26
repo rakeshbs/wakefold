@@ -190,7 +190,7 @@ fn rejects_a_repeated_call_id_without_running_the_tool_again() {
     ));
 
     assert!(
-        matches!(result, Err(RunError::DuplicateCallId { .. })),
+        matches!(result, Err(RunError::DuplicateToolCallId { .. })),
         "{result:?}"
     );
     assert_eq!(tool.calls.load(Ordering::Relaxed), 1);
@@ -331,19 +331,24 @@ fn reported_zero_allows_continuation_and_missing_final_usage_is_counted() -> Res
 #[test]
 fn rejects_an_oversized_prompt_before_calling_the_provider() {
     let provider = ScriptedProvider::new([]);
-    let result = block_on(run_with_options(
+    let error = block_on(run_with_options(
         "café",
         &provider,
         &[],
         RunOptions::new(1).with_context_byte_budget(4),
-    ));
+    ))
+    .unwrap_err();
 
+    assert_eq!(
+        error.to_string(),
+        "the transcript requires 5 bytes, exceeding the 4-byte budget"
+    );
     assert!(matches!(
-        result,
-        Err(RunError::ContextBudgetExceeded {
+        error,
+        RunError::ContextBudgetExceeded {
             limit_bytes: 4,
             required_bytes: 5,
-        })
+        }
     ));
 }
 
@@ -397,7 +402,7 @@ fn compacted_tool_call_ids_still_reject_duplicates() {
     ));
 
     assert!(
-        matches!(&result, Err(RunError::DuplicateCallId { id }) if id == &"first".into()),
+        matches!(&result, Err(RunError::DuplicateToolCallId { id }) if id == &"first".into()),
         "{result:?}"
     );
     assert_eq!(tool.calls.load(Ordering::Relaxed), 2);
