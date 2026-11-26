@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use futures_executor::block_on;
 use serde_json::json;
 use wakefold::{
-    CancellationToken, DelegateTool, Message, ModelRequest, ModelResponse, Provider, ProviderError,
-    RunEvent, RunOptions, RunOutcome, ScheduledRunConfig, Skill, Tool, ToolCall, WaitOn,
-    WorkspaceStore,
+    CancellationToken, DelegateTool, JsonValue, Message, ModelRequest, ModelResponse, Provider,
+    ProviderError, RunError, RunEvent, RunOptions, RunOutcome, ScheduledRunConfig, Skill, Tool,
+    ToolCall, ToolError, ToolGrant, ToolSpec, WaitOn, WakeEvent, WorkspaceStore,
 };
 
 const TASK: &str = "Find the notebook price";
@@ -188,4 +188,265 @@ fn restart_delivers_the_saved_worker_result_once() {
         &events.last().unwrap().event,
         RunEvent::RunFinished(_)
     ));
+}
+
+struct LookupPrice<'a> {
+    path: &'a Path,
+    name: &'static str,
+}
+
+#[async_trait]
+impl Tool for LookupPrice<'_> {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(self.name, "Look up a price", json!({"type": "object"}))
+    }
+
+    async fn call(&self, arguments: &JsonValue) -> Result<JsonValue, ToolError> {
+        assert_eq!(*arguments, json!({"sku": "notebook"}));
+        std::fs::File::create_new(self.path.join(self.name)).unwrap();
+        Ok(json!("350 cents"))
+    }
+}
+
+struct Researcher {
+    tool: &'static str,
+    expected: JsonValue,
+}
+
+#[async_trait]
+impl Provider for Researcher {
+    async fn complete_response(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        let response = match request.messages.last().unwrap() {
+            Message::User(prompt) => {
+                assert_eq!(prompt, TASK);
+                assert!(!request.tools[0].description.contains("admin:"));
+                ToolCall::new("load", "load_skill", json!({"name": "prices"})).into()
+            }
+            Message::Tool(result) if result.call_id == "load".into() => {
+                let tools = result.value["tools"].as_array().unwrap();
+                assert_eq!(tools.len(), 1);
+                assert_eq!(tools[0]["name"], "prices.lookup");
+                ToolCall::new(
+                    "price",
+                    "call_tool",
+                    json!({"tool_name": self.tool, "arguments": {"sku": "notebook"}}),
+                )
+                .into()
+            }
+            Message::Tool(result) => {
+                assert_eq!(result.call_id, "price".into());
+                assert_eq!(result.value, self.expected);
+                ModelResponse::Final(result.value.as_str().unwrap_or("declined").into())
+            }
+            other => panic!("unexpected researcher boundary {other:?}"),
+        };
+        Ok(response)
+    }
+}
+
+fn research_options(grant: ToolGrant) -> RunOptions {
+    RunOptions::new(3).with_tool_grants([("prices.lookup", grant)])
+}
+
+#[test]
+fn ungranted_tool_is_hidden_and_cannot_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let lookup = LookupPrice {
+        path: root.path(),
+        name: "lookup",
+    };
+    let private = LookupPrice {
+        path: root.path(),
+        name: "private",
+    };
+    let tools: [&dyn Tool; 2] = [&lookup, &private];
+    let skills = [
+        Skill::new("prices", "Prices", &tools),
+        Skill::new("admin", "Restricted tools", &tools),
+    ];
+    let denied = block_on(wakefold::run_with_options(
+        TASK,
+        &Researcher {
+            tool: "prices.private",
+            expected: JsonValue::Null,
+        },
+        &skills,
+        research_options(ToolGrant::Allow),
+    ));
+    assert!(matches!(denied, Err(RunError::ToolAccessDenied { name }) if name == "prices.private"));
+    assert!(!root.path().join("private").exists());
+}
+
+#[test]
+fn declined_approval_finishes_the_call_without_running_the_handler() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = WorkspaceStore::open(root.path()).unwrap();
+    let lookup = LookupPrice {
+        path: root.path(),
+        name: "lookup",
+    };
+    let tools: [&dyn Tool; 1] = [&lookup];
+    let skills = [Skill::new("prices", "Prices", &tools)];
+    let provider = Researcher {
+        tool: "prices.lookup",
+        expected: json!({"approved": false}),
+    };
+    let pending = block_on(
+        store
+            .open_journal("chat", "run")
+            .unwrap()
+            .run_until_blocked(
+                TASK,
+                &provider,
+                &skills,
+                research_options(ToolGrant::RequireApproval),
+            ),
+    )
+    .unwrap();
+    let RunOutcome::Suspended(wait) = pending else {
+        panic!("expected an approval request")
+    };
+    assert!(
+        store
+            .resolve_wait(&wait.id, WakeEvent::Approval { approved: false })
+            .unwrap()
+    );
+    assert!(
+        !store
+            .resolve_wait(&wait.id, WakeEvent::Approval { approved: true })
+            .unwrap()
+    );
+    let outcome = block_on(
+        store
+            .open_journal("chat", "run")
+            .unwrap()
+            .run_until_blocked(
+                TASK,
+                &provider,
+                &skills,
+                research_options(ToolGrant::RequireApproval),
+            ),
+    )
+    .unwrap();
+    assert!(matches!(outcome, RunOutcome::Finished(report) if report.answer == "declined"));
+    assert!(!root.path().join("lookup").exists());
+}
+
+#[tokio::test]
+async fn delegated_worker_resumes_after_saved_tool_approval() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path();
+    let mut store = WorkspaceStore::open(path).unwrap();
+    let delegate = delegate_tool();
+    let delegation_tools: [&dyn Tool; 1] = [&delegate];
+    let coordinator_skills = [Skill::new("delegate", "Delegate a task", &delegation_tools)];
+    let coordinator_options =
+        || RunOptions::new(3).with_tool_grants([("delegate.research", ToolGrant::Allow)]);
+    let lookup = LookupPrice {
+        path,
+        name: "lookup",
+    };
+    let worker_tools: [&dyn Tool; 1] = [&lookup];
+    let worker_skills = [Skill::new("prices", "Prices", &worker_tools)];
+    let worker = Researcher {
+        tool: "prices.lookup",
+        expected: json!("350 cents"),
+    };
+    let outcome = store
+        .open_journal("chat", "parent")
+        .unwrap()
+        .run_until_blocked(
+            PROMPT,
+            &Coordinator,
+            &coordinator_skills,
+            coordinator_options(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, RunOutcome::Suspended(_)));
+
+    let cancellation = CancellationToken::new();
+    let mut worker_id = None;
+    tokio::time::timeout(Duration::from_secs(5), store.run_scheduler(
+        NonZeroUsize::MIN, &cancellation,
+        |run| {
+            assert_eq!(run.delegation.as_ref().unwrap().worker, "researcher");
+            ScheduledRunConfig::new(&worker, &worker_skills, research_options(ToolGrant::RequireApproval))
+        },
+        |run, outcome| {
+            assert!(matches!(outcome, RunOutcome::Suspended(wait) if matches!(wait.on, WaitOn::ToolApproval { .. })));
+            worker_id = Some(run.agent_id);
+            cancellation.cancel();
+        },
+    )).await.unwrap().unwrap();
+    assert!(
+        !path.join("lookup").exists(),
+        "the worker must wait before executing"
+    );
+
+    let mut store = WorkspaceStore::open(path).unwrap();
+    let approvals = store.pending_tool_approvals().unwrap();
+    let [(agent_id, wait)] = approvals.as_slice() else {
+        panic!("expected one saved approval")
+    };
+    assert_eq!(Some(*agent_id), worker_id);
+    assert!(
+        matches!(&wait.on, WaitOn::ToolApproval { tool_name, arguments }
+        if tool_name == "prices.lookup" && *arguments == json!({"sku": "notebook"}))
+    );
+    assert!(
+        !store
+            .resolve_wait(&wait.id, WakeEvent::Webhook(json!({"approved": true})))
+            .unwrap()
+    );
+    assert!(
+        store
+            .resolve_wait(&wait.id, WakeEvent::Approval { approved: true })
+            .unwrap()
+    );
+    assert!(store.pending_tool_approvals().unwrap().is_empty());
+    drop(store);
+
+    let cancellation = CancellationToken::new();
+    let store = WorkspaceStore::open(path).unwrap();
+    let mut outcomes = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.run_scheduler(
+            NonZeroUsize::MIN,
+            &cancellation,
+            |run| {
+                if run.delegation.is_some() {
+                    ScheduledRunConfig::new(
+                        &worker,
+                        &worker_skills,
+                        research_options(ToolGrant::RequireApproval),
+                    )
+                } else {
+                    ScheduledRunConfig::new(
+                        &Coordinator,
+                        &coordinator_skills,
+                        coordinator_options(),
+                    )
+                }
+            },
+            |run, outcome| {
+                let RunOutcome::Finished(report) = outcome else {
+                    panic!("expected the approved run to finish")
+                };
+                outcomes.push(report.answer.clone());
+                if run.delegation.is_none() {
+                    cancellation.cancel();
+                }
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(outcomes, ["350 cents", "The notebook costs 350 cents."]);
+    assert!(path.join("lookup").exists());
 }

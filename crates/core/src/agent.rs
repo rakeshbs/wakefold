@@ -4,7 +4,7 @@ mod recovery;
 pub use recovery::RunCheckpoint;
 use recovery::{RunDriver, RunPhase};
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::pin;
 
@@ -12,14 +12,14 @@ use futures_util::future::{Either, select};
 
 use thiserror::Error;
 
-use crate::skill::{RunSkills, ToolExecution};
+use crate::skill::{LOADER, RunSkills, ToolExecution};
 use crate::{
     CancellationToken, Message, ModelRequest, ModelRetryPolicy, PendingWait, Provider,
     ProviderError, RunEvent, RunJournal, RunWorkspace, Skill, TokenUsage, ToolCall, ToolCallId,
-    ToolContext, ToolError,
+    ToolContext, ToolError, ToolGrant,
 };
 
-/// Limits, retries, and cancellation for a single agent run.
+/// Limits, tool grants, retries, and cancellation for a single agent run.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct RunOptions {
@@ -29,6 +29,7 @@ pub struct RunOptions {
     model_retry_policy: ModelRetryPolicy,
     workspace: Option<RunWorkspace>,
     cancellation: Option<CancellationToken>,
+    tool_grants: Option<BTreeMap<String, ToolGrant>>,
 }
 
 impl RunOptions {
@@ -41,6 +42,7 @@ impl RunOptions {
             model_retry_policy: ModelRetryPolicy::default(),
             workspace: None,
             cancellation: None,
+            tool_grants: None,
         }
     }
 
@@ -87,6 +89,35 @@ impl RunOptions {
     pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
         self.cancellation = Some(token);
         self
+    }
+
+    /// Restrict this run to the listed skill-qualified tools.
+    ///
+    /// An empty list denies all tool access. By default the run can call tools
+    /// from every skill the host supplies. The host supplies grants again on
+    /// resume. Wakefold checks the current grant before dispatch.
+    pub fn with_tool_grants<'name>(
+        mut self,
+        grants: impl IntoIterator<Item = (&'name str, ToolGrant)>,
+    ) -> Self {
+        self.tool_grants = Some(
+            grants
+                .into_iter()
+                .map(|(name, grant)| (name.into(), grant))
+                .collect(),
+        );
+        self
+    }
+
+    pub(crate) fn tool_grant(&self, name: &str) -> Option<ToolGrant> {
+        match &self.tool_grants {
+            Some(grants) => grants.get(name).copied(),
+            None => Some(ToolGrant::Allow),
+        }
+    }
+
+    pub(crate) fn has_tool_allowlist(&self) -> bool {
+        self.tool_grants.is_some()
     }
 }
 
@@ -167,10 +198,24 @@ pub enum RunError {
     #[error("run suspended on wait {}", .0.id)]
     Suspended(PendingWait),
 
-    /// A tool requested suspension in a run without a journal.
+    /// A tool or an approval gate required suspension in a run without a journal.
     #[error("tool {name} requires a journaled run to suspend")]
     WaitRequiresJournal {
         /// The tool that requested suspension.
+        name: String,
+    },
+
+    /// The host did not grant this run access to the requested tool.
+    #[error("tool {name} is not granted to this run")]
+    ToolAccessDenied {
+        /// Skill-qualified tool name.
+        name: String,
+    },
+
+    /// The current grant requires approval to retry a call originally run without it.
+    #[error("tool {name} requires approval, but the interrupted attempt had no approval")]
+    ToolApprovalMissingOnResume {
+        /// Skill-qualified tool name.
         name: String,
     },
 
@@ -467,7 +512,7 @@ async fn drive(
     };
 
     let durable = journal.is_some();
-    let mut run = RunDriver::open(prompt, journal, RunSkills::new(skills)?, &options)?;
+    let mut run = RunDriver::open(prompt, journal, RunSkills::new(skills, &options)?, &options)?;
     let mut context_sizes = crate::context::ContextSizes::default();
     loop {
         check_cancelled(cancellation)?;
@@ -531,7 +576,38 @@ async fn drive(
             }
             Action::RunTool(call) => {
                 run.state.usage.check_budget(options.token_budget)?;
-                if matches!(run.phase, RunPhase::Ready) {
+                if call.name != LOADER {
+                    let name = run.skills.target_name(call);
+                    let grant =
+                        options
+                            .tool_grant(name)
+                            .ok_or_else(|| RunError::ToolAccessDenied {
+                                name: name.to_owned(),
+                            })?;
+                    if grant == ToolGrant::RequireApproval {
+                        match run.phase {
+                            RunPhase::Ready => {
+                                if !durable {
+                                    return Err(RunError::WaitRequiresJournal {
+                                        name: name.to_owned(),
+                                    });
+                                }
+                                let request = run.approval_request(call)?;
+                                run.commit([request])?;
+                                continue;
+                            }
+                            RunPhase::ToolPrepared {
+                                approved: false, ..
+                            } => {
+                                return Err(RunError::ToolApprovalMissingOnResume {
+                                    name: name.to_owned(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if matches!(run.phase, RunPhase::Ready | RunPhase::ToolApproved) {
                     run.prepare_tool_call(call.clone())?;
                     continue;
                 }
@@ -540,12 +616,13 @@ async fn drive(
                     options.workspace.clone(),
                     run.tool_call_key().map(str::to_owned),
                 );
-                let execution = await_cancellable(run.skills.call(call, context), cancellation)
-                    .await?
-                    .map_err(|source| RunError::Tool {
-                        name: run.skills.target_name(call).to_owned(),
-                        source,
-                    })?;
+                let execution =
+                    await_cancellable(run.skills.call(call, context, &options), cancellation)
+                        .await?
+                        .map_err(|source| RunError::Tool {
+                            name: run.skills.target_name(call).to_owned(),
+                            source,
+                        })?;
                 match execution {
                     ToolExecution::Completed(events) => run.commit(events)?,
                     ToolExecution::Waiting(on) => {

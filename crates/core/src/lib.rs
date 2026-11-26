@@ -40,8 +40,8 @@ pub use serde_json::Value as JsonValue;
 pub use skill::Skill;
 pub use tokio_util::sync::CancellationToken;
 pub use tool::{
-    Tool, ToolCall, ToolCallId, ToolContext, ToolError, ToolOutput, ToolRecovery, ToolResult,
-    ToolSpec,
+    Tool, ToolCall, ToolCallId, ToolContext, ToolError, ToolGrant, ToolOutput, ToolRecovery,
+    ToolResult, ToolSpec,
 };
 #[cfg(feature = "derive")]
 pub use typed_tool::{ToolInput, typed_tool, typed_tool_with_context};

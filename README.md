@@ -28,3 +28,19 @@ and the test process.
 ```sh
 cargo test --locked -p wakefold --test suspend a_thousand_timers_survive_restart -- --ignored --nocapture
 ```
+
+## Delegating to a worker
+
+Use `DelegateTool` to bind a tool in the coordinator's skill catalog to a named
+worker. A delegation saves the coordinator's wait and queues the worker in
+the same transaction. The scheduler supplies the worker's own configuration
+using `ScheduledRun::delegation`. A worker's saved answer returns to the
+coordinator as a tool result with `worker` and `answer` fields.
+
+Set an agent's allowed tools with `RunOptions::with_tool_grants` using
+skill-qualified names such as `prices.lookup`. Supply the grants when resuming
+the run too. A `RequireApproval` grant saves the exact proposed tool name and
+arguments before dispatch. Hosts can recover those requests with
+`WorkspaceStore::pending_tool_approvals` and deliver a decision with
+`WakeEvent::Approval`. A declined call returns `{"approved": false}` to the
+model.

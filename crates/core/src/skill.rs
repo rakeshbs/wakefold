@@ -6,8 +6,8 @@ use std::fmt::{self, Write};
 use serde_json::json;
 
 use crate::{
-    JsonValue, ModelToolSpec, RunError, RunEvent, Tool, ToolCall, ToolContext, ToolError,
-    ToolOutput, ToolRecovery, ToolResult, ToolSpec, WaitOn,
+    JsonValue, ModelToolSpec, RunError, RunEvent, RunOptions, Tool, ToolCall, ToolContext,
+    ToolError, ToolOutput, ToolRecovery, ToolResult, ToolSpec, WaitOn,
 };
 
 /// A named group of tools the agent can load together.
@@ -60,7 +60,7 @@ pub(crate) struct RunSkills<'a> {
 }
 
 impl<'a> RunSkills<'a> {
-    pub(crate) fn new(skills: &[Skill<'a>]) -> Result<Self, RunError> {
+    pub(crate) fn new(skills: &[Skill<'a>], options: &RunOptions) -> Result<Self, RunError> {
         let mut available = BTreeMap::new();
         let mut description = String::from(
             "Load a skill by name to receive its tool definitions. Use call_tool with a returned name as tool_name and the tool arguments on subsequent turns. Available skills:",
@@ -78,13 +78,19 @@ impl<'a> RunSkills<'a> {
                 }
                 tools.push((spec, tool));
             }
+            if !options.has_tool_allowlist()
+                || tools
+                    .iter()
+                    .any(|(spec, _)| options.tool_grant(&spec.name).is_some())
+            {
+                write!(description, "\n{}: {}", skill.name, skill.description)
+                    .expect("writing a skill description into a String succeeds");
+            }
             if available.insert(skill.name, tools).is_some() {
                 return Err(RunError::DuplicateSkillName {
                     name: skill.name.to_owned(),
                 });
             }
-            write!(description, "\n{}: {}", skill.name, skill.description)
-                .expect("writing a skill description into a String succeeds");
         }
         let loader = ModelToolSpec {
             name: LOADER.into(),
@@ -146,15 +152,22 @@ impl<'a> RunSkills<'a> {
         Ok(())
     }
 
-    fn definitions(&self, name: &str) -> Result<JsonValue, ToolError> {
+    fn definitions(&self, name: &str, options: &RunOptions) -> Result<JsonValue, ToolError> {
         let tools = self
             .available
             .get(name)
             .ok_or_else(|| ToolError::new(format!("skill {name} is unavailable to this agent")))?;
-        Ok(json!({
-            "loaded": name,
-            "tools": tools.iter().map(|(spec, _)| spec).collect::<Vec<_>>()
-        }))
+        let granted = tools
+            .iter()
+            .map(|(spec, _)| spec)
+            .filter(|spec| options.tool_grant(&spec.name).is_some())
+            .collect::<Vec<_>>();
+        if options.has_tool_allowlist() && granted.is_empty() {
+            return Err(ToolError::new(format!(
+                "skill {name} is unavailable to this agent"
+            )));
+        }
+        Ok(json!({ "loaded": name, "tools": granted }))
     }
 
     pub(crate) fn recovery(&self, call: &ToolCall) -> Result<ToolRecovery, ToolError> {
@@ -173,7 +186,7 @@ impl<'a> RunSkills<'a> {
             .map_or(&call.name, |(name, _)| name)
     }
 
-    fn dispatch_arguments<'call>(
+    pub(crate) fn dispatch_arguments<'call>(
         &self,
         call: &'call ToolCall,
     ) -> Result<(&'call str, &'call JsonValue), ToolError> {
@@ -201,11 +214,12 @@ impl<'a> RunSkills<'a> {
         &self,
         call: &ToolCall,
         context: ToolContext,
+        options: &RunOptions,
     ) -> Result<ToolExecution, ToolError> {
         let mut events = Vec::new();
         let value = if call.name == LOADER {
             let name = load_name(&call.arguments)?;
-            let definitions = self.definitions(name)?;
+            let definitions = self.definitions(name, options)?;
             if !self.is_loaded(name) {
                 events.push(RunEvent::SkillLoaded(name.to_owned()));
             }
@@ -217,6 +231,11 @@ impl<'a> RunSkills<'a> {
             })?;
             match handler.call_with_output(context, arguments).await? {
                 ToolOutput::Value(value) => value,
+                ToolOutput::Wait(WaitOn::ToolApproval { .. }) => {
+                    return Err(ToolError::new(
+                        "tool approval must be requested by a grant before dispatch",
+                    ));
+                }
                 ToolOutput::Wait(on) => return Ok(ToolExecution::Waiting(on)),
             }
         };

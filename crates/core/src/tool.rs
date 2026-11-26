@@ -61,6 +61,16 @@ impl ToolRecovery {
     }
 }
 
+/// How an agent may invoke a particular tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolGrant {
+    /// The agent may dispatch the tool directly.
+    Allow,
+    /// The host must approve each call before its handler can run.
+    RequireApproval,
+}
+
 /// A registered tool and the shape of its accepted arguments.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::{WaitOn, WakeEvent, current_millis, deadline_millis};
 use crate::journal::append_events;
-use crate::{JournalError, JsonValue, RunEvent, WorkspaceStore};
+use crate::{JournalError, JsonValue, PendingWait, RunEvent, WorkspaceStore};
 
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS run_waits (
@@ -21,7 +21,9 @@ pub(crate) const SCHEMA: &str = "
     );
     CREATE INDEX IF NOT EXISTS pending_timers ON run_waits(wake_at_ms, agent_id)
     WHERE wake_at_ms IS NOT NULL AND resolved = 0;
-    CREATE INDEX IF NOT EXISTS ready_waits ON run_waits(agent_id) WHERE resolved = 1;";
+    CREATE INDEX IF NOT EXISTS ready_waits ON run_waits(agent_id) WHERE resolved = 1;
+    CREATE INDEX IF NOT EXISTS pending_tool_approvals ON run_waits(agent_id)
+    WHERE source = 'tool_approval' AND resolved = 0;";
 
 pub(crate) fn record_transition(
     tx: &Transaction<'_>,
@@ -91,7 +93,8 @@ impl WorkspaceStore {
         let pending = tx
             .query_row(
                 "SELECT agent_id, started_sequence FROM run_waits
-                 WHERE wait_id = ?1 AND source = ?2 AND resolved = 0",
+                 WHERE wait_id = ?1 AND resolved = 0
+                   AND (source = ?2 OR (?2 = 'approval' AND source = 'tool_approval'))",
                 params![wait_id, source],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -101,6 +104,40 @@ impl WorkspaceStore {
         }
         tx.commit()?;
         Ok(pending.is_some())
+    }
+
+    /// Find recorded tool approval requests, including requests saved before a restart.
+    ///
+    /// Each pair contains the requesting agent's stable ID and the wait to pass
+    /// to [`Self::resolve_wait`] by ID when a person makes a decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a journal error if an approval cannot be read or decoded.
+    pub fn pending_tool_approvals(&self) -> Result<Vec<(i64, PendingWait)>, JournalError> {
+        let mut query = self.connection.prepare_cached(
+            "SELECT rw.agent_id, e.event_json FROM run_waits rw
+             JOIN run_events e ON e.agent_id = rw.agent_id AND e.sequence = rw.started_sequence
+             WHERE rw.source = 'tool_approval' AND rw.resolved = 0
+             ORDER BY rw.agent_id",
+        )?;
+        let mut rows = query.query([])?;
+        let mut approvals = Vec::new();
+        while let Some(row) = rows.next()? {
+            let value: String = row.get(1)?;
+            match serde_json::from_str(&value)? {
+                RunEvent::WaitStarted(
+                    wait @ PendingWait {
+                        on: WaitOn::ToolApproval { .. },
+                        ..
+                    },
+                ) => {
+                    approvals.push((row.get(0)?, wait));
+                }
+                _ => return Err(JournalError::InvalidWait("expected a saved tool approval")),
+            }
+        }
+        Ok(approvals)
     }
 
     /// Resolve up to `limit` timers due at or before `now`.

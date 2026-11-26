@@ -9,7 +9,7 @@ use crate::context::Compaction;
 use crate::skill::{LOADER, RunSkills};
 use crate::{
     JsonValue, Message, ModelTurn, PendingWait, RunEvent, RunJournal, ToolCall, ToolCallId,
-    ToolRecovery, ToolResult,
+    ToolRecovery, ToolResult, WaitOn,
 };
 
 /// A durable model-call boundary containing the compacted transcript and run bookkeeping.
@@ -68,11 +68,13 @@ pub(super) enum RunPhase {
         call: ToolCall,
         recovery: ToolRecovery,
         tool_call_key: String,
+        approved: bool,
     },
     Waiting {
         call_id: ToolCallId,
         wait: PendingWait,
     },
+    ToolApproved,
     Finished(String),
 }
 
@@ -155,8 +157,25 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         self.commit([RunEvent::ToolCallPrepared {
             call,
             recovery,
-            tool_call_key: format!("wakefold-{:032x}", rand::random::<u128>()),
+            tool_call_key: new_event_id(),
         }])
+    }
+
+    pub fn approval_request(&self, call: &ToolCall) -> Result<RunEvent, RunError> {
+        let (name, arguments) =
+            self.skills
+                .dispatch_arguments(call)
+                .map_err(|source| RunError::Tool {
+                    name: call.name.clone(),
+                    source,
+                })?;
+        Ok(RunEvent::WaitStarted(PendingWait {
+            id: new_event_id(),
+            on: WaitOn::ToolApproval {
+                tool_name: name.to_owned(),
+                arguments: arguments.clone(),
+            },
+        }))
     }
 
     pub fn tool_call_key(&self) -> Option<&str> {
@@ -223,7 +242,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                 RunPhase::Ready
             }
             (
-                RunPhase::Ready,
+                phase @ (RunPhase::Ready | RunPhase::ToolApproved),
                 RunEvent::ToolCallPrepared {
                     call,
                     recovery,
@@ -236,6 +255,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                     call,
                     recovery,
                     tool_call_key,
+                    approved: matches!(phase, RunPhase::ToolApproved),
                 }
             }
             (RunPhase::ToolPrepared { call, .. }, RunEvent::SkillLoaded(name))
@@ -261,6 +281,32 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                 self.state.messages.push(Message::Tool(result));
                 RunPhase::Ready
             }
+            (RunPhase::Ready, RunEvent::WaitStarted(wait)) => {
+                let (
+                    WaitOn::ToolApproval {
+                        tool_name,
+                        arguments,
+                    },
+                    Some(Action::RunTool(call)),
+                ) = (&wait.on, action())
+                else {
+                    return Err(RunError::InvalidJournal(
+                        "expected an approval for the next tool call",
+                    ));
+                };
+                if wait.id.is_empty()
+                    || self.skills.dispatch_arguments(call).ok()
+                        != Some((tool_name.as_str(), arguments))
+                {
+                    return Err(RunError::InvalidJournal(
+                        "approval does not match the next tool call",
+                    ));
+                }
+                RunPhase::Waiting {
+                    call_id: call.id.clone(),
+                    wait,
+                }
+            }
             (
                 RunPhase::ToolPrepared {
                     call,
@@ -268,13 +314,30 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                     ..
                 },
                 RunEvent::WaitStarted(wait),
-            ) if call.name != LOADER && wait.id == *tool_call_key => RunPhase::Waiting {
-                call_id: call.id.clone(),
-                wait,
-            },
+            ) if call.name != LOADER
+                && !matches!(wait.on, WaitOn::ToolApproval { .. })
+                && wait.id == *tool_call_key =>
+            {
+                RunPhase::Waiting {
+                    call_id: call.id.clone(),
+                    wait,
+                }
+            }
             (RunPhase::Waiting { call_id, wait }, RunEvent::Woken { wait_id, payload })
                 if wait.id == wait_id =>
             {
+                if matches!(wait.on, WaitOn::ToolApproval { .. }) {
+                    match payload["approved"].as_bool() {
+                        Some(true) => {
+                            self.phase = RunPhase::ToolApproved;
+                            return Ok(());
+                        }
+                        Some(false) => {}
+                        None => {
+                            return Err(RunError::InvalidJournal("invalid tool approval decision"));
+                        }
+                    }
+                }
                 self.state
                     .messages
                     .push(Message::Tool(ToolResult::new(call_id.clone(), payload)));
@@ -287,4 +350,8 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         };
         Ok(())
     }
+}
+
+fn new_event_id() -> String {
+    format!("wakefold-{:032x}", rand::random::<u128>())
 }

@@ -26,6 +26,13 @@ pub enum WaitOn {
     Webhook,
     /// Resume with a human decision delivered by the host.
     Approval,
+    /// Wait for the host to approve a specific tool call before dispatch.
+    ToolApproval {
+        /// Skill-qualified name of the tool.
+        tool_name: String,
+        /// Actual tool arguments the host reviews.
+        arguments: JsonValue,
+    },
     /// Start a worker in this chat and resume with its saved answer.
     Delegation {
         /// Worker name registered by the host.
@@ -42,6 +49,7 @@ impl WaitOn {
             Self::Message => "message",
             Self::Webhook => "webhook",
             Self::Approval => "approval",
+            Self::ToolApproval { .. } => "tool_approval",
             Self::Delegation { .. } => "delegation",
         }
     }
