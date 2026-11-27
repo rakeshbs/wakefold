@@ -11,6 +11,8 @@ use wakefold::{
     ToolError, ToolResult, ToolSpec, run, run_with_options,
 };
 
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
+
 #[derive(Default)]
 struct Echo {
     calls: AtomicUsize,
@@ -77,8 +79,8 @@ fn resumes_a_saved_single_tool_call_from_an_older_journal() -> Result<(), Box<dy
     let (_, messages) = common::load_skill(&user, "util", &[tool.spec()]);
     {
         let mut store = WorkspaceStore::open(dir.path())?;
-        let workspace = store.open_run_workspace("chat", "run")?;
-        store.open_journal("chat", "run")?.append(
+        let workspace = store.open_run_workspace(CHAT, "run")?;
+        store.open_journal(CHAT, "run")?.append(
             0,
             &[
                 RunEvent::RunStarted(prompt.into()),
@@ -101,7 +103,7 @@ fn resumes_a_saved_single_tool_call_from_an_older_journal() -> Result<(), Box<dy
     }
 
     let mut store = WorkspaceStore::open(dir.path())?;
-    let mut journal = store.open_journal("chat", "run")?;
+    let mut journal = store.open_journal(CHAT, "run")?;
     let provider = ScriptedProvider::new([ScriptedTurn::new(
         messages,
         ModelResponse::Final("ready".into()),

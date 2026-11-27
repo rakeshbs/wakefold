@@ -14,6 +14,8 @@ use wakefold::{
     WorkspaceStore,
 };
 
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
+
 const PROMPT: &str = "Wait and report the result.";
 const ONE: NonZeroUsize = NonZeroUsize::MIN;
 
@@ -66,7 +68,7 @@ fn run(
     provider: &dyn Provider,
     tool: &dyn Tool,
 ) -> Result<RunOutcome, RunError> {
-    let mut journal = store.open_journal("chat", "run").unwrap();
+    let mut journal = store.open_journal(CHAT, "run").unwrap();
     block_on(journal.run_until_blocked(
         PROMPT,
         provider,
@@ -130,7 +132,7 @@ fn timer_and_wake_survive_reopening_the_database() {
     assert_eq!(store.wake_due_timers(after_deadline, ONE).unwrap(), 1);
     assert_eq!(store.wake_due_timers(after_deadline, ONE).unwrap(), 0);
     let events = store
-        .open_journal("chat", "run")
+        .open_journal(CHAT, "run")
         .unwrap()
         .load_after(0)
         .unwrap();
@@ -250,7 +252,7 @@ fn start_timer(store: &mut WorkspaceStore, key: &str, wake_at: SystemTime) {
     let tool = ExternalWait(WaitOn::Timer { wake_at });
     let tools: [&dyn Tool; 1] = [&tool];
     let skill = Skill::new("test", "Test waits", &tools);
-    let mut journal = store.open_journal("chat", key).unwrap();
+    let mut journal = store.open_journal(CHAT, key).unwrap();
     let outcome =
         block_on(journal.run_until_blocked(PROMPT, &provider, &[skill], RunOptions::new(4)))
             .unwrap();

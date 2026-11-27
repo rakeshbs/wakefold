@@ -383,7 +383,7 @@ async fn http_workflow_survives_daemon_restart() {
         }).to_string()).unwrap();
 
         let client = Client::builder().no_proxy().build().unwrap();
-        let request = json!({ "chat_key": "notebook-order", "run_key": "check", "agent": "coordinator", "prompt": PROMPT });
+        let request = json!({ "chat_id": wakefold::ChatId::from_u128(1), "run_key": "check", "agent": "coordinator", "prompt": PROMPT });
         let (daemon, address) = launch(&config, ORDER_TEST).await;
         let response = client.post(format!("http://{address}/runs")).json(&request).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -479,7 +479,7 @@ async fn http_workflow_survives_daemon_restart() {
         assert_eq!(repeated.status(), StatusCode::NOT_FOUND);
 
         let no_budget: Value = client.post(format!("http://{address}/runs"))
-            .json(&json!({"chat_key": "notebook-order", "run_key": "blocked", "agent": "no_budget", "prompt": "Must not start"}))
+            .json(&json!({"chat_id": wakefold::ChatId::from_u128(1), "run_key": "blocked", "agent": "no_budget", "prompt": "Must not start"}))
             .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
         let id = no_budget["agent_id"].as_i64().unwrap();
         let (mut socket, _) = connect_async(format!("ws://{address}/runs/{id}/events")).await.unwrap();
@@ -523,7 +523,7 @@ async fn http_messages_survive_daemon_restart() {
         let client = Client::builder().no_proxy().build().unwrap();
         let (daemon, address) = launch(&config, MAILBOX_TEST).await;
         let response = client.post(format!("http://{address}/runs")).json(&json!({
-            "chat_key": "chat", "run_key": "mailbox-check", "agent": "receiver", "prompt": MAILBOX_PROMPT
+            "chat_id": wakefold::ChatId::from_u128(2), "run_key": "mailbox-check", "agent": "receiver", "prompt": MAILBOX_PROMPT
         })).send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
         let agent_id = response["agent_id"].as_i64().unwrap();
         let pending = loop {
@@ -652,7 +652,7 @@ async fn mcp_tool_works_after_daemon_restart() {
         let client = Client::builder().no_proxy().build().unwrap();
         let (daemon, address) = launch(&config, MCP_TEST).await;
         let response = client.post(format!("http://{address}/runs")).json(&json!({
-            "chat_key": "catalog", "run_key": "prices", "agent": "assistant", "prompt": MCP_PROMPT
+            "chat_id": wakefold::ChatId::from_u128(3), "run_key": "prices", "agent": "assistant", "prompt": MCP_PROMPT
         })).send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
         let agent_id = response["agent_id"].as_i64().unwrap();
         let first = next_approval(&client, address, "").await;

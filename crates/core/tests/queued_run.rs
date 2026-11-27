@@ -5,12 +5,14 @@ use wakefold::{
     CancellationToken, JournalReplay, QueueRunError, RunEvent, SchedulerError, WorkspaceStore,
 };
 
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
+
 #[test]
 fn journal_replay_keeps_a_snapshot_while_the_run_advances() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
     let id = store
-        .queue_run("chat", "job", "agent", "Inspect an order.")
+        .queue_run(CHAT, "job", "agent", "Inspect an order.")
         .unwrap();
     let replay = JournalReplay::open(state.path()).unwrap();
     let first = replay
@@ -22,7 +24,7 @@ fn journal_replay_keeps_a_snapshot_while_the_run_advances() {
 
     assert!(
         store
-            .open_journal("chat", "job")
+            .open_journal(CHAT, "job")
             .unwrap()
             .record_failure("stopped".into())
             .unwrap()
@@ -47,20 +49,20 @@ fn queued_run_retains_its_identity_and_terminal_failure_after_reopening() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
     let id = store
-        .queue_run("chat", "job", "coordinator", "Review this order.")
+        .queue_run(CHAT, "job", "coordinator", "Review this order.")
         .unwrap();
     assert_eq!(
         store
-            .queue_run("chat", "job", "coordinator", "Review this order.")
+            .queue_run(CHAT, "job", "coordinator", "Review this order.")
             .unwrap(),
         id
     );
     assert!(matches!(
-        store.queue_run("chat", "job", "worker", "Review this order."),
+        store.queue_run(CHAT, "job", "worker", "Review this order."),
         Err(QueueRunError::Conflict)
     ));
     assert!(matches!(
-        store.queue_run("chat", "job", "coordinator", "Another prompt"),
+        store.queue_run(CHAT, "job", "coordinator", "Another prompt"),
         Err(QueueRunError::Conflict)
     ));
     drop(store);
@@ -82,7 +84,7 @@ fn queued_run_retains_its_identity_and_terminal_failure_after_reopening() {
     assert_eq!(run.agent_name.as_deref(), Some("coordinator"));
 
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    let mut journal = store.open_journal(&run.chat_key, &run.run_key).unwrap();
+    let mut journal = store.open_journal(run.chat_id, &run.run_key).unwrap();
     assert!(journal.record_failure("agent removed".into()).unwrap());
     assert!(!journal.record_failure("duplicate failure".into()).unwrap());
     drop(store);

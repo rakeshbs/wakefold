@@ -11,7 +11,7 @@ use wakefold::{
     TokenUsage, Tool, ToolCall, ToolError, ToolGrant, ToolSpec, WaitOn, WakeEvent, WorkspaceStore,
 };
 
-const CHAT: &str = "notebook-order";
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
 const COORDINATOR: &str = "coordinator";
 const PROMPT: &str = "Find the notebook price and obtain a review.";
 const CATALOG: &str = "catalog";

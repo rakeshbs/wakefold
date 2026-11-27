@@ -15,6 +15,8 @@ use wakefold::{
     ToolContext, ToolError, ToolRecovery, ToolSpec, WorkspaceStore,
 };
 
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
+
 const WORKER_ROOT: &str = "WAKEFOLD_RECOVERY_WORKER_ROOT";
 const FAULT_POINT: &str = "WAKEFOLD_RECOVERY_FAULT_POINT";
 const POLICIES: [ToolRecovery; 3] = [
@@ -222,7 +224,7 @@ fn run_workflow(
     let tools: [&dyn Tool; 3] = [&read, &reserve, &notify];
     let skills = [Skill::new("workflow", "Read, reserve and notify", &tools)];
     let mut store = WorkspaceStore::open(root).unwrap();
-    let mut journal = store.open_journal("chat", "run").unwrap();
+    let mut journal = store.open_journal(CHAT, "run").unwrap();
     if let Some(hook) = hook {
         journal.set_commit_hook(hook);
     }
@@ -232,7 +234,7 @@ fn run_workflow(
 fn events(root: &Path) -> Vec<RunEvent> {
     let mut store = WorkspaceStore::open(root).unwrap();
     store
-        .open_journal("chat", "run")
+        .open_journal(CHAT, "run")
         .unwrap()
         .load_after(0)
         .unwrap()
@@ -443,7 +445,7 @@ fn recovery_requires_the_original_and_current_policies_to_allow_repetition() {
         let root = tempfile::tempdir().unwrap();
         let mut store = WorkspaceStore::open(root.path()).unwrap();
         store
-            .open_journal("chat", "run")
+            .open_journal(CHAT, "run")
             .unwrap()
             .append(0, &history[..=end])
             .unwrap();

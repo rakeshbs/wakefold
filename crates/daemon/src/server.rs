@@ -92,7 +92,7 @@ async fn drive(runtime: &Runtime, stop: &CancellationToken) -> Result<(), Daemon
                         parent_agent_id =
                             run.delegation.as_ref().map(|worker| worker.parent_agent_id),
                         agent = name,
-                        chat_key = run.chat_key.as_str(),
+                        chat_id = %run.chat_id,
                         run_key = run.run_key.as_str(),
                         "dispatching ready run"
                     );
@@ -116,7 +116,7 @@ async fn drive(runtime: &Runtime, stop: &CancellationToken) -> Result<(), Daemon
         };
         tracing::warn!(
             agent_id = run.agent_id,
-            chat_key = run.chat_key.as_str(),
+            chat_id = %run.chat_id,
             run_key = run.run_key.as_str(),
             "run execution failed"
         );
@@ -128,7 +128,7 @@ async fn drive(runtime: &Runtime, stop: &CancellationToken) -> Result<(), Daemon
 fn fail_run(state: &Path, run: &ScheduledRun, error: String) -> Result<(), DaemonError> {
     let mut store = WorkspaceStore::open(state)?;
     store
-        .open_journal(&run.chat_key, &run.run_key)?
+        .open_journal(run.chat_id, &run.run_key)?
         .record_failure(error)?;
     Ok(())
 }

@@ -270,7 +270,7 @@ pub(crate) fn record_sent_message(
     let inserted = tx.sql().execute(
         "INSERT INTO mailbox(message_id, from_agent_id, to_agent_id, payload_json)
          SELECT ?1, sender.agent_id, recipient.agent_id, ?4
-         FROM workspace_runs sender JOIN workspace_runs recipient USING (workspace_id)
+         FROM workspace_runs sender JOIN workspace_runs recipient USING (chat_id)
          WHERE sender.agent_id = ?2 AND recipient.agent_id = ?3",
         params![
             message_id,

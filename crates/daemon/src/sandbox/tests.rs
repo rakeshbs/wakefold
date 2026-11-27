@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use wakefold::WorkspaceStore;
+use wakefold::{ChatId, WorkspaceStore};
 
 use super::{Config, Sandbox};
 
@@ -56,11 +56,14 @@ fn python(source: &str) -> Vec<String> {
 async fn workspace_permissions_and_limits_survive_reuse() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    let caller = store.open_run_workspace("chat", "caller").unwrap();
-    let peer = store.open_run_workspace("chat", "shared").unwrap();
-    let hidden = store.open_run_workspace("chat", "unshared").unwrap();
-    let restricted = store.open_run_workspace("chat", "restricted").unwrap();
-    let other = store.open_run_workspace("other", "outside").unwrap();
+    let chat_id = ChatId::new_v4();
+    let caller = store.open_run_workspace(chat_id, "caller").unwrap();
+    let peer = store.open_run_workspace(chat_id, "shared").unwrap();
+    let hidden = store.open_run_workspace(chat_id, "unshared").unwrap();
+    let restricted = store.open_run_workspace(chat_id, "restricted").unwrap();
+    let other = store
+        .open_run_workspace(ChatId::new_v4(), "outside")
+        .unwrap();
     for (workspace, name) in [
         (&peer, "shared.txt"),
         (&hidden, "private.txt"),
@@ -131,7 +134,7 @@ async fn workspace_permissions_and_limits_survive_reuse() {
     assert_eq!(report["interfaces"], json!(["lo"]));
     let slot = sandbox.agents.lock().await[&caller.agent_id()].clone();
     let first_pid = slot.lock().await.as_ref().unwrap().child.id();
-    let newcomer = store.open_run_workspace("chat", "newcomer").unwrap();
+    let newcomer = store.open_run_workspace(chat_id, "newcomer").unwrap();
     fs::write(
         newcomer
             .chat_root()

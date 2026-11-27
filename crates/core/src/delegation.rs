@@ -102,8 +102,8 @@ pub(crate) fn start_worker(
 ) -> Result<(), JournalError> {
     // The parent's durable call key also identifies the child within the chat.
     let child = tx.sql().query_row(
-        "INSERT INTO workspace_runs(workspace_id, run_key)
-         SELECT workspace_id, ?2 FROM workspace_runs WHERE agent_id = ?1
+        "INSERT INTO workspace_runs(chat_id, run_key)
+         SELECT chat_id, ?2 FROM workspace_runs WHERE agent_id = ?1
          RETURNING agent_id",
         params![parent, wait_id],
         |row| row.get(0),

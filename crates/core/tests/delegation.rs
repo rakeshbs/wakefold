@@ -12,6 +12,8 @@ use wakefold::{
     ToolCall, ToolError, ToolGrant, ToolSpec, WaitOn, WakeEvent, WorkspaceStore,
 };
 
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
+
 const TASK: &str = "Find the notebook price";
 const PROMPT: &str = "Ask the researcher for the notebook price.";
 const CHILD_STATE: &str = "WAKEFOLD_DELEGATION_TEST_STATE";
@@ -85,7 +87,7 @@ fn finish_worker_then_exit(path: &Path) {
                 .as_ref()
                 .expect("only the worker should be ready");
             assert_eq!(delegation.worker, "researcher");
-            assert_eq!(run.chat_key, "chat");
+            assert_eq!(run.chat_id, CHAT);
             assert_ne!(delegation.parent_agent_id, run.agent_id);
             ScheduledRunConfig::new(&worker, &[], RunOptions::new(1))
         },
@@ -110,13 +112,13 @@ fn restart_delivers_the_saved_worker_result_once() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path();
     let mut store = WorkspaceStore::open(path).unwrap();
-    let parent = store.open_run_workspace("chat", "parent").unwrap();
+    let parent = store.open_run_workspace(CHAT, "parent").unwrap();
     let tool = delegate_tool();
     let tools: [&dyn Tool; 1] = [&tool];
     let skills = [Skill::new("delegate", "Delegate a task", &tools)];
     let outcome = block_on(
         store
-            .open_journal("chat", "parent")
+            .open_journal(CHAT, "parent")
             .unwrap()
             .run_until_blocked(PROMPT, &Coordinator, &skills, RunOptions::new(3)),
     )
@@ -138,14 +140,14 @@ fn restart_delivers_the_saved_worker_result_once() {
     assert!(path.join("research-ran").is_file());
 
     let mut store = WorkspaceStore::open(path).unwrap();
-    let child = store.open_run_workspace("chat", &wait.id).unwrap();
+    let child = store.open_run_workspace(CHAT, &wait.id).unwrap();
     assert_eq!(child.chat_root(), parent.chat_root());
     assert_ne!(
         child.agent_relative_directory(),
         parent.agent_relative_directory()
     );
     let events = store
-        .open_journal("chat", "parent")
+        .open_journal(CHAT, "parent")
         .unwrap()
         .load_after(0)
         .unwrap();
@@ -173,7 +175,7 @@ fn restart_delivers_the_saved_worker_result_once() {
     });
     let mut store = WorkspaceStore::open(path).unwrap();
     let events = store
-        .open_journal("chat", "parent")
+        .open_journal(CHAT, "parent")
         .unwrap()
         .load_after(0)
         .unwrap();
@@ -294,17 +296,12 @@ fn declined_approval_finishes_the_call_without_running_the_handler() {
         tool: "prices.lookup",
         expected: json!({"approved": false}),
     };
-    let pending = block_on(
-        store
-            .open_journal("chat", "run")
-            .unwrap()
-            .run_until_blocked(
-                TASK,
-                &provider,
-                &skills,
-                research_options(ToolGrant::RequireApproval),
-            ),
-    )
+    let pending = block_on(store.open_journal(CHAT, "run").unwrap().run_until_blocked(
+        TASK,
+        &provider,
+        &skills,
+        research_options(ToolGrant::RequireApproval),
+    ))
     .unwrap();
     let RunOutcome::Suspended(wait) = pending else {
         panic!("expected an approval request")
@@ -319,17 +316,12 @@ fn declined_approval_finishes_the_call_without_running_the_handler() {
             .resolve_wait(&wait.id, WakeEvent::Approval { approved: true })
             .unwrap()
     );
-    let outcome = block_on(
-        store
-            .open_journal("chat", "run")
-            .unwrap()
-            .run_until_blocked(
-                TASK,
-                &provider,
-                &skills,
-                research_options(ToolGrant::RequireApproval),
-            ),
-    )
+    let outcome = block_on(store.open_journal(CHAT, "run").unwrap().run_until_blocked(
+        TASK,
+        &provider,
+        &skills,
+        research_options(ToolGrant::RequireApproval),
+    ))
     .unwrap();
     assert!(matches!(outcome, RunOutcome::Finished(report) if report.answer == "declined"));
     assert!(!root.path().join("lookup").exists());
@@ -356,7 +348,7 @@ async fn delegated_worker_resumes_after_saved_tool_approval() {
         expected: json!("350 cents"),
     };
     let outcome = store
-        .open_journal("chat", "parent")
+        .open_journal(CHAT, "parent")
         .unwrap()
         .run_until_blocked(
             PROMPT,

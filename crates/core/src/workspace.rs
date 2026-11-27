@@ -7,6 +7,15 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, ErrorCode, TransactionBehavior, params};
 use thiserror::Error;
 
+use crate::ChatId;
+
+mod migration;
+
+pub(crate) const CHAT_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS chats (
+        chat_id BLOB NOT NULL PRIMARY KEY CHECK(length(chat_id) = 16)
+    ) WITHOUT ROWID;";
+
 /// A failure to open workspace metadata or materialize a directory.
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
@@ -77,18 +86,17 @@ impl WorkspaceStore {
                 }
             }
         }
+        connection.execute_batch("PRAGMA synchronous = FULL;")?;
+        migration::upgrade(&mut connection, &state)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        connection.execute_batch(CHAT_SCHEMA)?;
         connection.execute_batch(
-            "PRAGMA synchronous = FULL;
-             PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS workspaces (
-                 id INTEGER PRIMARY KEY,
-                 chat_key TEXT NOT NULL UNIQUE
-             );
+            "
              CREATE TABLE IF NOT EXISTS workspace_runs (
                  agent_id INTEGER PRIMARY KEY,
-                 workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+                 chat_id BLOB NOT NULL REFERENCES chats(chat_id),
                  run_key TEXT NOT NULL,
-                 UNIQUE(workspace_id, run_key)
+                 UNIQUE(chat_id, run_key)
              );",
         )?;
         connection.execute_batch(crate::journal::SCHEMA)?;
@@ -100,6 +108,19 @@ impl WorkspaceStore {
         Ok(Self { connection, state })
     }
 
+    /// Create a chat and return its UUID.
+    ///
+    /// The workspace directory is created when the chat's first run opens it.
+    ///
+    /// # Errors
+    /// Returns an error if the chat could not be saved.
+    pub fn create_chat(&self) -> Result<ChatId, WorkspaceError> {
+        let chat_id = ChatId::new_v4();
+        self.connection
+            .execute("INSERT INTO chats(chat_id) VALUES (?1)", [chat_id])?;
+        Ok(chat_id)
+    }
+
     /// Open the journal for a chat and run, creating their metadata on first use.
     ///
     /// # Errors
@@ -107,10 +128,10 @@ impl WorkspaceStore {
     /// Returns a workspace error if the run cannot be opened.
     pub fn open_journal(
         &mut self,
-        chat_key: &str,
+        chat_id: ChatId,
         run_key: &str,
     ) -> Result<crate::RunJournal<'_>, WorkspaceError> {
-        let run = self.open_run_workspace(chat_key, run_key)?;
+        let run = self.open_run_workspace(chat_id, run_key)?;
         let locks = self.state.join("run-locks");
         fs::create_dir_all(&locks)?;
         let lock_path = locks.join(run.agent_id().to_string());
@@ -123,29 +144,29 @@ impl WorkspaceStore {
         ))
     }
 
-    /// Open or create a run's workspace using stable chat and run keys.
+    /// Open or create a run's workspace using its chat UUID and run key.
     ///
-    /// A new run receives its own agent directory. Reusing both keys restores
-    /// the same directories. Only database-generated IDs appear in host paths.
+    /// A new run receives its own agent directory under the chat UUID. Reusing
+    /// the UUID and run key restores the same directories.
     ///
     /// # Errors
     ///
     /// Returns an error if the mapping or directories cannot be opened.
-    /// Retrying with the same keys is safe after a partial failure.
+    /// Retrying with the same identifiers is safe after a partial failure.
     pub fn open_run_workspace(
         &mut self,
-        chat_key: &str,
+        chat_id: ChatId,
         run_key: &str,
     ) -> Result<RunWorkspace, WorkspaceError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (workspace_id, agent_id) = reserve_run(&tx, chat_key, run_key)?;
-        // Reserve both IDs durably before creating files. An interrupted
+        let agent_id = reserve_run(&tx, chat_id, run_key)?;
+        // Reserve the run durably before creating files. An interrupted
         // initialization can then finish without reassigning the directory.
         tx.commit()?;
         let workspace = RunWorkspace {
-            chat_root: self.state.join("workspaces").join(workspace_id.to_string()),
+            chat_root: chat_directory(&self.state, chat_id),
             agent_id,
         };
         fs::create_dir_all(
@@ -157,30 +178,28 @@ impl WorkspaceStore {
     }
 }
 
+fn chat_directory(state: &Path, chat_id: ChatId) -> PathBuf {
+    state.join("workspaces").join(chat_id.to_string())
+}
+
 pub(crate) fn reserve_run(
     tx: &rusqlite::Transaction<'_>,
-    chat_key: &str,
+    chat_id: ChatId,
     run_key: &str,
-) -> Result<(i64, i64), rusqlite::Error> {
+) -> Result<i64, rusqlite::Error> {
     tx.execute(
-        "INSERT INTO workspaces(chat_key) VALUES (?1) ON CONFLICT(chat_key) DO NOTHING",
-        [chat_key],
+        "INSERT INTO chats(chat_id) VALUES (?1) ON CONFLICT(chat_id) DO NOTHING",
+        [chat_id],
     )?;
-    let workspace_id: i64 = tx.query_row(
-        "SELECT id FROM workspaces WHERE chat_key = ?1",
-        [chat_key],
-        |row| row.get(0),
-    )?;
-    let keys = params![workspace_id, run_key];
+    let keys = params![chat_id, run_key];
     tx.execute(
-        "INSERT INTO workspace_runs(workspace_id, run_key) VALUES (?1, ?2)
-         ON CONFLICT(workspace_id, run_key) DO NOTHING",
+        "INSERT INTO workspace_runs(chat_id, run_key) VALUES (?1, ?2)
+         ON CONFLICT(chat_id, run_key) DO NOTHING",
         keys,
     )?;
-    let agent_id = tx.query_row(
-        "SELECT agent_id FROM workspace_runs WHERE workspace_id = ?1 AND run_key = ?2",
+    tx.query_row(
+        "SELECT agent_id FROM workspace_runs WHERE chat_id = ?1 AND run_key = ?2",
         keys,
         |row| row.get(0),
-    )?;
-    Ok((workspace_id, agent_id))
+    )
 }

@@ -16,8 +16,8 @@ use thiserror::Error;
 
 use crate::wait::current_millis;
 use crate::{
-    CancellationToken, DelegatedRun, JournalError, Provider, RunError, RunOptions, RunOutcome,
-    Skill, WorkspaceError, WorkspaceStore,
+    CancellationToken, ChatId, DelegatedRun, JournalError, Provider, RunError, RunOptions,
+    RunOutcome, Skill, WorkspaceError, WorkspaceStore,
 };
 
 // Independent store handles and wall-clock adjustments can change the next wake time.
@@ -30,8 +30,8 @@ const MIN_IDLE_DELAY: Duration = Duration::from_millis(1);
 pub struct ScheduledRun {
     /// ID assigned by the workspace store.
     pub agent_id: i64,
-    /// Chat key used to open the journal.
-    pub chat_key: String,
+    /// Chat UUID used to open the journal.
+    pub chat_id: ChatId,
     /// Run key used to open the journal.
     pub run_key: String,
     /// Parent and worker configuration for a delegated run.
@@ -86,10 +86,10 @@ pub enum SchedulerError {
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
     /// The host has no configuration for a ready run.
-    #[error("no agent configuration for run {} in chat {}", .0.run_key, .0.chat_key)]
+    #[error("no agent configuration for run {} in chat {}", .0.run_key, .0.chat_id)]
     MissingAgent(ScheduledRun),
     /// A driver returned an error while resuming a scheduled run.
-    #[error("could not resume run {} in chat {}", run.run_key, run.chat_key)]
+    #[error("could not resume run {} in chat {}", run.run_key, run.chat_id)]
     Resume {
         /// Run whose driver failed.
         run: ScheduledRun,
@@ -248,11 +248,10 @@ impl WorkspaceStore {
                 SELECT agent_id FROM queued_runs WHERE ready = 1
                 ORDER BY 1 LIMIT ?1
             )
-            SELECT ready.agent_id, w.chat_key, wr.run_key, e.event_json,
+            SELECT ready.agent_id, wr.chat_id, wr.run_key, e.event_json,
                    d.parent_agent_id, d.worker, COALESCE(q.agent_name, d.worker)
             FROM ready
             JOIN workspace_runs wr USING (agent_id)
-            JOIN workspaces w ON w.id = wr.workspace_id
             JOIN run_events e ON e.agent_id = ready.agent_id AND e.sequence = 1
             LEFT JOIN delegated_runs d ON d.child_agent_id = ready.agent_id
             LEFT JOIN queued_runs q ON q.agent_id = ready.agent_id
@@ -279,7 +278,7 @@ impl WorkspaceStore {
             ready.push(ReadyRun {
                 run: ScheduledRun {
                     agent_id: row.get(0)?,
-                    chat_key: row.get(1)?,
+                    chat_id: row.get(1)?,
                     run_key: row.get(2)?,
                     delegation,
                     agent_name: row.get(6)?,
@@ -299,7 +298,7 @@ async fn resume(
     let ReadyRun { run, prompt } = ready;
     let result = async {
         let mut store = WorkspaceStore::open(state)?;
-        let mut journal = store.open_journal(&run.chat_key, &run.run_key)?;
+        let mut journal = store.open_journal(run.chat_id, &run.run_key)?;
         let outcome = journal
             .run_until_blocked(prompt, config.provider, config.skills, config.options)
             .await;

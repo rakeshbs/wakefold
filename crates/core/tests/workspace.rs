@@ -15,7 +15,7 @@ use wakefold::{
 };
 
 const CONTENT: &str = "notes from the first agent";
-const CHAT: &str = "../chat/one";
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
 
 #[derive(Deserialize, JsonSchema, ToolInput)]
 #[tool(name = "note", description = "Access the chat note")]
@@ -94,7 +94,9 @@ fn shared_workspace_survives_restart() {
     let reader = store.open_run_workspace(CHAT, "reader").unwrap();
     run_note_tool(reader, Some(&artifact));
 
-    let other = store.open_run_workspace("chat-two", "writer").unwrap();
+    let other = store
+        .open_run_workspace(wakefold::ChatId::from_u128(2), "writer")
+        .unwrap();
     assert_ne!(other.chat_root(), writer.chat_root());
     assert_eq!(
         fs::read_to_string(other.chat_root().join(&artifact))
@@ -118,16 +120,13 @@ fn concurrent_first_runs_share_one_workspace() {
         let worker = scope.spawn(|| {
             start.wait();
             let mut first = WorkspaceStore::open(state.path()).unwrap();
-            first.open_run_workspace("new-chat", "first").unwrap()
+            first.open_run_workspace(CHAT, "first").unwrap()
         });
         start.wait();
         let mut second = WorkspaceStore::open(state.path()).unwrap();
-        let right = second.open_run_workspace("new-chat", "second").unwrap();
+        let right = second.open_run_workspace(CHAT, "second").unwrap();
         let left = worker.join().unwrap();
-        assert_eq!(
-            second.open_run_workspace("new-chat", "first").unwrap(),
-            left
-        );
+        assert_eq!(second.open_run_workspace(CHAT, "first").unwrap(), left);
         (left, right)
     });
     assert_eq!(left.chat_root(), right.chat_root());

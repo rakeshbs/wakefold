@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::journal::JournalTransaction;
 use crate::workspace::reserve_run;
-use crate::{JournalError, RunEvent, WorkspaceStore};
+use crate::{ChatId, JournalError, RunEvent, WorkspaceStore};
 
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS queued_runs (
@@ -19,8 +19,8 @@ pub(crate) const SCHEMA: &str = "
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum QueueRunError {
-    /// The chat and run keys belong to a different request.
-    #[error("these chat and run keys already belong to a different request")]
+    /// The chat ID and run key belong to a different request.
+    #[error("this chat ID and run key already belong to a different request")]
     Conflict,
     /// The journal could not save or verify the request.
     #[error(transparent)]
@@ -37,20 +37,20 @@ impl WorkspaceStore {
     /// Queue a run for the named agent and return its stable ID.
     ///
     /// The scheduler receives the saved agent name and prompt, including after
-    /// a restart. Repeating the same request with the same keys returns its ID.
+    /// a restart. Repeating the request with the same identifiers returns its ID.
     ///
     /// # Errors
     ///
-    /// Returns [`QueueRunError::Conflict`] if the keys already identify a different run.
+    /// Returns [`QueueRunError::Conflict`] if those identifiers belong to a different run.
     pub fn queue_run(
         &mut self,
-        chat_key: &str,
+        chat_id: ChatId,
         run_key: &str,
         agent_name: &str,
         prompt: &str,
     ) -> Result<i64, QueueRunError> {
         let tx = JournalTransaction::begin(&mut self.connection)?;
-        let (_, agent_id) = reserve_run(tx.sql(), chat_key, run_key)?;
+        let agent_id = reserve_run(tx.sql(), chat_id, run_key)?;
         let saved = tx
             .sql()
             .query_row(

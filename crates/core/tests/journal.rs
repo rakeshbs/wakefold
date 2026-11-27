@@ -6,6 +6,8 @@ use wakefold::{
     ToolResult, WorkspaceStore,
 };
 
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
+
 #[test]
 fn stored_text_only_tool_response_decodes_as_a_final_answer() {
     let turn: ModelTurn = serde_json::from_value(json!({
@@ -52,12 +54,12 @@ fn reopens_run_events_in_order_with_provider_replay_data() {
     assert_eq!(prepared_event["data"]["idempotency_key"], "saved-key");
     {
         let mut store = WorkspaceStore::open(state.path()).unwrap();
-        let mut journal = store.open_journal("chat", "run").unwrap();
+        let mut journal = store.open_journal(CHAT, "run").unwrap();
         assert_eq!(journal.append(0, &events[..4]).unwrap(), 4);
         assert_eq!(journal.append(4, &events[4..]).unwrap(), 8);
     }
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    let journal = store.open_journal("chat", "run").unwrap();
+    let journal = store.open_journal(CHAT, "run").unwrap();
     let entries = journal.load_after(0).unwrap();
     assert_eq!(entries.len(), events.len());
     for (index, (entry, expected)) in entries.iter().zip(&events).enumerate() {
@@ -66,7 +68,7 @@ fn reopens_run_events_in_order_with_provider_replay_data() {
     }
     assert_eq!(journal.load_after(4).unwrap(), entries[4..]);
     assert!(journal.load_after(8).unwrap().is_empty());
-    for (chat, run) in [("other", "run"), ("chat", "other")] {
+    for (chat, run) in [(wakefold::ChatId::from_u128(2), "run"), (CHAT, "other")] {
         assert!(
             store
                 .open_journal(chat, run)
@@ -84,7 +86,7 @@ fn concurrent_writers_at_the_same_sequence_commit_only_one_batch() {
     let start = Barrier::new(2);
     let writer = |prompt: &str| {
         let mut store = WorkspaceStore::open(state.path()).unwrap();
-        let mut journal = store.open_journal("chat", "run").unwrap();
+        let mut journal = store.open_journal(CHAT, "run").unwrap();
         start.wait();
         journal.append(
             0,
@@ -113,7 +115,7 @@ fn concurrent_writers_at_the_same_sequence_commit_only_one_batch() {
         })
     ));
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    let mut journal = store.open_journal("chat", "run").unwrap();
+    let mut journal = store.open_journal(CHAT, "run").unwrap();
     let entries = journal.load_after(0).unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].event, RunEvent::RunStarted(prompt.into()));
@@ -129,7 +131,7 @@ fn concurrent_writers_at_the_same_sequence_commit_only_one_batch() {
 fn interrupted_batch_rolls_back_all_its_entries() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    let mut journal = store.open_journal("chat", "run").unwrap();
+    let mut journal = store.open_journal(CHAT, "run").unwrap();
     let db = rusqlite::Connection::open(state.path().join("wakefold.sqlite3")).unwrap();
     db.execute_batch(
         "CREATE TRIGGER fail_insert BEFORE INSERT ON run_events
@@ -154,7 +156,7 @@ fn existing_run_gains_an_empty_journal_without_changing_its_workspace() {
     let state = tempfile::tempdir().unwrap();
     let run = WorkspaceStore::open(state.path())
         .unwrap()
-        .open_run_workspace("chat", "old")
+        .open_run_workspace(CHAT, "old")
         .unwrap();
     let file = run.chat_root().join("note");
     std::fs::write(&file, "existing data").unwrap();
@@ -165,8 +167,8 @@ fn existing_run_gains_an_empty_journal_without_changing_its_workspace() {
         .unwrap();
 
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    assert_eq!(store.open_run_workspace("chat", "old").unwrap(), run);
-    let mut journal = store.open_journal("chat", "old").unwrap();
+    assert_eq!(store.open_run_workspace(CHAT, "old").unwrap(), run);
+    let mut journal = store.open_journal(CHAT, "old").unwrap();
     assert!(journal.load_after(0).unwrap().is_empty());
     assert_eq!(
         journal

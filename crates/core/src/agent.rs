@@ -460,7 +460,8 @@ impl RunJournal<'_> {
     /// use wakefold::{RunOptions, WorkspaceStore};
     ///
     /// let mut store = WorkspaceStore::open("state")?;
-    /// let mut journal = store.open_journal("chat-7", "run-1")?;
+    /// let chat_id = store.create_chat()?;
+    /// let mut journal = store.open_journal(chat_id, "run-1")?;
     /// let report = journal.run_or_resume("Set a timer", provider, skills, RunOptions::new(6)).await?;
     /// println!("{}", report.answer);
     /// # Ok(())

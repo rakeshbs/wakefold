@@ -198,10 +198,10 @@ async fn daemon(config: &Path) -> Result<(), DaemonError> {
     server::serve(socket, runtime, CancellationToken::new()).await
 }
 
-async fn catalog(client: &Client, address: SocketAddr, chat: &str) -> Vec<Value> {
+async fn catalog(client: &Client, address: SocketAddr, chat_id: wakefold::ChatId) -> Vec<Value> {
     client
         .get(format!("http://{address}/artifacts"))
-        .query(&[("chat_key", chat)])
+        .query(&[("chat_id", chat_id)])
         .send()
         .await
         .unwrap()
@@ -215,7 +215,7 @@ async fn catalog(client: &Client, address: SocketAddr, chat: &str) -> Vec<Value>
 async fn download(
     client: &Client,
     address: SocketAddr,
-    chat: &str,
+    chat_id: wakefold::ChatId,
     artifact_id: i64,
     revision: u64,
 ) -> Response {
@@ -223,7 +223,7 @@ async fn download(
         .get(format!(
             "http://{address}/artifacts/{artifact_id}/revisions/{revision}"
         ))
-        .query(&[("chat_key", chat)])
+        .query(&[("chat_id", chat_id)])
         .send()
         .await
         .unwrap()
@@ -274,9 +274,24 @@ async fn artifact_publication_survives_daemon_crash() {
 
         let client = Client::builder().no_proxy().build().unwrap();
         let (child, address) = launch(&config, TEST).await;
+        let created = client.post(format!("http://{address}/chats"))
+            .send().await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = created.json().await.unwrap();
+        let chat_id: wakefold::ChatId = serde_json::from_value(created["chat_id"].clone()).unwrap();
+        let other_chat = wakefold::ChatId::new_v4();
+
+        let invalid = client.post(format!("http://{address}/runs"))
+            .json(&json!({
+                "chat_id": "../inventory", "run_key": "report", "agent": "coordinator",
+                "prompt": "Publish two revisions of the inventory report."
+            }))
+            .send().await.unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
         let start: Value = client.post(format!("http://{address}/runs"))
             .json(&json!({
-                "chat_key": "inventory", "run_key": "report", "agent": "coordinator",
+                "chat_id": chat_id, "run_key": "report", "agent": "coordinator",
                 "prompt": "Publish two revisions of the inventory report."
             }))
             .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
@@ -290,14 +305,14 @@ async fn artifact_publication_survives_daemon_crash() {
         assert_eq!(publish["tool_name"], "artifacts.publish");
         let path = publish["arguments"]["path"].as_str().unwrap();
         assert!(path.ends_with(DRAFT_NAME));
-        assert!(catalog(&client, address, "inventory").await.is_empty());
+        assert!(catalog(&client, address, chat_id).await.is_empty());
         approve(&client, address, first_wait).await;
 
         while !root.join(COPY_READY).exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(catalog(&client, address, "inventory").await.is_empty(), "a saved file is visible only after publication commits");
-        let workspace = fs::read_dir(root.join("state/workspaces")).unwrap().next().unwrap().unwrap().path();
+        assert!(catalog(&client, address, chat_id).await.is_empty(), "a saved file is visible only after publication commits");
+        let workspace = root.join("state/workspaces").join(chat_id.to_string());
         assert_eq!(fs::read_to_string(workspace.join(path)).unwrap(), ORIGINAL);
         drop(child);
         fs::write(workspace.join(path), "edited after the copy").unwrap();
@@ -306,19 +321,19 @@ async fn artifact_publication_survives_daemon_crash() {
         let (_child, address) = launch(&config, TEST).await;
         let second = next_approval(&client, address, first_wait).await;
         assert_eq!(second["agent_id"], run);
-        let published = catalog(&client, address, "inventory").await;
+        let published = catalog(&client, address, chat_id).await;
         assert_eq!(published.len(), 1);
         let artifact_id = published[0]["artifact_id"].as_i64().unwrap();
         assert_eq!(published[0]["title"], "Weekly inventory");
         assert_eq!(published[0]["revision"], 1);
         assert_eq!(published[0]["filename"], DRAFT_NAME);
-        let original = download(&client, address, "inventory", artifact_id, 1).await;
+        let original = download(&client, address, chat_id, artifact_id, 1).await;
         assert_eq!(original.status(), StatusCode::OK);
         assert_eq!(original.headers()[header::CONTENT_TYPE], "text/csv");
         assert_eq!(original.headers()[header::CONTENT_DISPOSITION], "attachment; filename*=UTF-8''inventory%20report%2Ecsv");
         assert_eq!(original.text().await.unwrap(), ORIGINAL);
-        assert_eq!(download(&client, address, "other-chat", artifact_id, 1).await.status(), StatusCode::NOT_FOUND);
-        assert!(catalog(&client, address, "other-chat").await.is_empty());
+        assert_eq!(download(&client, address, other_chat, artifact_id, 1).await.status(), StatusCode::NOT_FOUND);
+        assert!(catalog(&client, address, other_chat).await.is_empty());
 
         let wait = &second["wait"];
         assert_eq!(wait["on"]["ToolApproval"]["arguments"]["artifact_id"], artifact_id);
@@ -347,9 +362,9 @@ async fn artifact_publication_survives_daemon_crash() {
         assert_eq!(revisions[0], published[0]);
         assert_eq!(revisions[1]["artifact_id"], artifact_id);
         assert_eq!(revisions[1]["revision"], 2);
-        assert_eq!(catalog(&client, address, "inventory").await, revisions[1..]);
+        assert_eq!(catalog(&client, address, chat_id).await, revisions[1..]);
         for (revision, expected) in [(1, ORIGINAL), (2, UPDATED)] {
-            let response = download(&client, address, "inventory", artifact_id, revision).await;
+            let response = download(&client, address, chat_id, artifact_id, revision).await;
             assert_eq!(response.error_for_status().unwrap().text().await.unwrap(), expected);
         }
     }).await.expect("the artifact workflow must finish");

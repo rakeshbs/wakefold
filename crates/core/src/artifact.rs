@@ -14,8 +14,8 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::{
-    JsonValue, RunWorkspace, Tool, ToolContext, ToolError, ToolOutput, ToolRecovery, ToolSpec,
-    WorkspaceStore,
+    ChatId, JsonValue, RunWorkspace, Tool, ToolContext, ToolError, ToolOutput, ToolRecovery,
+    ToolSpec, WorkspaceStore,
 };
 
 const FILE_DIRECTORY: &str = "artifact-files";
@@ -23,9 +23,9 @@ const FILE_DIRECTORY: &str = "artifact-files";
 pub(crate) const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS artifacts (
         id INTEGER PRIMARY KEY,
-        workspace_id INTEGER NOT NULL REFERENCES workspaces(id)
+        chat_id BLOB NOT NULL REFERENCES chats(chat_id)
     );
-    CREATE INDEX IF NOT EXISTS artifacts_by_workspace ON artifacts(workspace_id, id);
+    CREATE INDEX IF NOT EXISTS artifacts_by_chat ON artifacts(chat_id, id);
     CREATE TABLE IF NOT EXISTS artifact_revisions (
         artifact_id INTEGER NOT NULL REFERENCES artifacts(id),
         revision INTEGER NOT NULL CHECK(revision > 0),
@@ -182,7 +182,7 @@ impl ArtifactPublication {
         if let Some(artifact_id) = self.artifact_id {
             let exists: bool = connection.query_row(
                 "SELECT EXISTS(
-                    SELECT 1 FROM artifacts a JOIN workspace_runs r USING (workspace_id)
+                    SELECT 1 FROM artifacts a JOIN workspace_runs r USING (chat_id)
                     WHERE a.id = ?1 AND r.agent_id = ?2
                  )",
                 params![artifact_id, agent_id],
@@ -315,8 +315,8 @@ impl SavedArtifact {
                 id
             }
             None => connection.query_row(
-                "INSERT INTO artifacts(workspace_id)
-                 SELECT workspace_id FROM workspace_runs WHERE agent_id = ?1 RETURNING id",
+                "INSERT INTO artifacts(chat_id)
+                 SELECT chat_id FROM workspace_runs WHERE agent_id = ?1 RETURNING id",
                 [agent_id],
                 |row| row.get(0),
             )?,
@@ -368,17 +368,17 @@ impl WorkspaceStore {
     ///
     /// # Errors
     /// Returns an error if the artifact catalog could not be read.
-    pub fn artifacts(&self, chat_key: &str) -> Result<Vec<ArtifactRevision>, ArtifactError> {
+    pub fn artifacts(&self, chat_id: ChatId) -> Result<Vec<ArtifactRevision>, ArtifactError> {
         let mut statement = self.connection.prepare_cached(
             "SELECT a.id, r.revision, r.title, r.filename, r.media_type, r.size_bytes, r.agent_id
-             FROM workspaces w JOIN artifacts a ON a.workspace_id = w.id
+             FROM artifacts a
              JOIN artifact_revisions r ON r.artifact_id = a.id
-             WHERE w.chat_key = ?1 AND r.revision = (
+             WHERE a.chat_id = ?1 AND r.revision = (
                 SELECT MAX(revision) FROM artifact_revisions WHERE artifact_id = a.id
              )
              ORDER BY a.id",
         )?;
-        let rows = statement.query_map([chat_key], read_revision)?;
+        let rows = statement.query_map([chat_id], read_revision)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -390,7 +390,7 @@ impl WorkspaceStore {
     /// Returns an error if the catalog or a published file could not be accessed.
     pub fn open_artifact(
         &self,
-        chat_key: &str,
+        chat_id: ChatId,
         artifact_id: i64,
         revision: u64,
     ) -> Result<Option<(ArtifactRevision, File)>, ArtifactError> {
@@ -401,9 +401,8 @@ impl WorkspaceStore {
             "SELECT a.id, r.revision, r.title, r.filename, r.media_type, r.size_bytes, r.agent_id,
                     r.tool_call_key
              FROM artifact_revisions r JOIN artifacts a ON a.id = r.artifact_id
-             JOIN workspaces w ON w.id = a.workspace_id
-             WHERE w.chat_key = ?1 AND a.id = ?2 AND r.revision = ?3",
-            params![chat_key, artifact_id, revision],
+             WHERE a.chat_id = ?1 AND a.id = ?2 AND r.revision = ?3",
+            params![chat_id, artifact_id, revision],
             |row| Ok((read_revision(row)?, row.get::<_, String>(7)?)),
         ).optional()?;
         let Some((publication, key)) = publication else {
@@ -422,7 +421,9 @@ mod tests {
     fn publication_uses_regular_files_in_the_chat_workspace() {
         let state = tempfile::tempdir().unwrap();
         let mut store = WorkspaceStore::open(state.path()).unwrap();
-        let workspace = store.open_run_workspace("chat", "report").unwrap();
+        let workspace = store
+            .open_run_workspace(ChatId::new_v4(), "report")
+            .unwrap();
         let artifact_files = directory(state.path());
         let attempt = |path| {
             ArtifactPublication::new("Report", path).copy_file(

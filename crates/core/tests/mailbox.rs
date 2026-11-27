@@ -13,6 +13,8 @@ use wakefold::{
     WorkspaceStore,
 };
 
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
+
 const PROMPT: &str = "Exchange the notebook price.";
 const CHILD_STATE: &str = "WAKEFOLD_MAILBOX_TEST_STATE";
 static TOOLS: [&dyn Tool; 2] = [&SendMessage, &WaitForMessage];
@@ -24,10 +26,8 @@ fn mailbox_skills() -> [Skill<'static>; 1] {
 fn opening_a_legacy_mailbox_keeps_order_and_consumption() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    let sender = store.queue_run("chat", "sender", "agent", PROMPT).unwrap();
-    let receiver = store
-        .queue_run("chat", "receiver", "agent", PROMPT)
-        .unwrap();
+    let sender = store.queue_run(CHAT, "sender", "agent", PROMPT).unwrap();
+    let receiver = store.queue_run(CHAT, "receiver", "agent", PROMPT).unwrap();
     drop(store);
 
     let db = rusqlite::Connection::open(state.path().join("wakefold.sqlite3")).unwrap();
@@ -83,14 +83,12 @@ fn opening_a_legacy_mailbox_keeps_order_and_consumption() {
 fn retrying_an_accepted_client_message_after_the_run_ends_returns_the_saved_id() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
-    let id = store
-        .queue_run("chat", "receiver", "agent", PROMPT)
-        .unwrap();
+    let id = store.queue_run(CHAT, "receiver", "agent", PROMPT).unwrap();
     let payload = json!({"price_cents": 350});
     let posted = store.post_client_message(id, "client-1", &payload).unwrap();
     assert!(
         store
-            .open_journal("chat", "receiver")
+            .open_journal(CHAT, "receiver")
             .unwrap()
             .record_failure("stopped".into())
             .unwrap()
@@ -198,7 +196,7 @@ impl Provider for Receiver {
 
 fn run(
     store: &mut WorkspaceStore,
-    chat: &str,
+    chat: wakefold::ChatId,
     key: &str,
     provider: &dyn Provider,
 ) -> Result<RunOutcome, RunError> {
@@ -213,7 +211,7 @@ fn run(
 fn send(store: &mut WorkspaceStore, key: &str, recipient: i64) -> Result<RunOutcome, RunError> {
     run(
         store,
-        "chat",
+        CHAT,
         key,
         &Sender {
             recipient,
@@ -225,12 +223,12 @@ fn send(store: &mut WorkspaceStore, key: &str, recipient: i64) -> Result<RunOutc
 fn send_and_exit(path: &Path) {
     let mut store = WorkspaceStore::open(path).unwrap();
     let recipient = store
-        .open_run_workspace("chat", "receiver")
+        .open_run_workspace(CHAT, "receiver")
         .unwrap()
         .agent_id();
     let result = run(
         &mut store,
-        "chat",
+        CHAT,
         "sender",
         &Sender {
             recipient,
@@ -259,28 +257,25 @@ fn message_sent_before_the_wait_survives_restart_and_is_consumed_once() {
 
     let mut store = WorkspaceStore::open(state.path()).unwrap();
     let recipient = store
-        .open_run_workspace("chat", "receiver")
+        .open_run_workspace(CHAT, "receiver")
         .unwrap()
         .agent_id();
-    let sender = store
-        .open_run_workspace("chat", "sender")
-        .unwrap()
-        .agent_id();
+    let sender = store.open_run_workspace(CHAT, "sender").unwrap().agent_id();
     assert!(matches!(
         send(&mut store, "sender", recipient).unwrap(),
         RunOutcome::Finished(_)
     ));
-    assert!(matches!(run(&mut store, "chat", "receiver", &Receiver {
+    assert!(matches!(run(&mut store, CHAT, "receiver", &Receiver {
         expected_sender: sender, wait_again: true,
     }).unwrap(), RunOutcome::Suspended(wait) if wait.on == WaitOn::MailboxMessage { from_agent_id: None }));
 
     let sent = store
-        .open_journal("chat", "sender")
+        .open_journal(CHAT, "sender")
         .unwrap()
         .load_after(0)
         .unwrap();
     let received = store
-        .open_journal("chat", "receiver")
+        .open_journal(CHAT, "receiver")
         .unwrap()
         .load_after(0)
         .unwrap();
@@ -305,19 +300,15 @@ fn a_matching_send_wakes_the_receiver_and_rolls_back_if_the_wake_fails() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
     let recipient = store
-        .open_run_workspace("chat", "receiver")
+        .open_run_workspace(CHAT, "receiver")
         .unwrap()
         .agent_id();
-    let sender = store
-        .open_run_workspace("chat", "sender")
-        .unwrap()
-        .agent_id();
+    let sender = store.open_run_workspace(CHAT, "sender").unwrap().agent_id();
     let receiver = Receiver {
         expected_sender: sender,
         wait_again: false,
     };
-    let RunOutcome::Suspended(wait) = run(&mut store, "chat", "receiver", &receiver).unwrap()
-    else {
+    let RunOutcome::Suspended(wait) = run(&mut store, CHAT, "receiver", &receiver).unwrap() else {
         panic!("receiver should wait for the sender")
     };
 
@@ -331,7 +322,7 @@ fn a_matching_send_wakes_the_receiver_and_rolls_back_if_the_wake_fails() {
         RunOutcome::Finished(_)
     ));
     assert_eq!(
-        run(&mut store, "chat", "receiver", &receiver).unwrap(),
+        run(&mut store, CHAT, "receiver", &receiver).unwrap(),
         RunOutcome::Suspended(wait.clone())
     );
 
@@ -347,7 +338,7 @@ fn a_matching_send_wakes_the_receiver_and_rolls_back_if_the_wake_fails() {
         Err(RunError::Journal(_))
     ));
     assert_eq!(
-        run(&mut store, "chat", "receiver", &receiver).unwrap(),
+        run(&mut store, CHAT, "receiver", &receiver).unwrap(),
         RunOutcome::Suspended(wait)
     );
     let sender_rows: i64 = db
@@ -397,7 +388,7 @@ fn a_sender_cannot_address_a_recipient_in_another_chat() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
     let foreign = store
-        .open_run_workspace("other-chat", "receiver")
+        .open_run_workspace(wakefold::ChatId::from_u128(2), "receiver")
         .unwrap()
         .agent_id();
     let result = send(&mut store, "sender", foreign);

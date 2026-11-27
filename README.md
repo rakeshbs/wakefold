@@ -4,12 +4,25 @@ Wakefold is a Rust library and local daemon for AI agents that can pause and res
 
 Agents can wait for a timer, a message, or human approval. They can delegate work to other agents with their own tool permissions and token budgets, load skills when needed, and call tools from local Model Context Protocol (MCP) servers.
 
+## Chat workspaces
+
+`POST /chats` creates a chat and returns its `chat_id` UUID. Send that UUID
+with `POST /runs` and artifact requests. Clients can also generate a UUID and
+use it in their first run request. Wakefold stores the chat's working files in
+`workspaces/<chat_id>/agents/<agent_id>/` under the daemon's state directory.
+The same IDs reopen the workspace after a restart.
+
+On upgrade from the numeric workspace layout, Wakefold moves existing chat
+folders to UUID paths and saves the previous keys and their UUIDs in
+`chat-id-migration.json` in the state directory. Use the mapped UUID as
+`chat_id` in requests for an existing chat.
+
 ## Artifacts
 
 Enable the built-in `artifacts` skill for an agent and grant `artifacts.publish` with `allow` or `require_approval`. The tool publishes an existing file by title and chat-relative `path`. Pass its returned `artifact_id` with a later publication to add a revision.
 
-- `GET /artifacts?chat_key=…` lists each artifact's latest revision.
-- `GET /artifacts/{artifact_id}/revisions/{revision}?chat_key=…` downloads that exact revision.
+- `GET /artifacts?chat_id=…` lists each artifact's latest revision.
+- `GET /artifacts/{artifact_id}/revisions/{revision}?chat_id=…` downloads that exact revision.
 
 Published copies survive restarts and workspace edits. The run's event stream records the revision it delivered.
 

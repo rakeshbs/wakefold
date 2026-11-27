@@ -51,6 +51,8 @@ pub use tool::{
 };
 #[cfg(feature = "derive")]
 pub use typed_tool::{ToolInput, typed_tool, typed_tool_with_context};
+/// The UUID used to address a chat and its persistent workspace.
+pub use uuid::Uuid as ChatId;
 pub use wait::{PendingWait, TimerWait, WaitOn, WakeEvent};
 #[cfg(feature = "derive")]
 pub use wakefold_macros::ToolInput;

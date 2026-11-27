@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::io::ReaderStream;
 use wakefold::{
-    ArtifactRevision, CancellationToken, ClientMessageError, PendingWait, QueueRunError, RunEvent,
-    RunEventPage, WakeEvent, WorkspaceStore,
+    ArtifactRevision, CancellationToken, ChatId, ClientMessageError, PendingWait, QueueRunError,
+    RunEvent, RunEventPage, WakeEvent, WorkspaceStore,
 };
 
 const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(128).expect("page size is nonzero");
@@ -73,6 +73,7 @@ pub(crate) fn router(
 ) -> Router {
     Router::new()
         .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
+        .route("/chats", post(create_chat))
         .route("/runs", post(start_run))
         .route("/runs/{agent_id}/events", get(events))
         .route("/runs/{agent_id}/messages", post(post_message))
@@ -92,8 +93,18 @@ pub(crate) fn router(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArtifactChat {
-    chat_key: String,
+    chat_id: ChatId,
+}
+
+async fn create_chat(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let chat_id = state
+        .database(|store| store.create_chat().map_err(ApiError::internal))
+        .await?;
+    Ok((StatusCode::CREATED, Json(json!({ "chat_id": chat_id }))))
 }
 
 async fn list_artifacts(
@@ -101,7 +112,7 @@ async fn list_artifacts(
     Query(chat): Query<ArtifactChat>,
 ) -> Result<Json<Vec<ArtifactRevision>>, ApiError> {
     state
-        .database(move |store| store.artifacts(&chat.chat_key).map_err(ApiError::internal))
+        .database(move |store| store.artifacts(chat.chat_id).map_err(ApiError::internal))
         .await
         .map(Json)
 }
@@ -121,7 +132,7 @@ async fn download_artifact(
     let (metadata, file) = state
         .database(move |store| {
             store
-                .open_artifact(&chat.chat_key, artifact_id, revision)
+                .open_artifact(chat.chat_id, artifact_id, revision)
                 .map_err(ApiError::internal)
         })
         .await?
@@ -217,7 +228,7 @@ async fn require_local_origin(request: Request, next: Next) -> Result<Response, 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartRun {
-    chat_key: String,
+    chat_id: ChatId,
     run_key: String,
     agent: String,
     prompt: String,
@@ -227,13 +238,10 @@ async fn start_run(
     State(state): State<AppState>,
     Json(request): Json<StartRun>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    if request.chat_key.trim().is_empty()
-        || request.run_key.trim().is_empty()
-        || request.prompt.trim().is_empty()
-    {
+    if request.run_key.trim().is_empty() || request.prompt.trim().is_empty() {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "chat_key, run_key and prompt must be nonempty",
+            "run_key and prompt must be nonempty",
         ));
     }
     if !state.agents.contains(&request.agent) {
@@ -243,7 +251,7 @@ async fn start_run(
         .database(move |store| {
             store
                 .queue_run(
-                    &request.chat_key,
+                    request.chat_id,
                     &request.run_key,
                     &request.agent,
                     &request.prompt,
@@ -251,7 +259,7 @@ async fn start_run(
                 .map_err(|error| match error {
                     QueueRunError::Conflict => ApiError(
                         StatusCode::CONFLICT,
-                        "chat and run keys already identify a different request",
+                        "chat ID and run key already identify a different request",
                     ),
                     _ => ApiError::internal(error),
                 })

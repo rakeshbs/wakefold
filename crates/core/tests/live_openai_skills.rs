@@ -16,6 +16,7 @@ use wakefold::{
     ToolSpec, WorkspaceStore,
 };
 
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
 const PROMPT: &str = "Retrieve the pickup code for order WF-206 from the order records. Reply with just the pickup code.";
 const CHILD_STATE: &str = "WAKEFOLD_LIVE_ORDER_TEST";
 
@@ -78,7 +79,7 @@ async fn drive(state: &Path, stop_after_activation: bool) -> Result<String, Box<
         stop_after_activation,
     };
     let mut store = WorkspaceStore::open(state)?;
-    let mut journal = store.open_journal("synthetic-orders", "lookup")?;
+    let mut journal = store.open_journal(CHAT, "lookup")?;
     let tool = Lookup(state);
     let tools: [&dyn Tool; 1] = [&tool];
     let skills = [Skill::new(
@@ -285,7 +286,7 @@ async fn drive_compaction(
         ),
     ];
     let mut store = WorkspaceStore::open(state)?;
-    let mut journal = store.open_journal("synthetic-orders", "compaction")?;
+    let mut journal = store.open_journal(CHAT, "compaction")?;
     let report = tokio::time::timeout(
         Duration::from_secs(180),
         journal.run_or_resume(
@@ -337,7 +338,7 @@ async fn live_compaction_preserves_skills_across_restart() -> Result<(), Box<dyn
 
     let (checkpoint, checkpoint_sequence, definitions) = {
         let mut store = WorkspaceStore::open(state.path())?;
-        let journal = store.open_journal("synthetic-orders", "compaction")?;
+        let journal = store.open_journal(CHAT, "compaction")?;
         let entries = journal.load_after(0)?;
         let compacted = entries
             .iter()
@@ -392,7 +393,7 @@ async fn live_compaction_preserves_skills_across_restart() -> Result<(), Box<dyn
         receipt
     );
     let mut store = WorkspaceStore::open(state.path())?;
-    let journal = store.open_journal("synthetic-orders", "compaction")?;
+    let journal = store.open_journal(CHAT, "compaction")?;
     let entries = journal.load_after(0)?;
     let loaded: Vec<_> = entries
         .iter()

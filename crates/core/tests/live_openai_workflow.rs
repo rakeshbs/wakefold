@@ -20,7 +20,7 @@ use wakefold::{
 
 const STATE: &str = "WAKEFOLD_LIVE_WORKFLOW_STATE";
 const STAGE: &str = "WAKEFOLD_LIVE_WORKFLOW_STAGE";
-const CHAT: &str = "order-workflow";
+const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
 const COORDINATOR: &str = "coordinator";
 const CATALOG: &str = "catalog";
 const REVIEW: &str = "review";
