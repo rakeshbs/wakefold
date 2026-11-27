@@ -120,6 +120,9 @@ impl ContextSizes {
         } else {
             1
         };
+        let newest_user = messages
+            .iter()
+            .rposition(|message| matches!(message, Message::User(_)));
         let mut input_bytes = self.messages[..prefix].iter().sum::<u128>();
         let mut retained_bytes = self.total;
         let mut assistant_turns = 0;
@@ -166,7 +169,9 @@ impl ContextSizes {
             }
             let size = self.messages[index];
             input_bytes += size;
-            if keep_exchange && !matches!(message, Message::Summary(_)) {
+            if (keep_exchange && !matches!(message, Message::Summary(_)))
+                || newest_user == Some(index)
+            {
                 retained_messages.push(index);
             } else {
                 retained_bytes -= size;

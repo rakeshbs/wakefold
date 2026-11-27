@@ -28,6 +28,8 @@ const MIN_IDLE_DELAY: Duration = Duration::from_millis(1);
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ScheduledRun {
+    /// Identity of the particular request being scheduled.
+    pub run_id: i64,
     /// ID assigned by the workspace store.
     pub agent_id: i64,
     /// Chat UUID used to open the journal.
@@ -260,7 +262,7 @@ impl WorkspaceStore {
         let now = SystemTime::now();
         let now_millis = current_millis(now);
         let next_timer: Option<i64> = self.connection.query_row(
-            "SELECT MIN(wake_at_ms) FROM run_waits
+            "SELECT MIN(wake_at_ms) FROM agent_runs
              WHERE wake_at_ms IS NOT NULL",
             [],
             |row| row.get(0),
@@ -273,10 +275,12 @@ impl WorkspaceStore {
             self.wake_due_timers(now, limit)?;
         }
         let mut query = self.connection.prepare_cached(
-            "SELECT r.agent_id, r.chat_id, r.run_key, e.event_json, r.settings_json, r.parent_agent_id
-             FROM agent_runs r JOIN run_events e ON e.agent_id=r.agent_id AND e.sequence=1
-             WHERE r.status='runnable' AND (NOT ?2 OR r.settings_json IS NOT NULL)
-             ORDER BY r.agent_id LIMIT ?1",
+            "SELECT r.agent_id, r.chat_id, r.run_key,
+                    (SELECT event_json FROM run_events WHERE run_id=r.run_id ORDER BY sequence LIMIT 1),
+                    s.settings_json, s.parent_agent_id, r.run_id
+             FROM agent_runs r JOIN agent_sessions s USING(agent_id)
+             WHERE r.status='runnable' AND (NOT ?2 OR s.settings_json IS NOT NULL)
+             ORDER BY r.run_id LIMIT ?1",
         )?;
         let limit = i64::try_from(limit.get()).unwrap_or(i64::MAX);
         let mut rows = query.query(rusqlite::params![limit, admitted_only])?;
@@ -291,6 +295,7 @@ impl WorkspaceStore {
             ready.push(ReadyRun {
                 run: ScheduledRun {
                     agent_id: row.get(0)?,
+                    run_id: row.get(6)?,
                     chat_id: row.get(1)?,
                     run_key: row.get(2)?,
                     parent_agent_id: row.get(5)?,

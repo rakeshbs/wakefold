@@ -26,14 +26,20 @@ impl Provider for DynamicProvider {
         let [
             Message::Developer(instructions),
             Message::User(task),
-            Message::Developer(date),
+            Message::Developer(identity),
             ..,
         ] = request.messages
         else {
             panic!("missing startup context")
         };
         assert!(instructions.starts_with("Coordinate research"));
-        assert!(date.contains("Asia/Kolkata"));
+        assert!(identity.starts_with("Your agent ID is "));
+        assert!(
+            request
+                .request_context
+                .unwrap()
+                .ends_with("(Asia/Kolkata).")
+        );
         let root = task == "coordinate";
         assert_eq!(instructions.contains("\nagents:"), root);
         assert_eq!(request.tools[0].description.contains("\nagents:"), root);
@@ -185,7 +191,11 @@ async fn parent_and_children_resume_after_restart() {
         .unwrap();
     let tree = wait_for_tree(&client, address, chat, "wait_started").await;
     assert!(tree.iter().all(|r| r["status"] == "waiting"));
-    assert!(tree.iter().skip(1).all(|r| r["parent_agent_id"] == root));
+    assert!(
+        tree.iter()
+            .skip(1)
+            .all(|r| r["parent_agent_id"] == root && r["spawned_by_run_id"] == tree[0]["run_id"])
+    );
     assert!(state.path().join("lookup").is_file());
     drop(process);
     config["defaults"]["model"] = json!("updated");

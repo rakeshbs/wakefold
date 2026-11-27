@@ -163,7 +163,7 @@ impl ArtifactPublication {
         if let Some(artifact_id) = self.artifact_id {
             let exists: bool = connection.query_row(
                 "SELECT EXISTS(
-                    SELECT 1 FROM artifacts a JOIN agent_runs r USING (chat_id)
+                    SELECT 1 FROM artifacts a JOIN agent_sessions r USING (chat_id)
                     WHERE a.artifact_id = ?1 AND r.agent_id = ?2
                  )",
                 params![artifact_id, agent_id],
@@ -283,6 +283,7 @@ impl SavedArtifact {
         self,
         connection: &Connection,
         agent_id: i64,
+        run_id: i64,
     ) -> Result<ArtifactRevision, ArtifactError> {
         let Self {
             publication,
@@ -297,7 +298,7 @@ impl SavedArtifact {
             }
             None => connection.query_row(
                 "INSERT INTO artifacts(chat_id)
-                 SELECT chat_id FROM agent_runs WHERE agent_id = ?1 RETURNING artifact_id",
+                 SELECT chat_id FROM agent_sessions WHERE agent_id = ?1 RETURNING artifact_id",
                 [agent_id],
                 |row| row.get(0),
             )?,
@@ -308,13 +309,13 @@ impl SavedArtifact {
             .to_owned();
         let revision = connection.query_row(
             "INSERT INTO artifact_revisions
-                (artifact_id, revision, title, filename, media_type, size_bytes, published_by_agent_id, tool_call_key, chat_id)
+                (artifact_id, revision, title, filename, media_type, size_bytes, published_by_agent_id, tool_call_key, chat_id, published_in_run_id)
              VALUES (
                 ?1, (SELECT COALESCE(MAX(revision), 0) + 1 FROM artifact_revisions WHERE artifact_id = ?1),
-                ?2, ?3, ?4, ?5, ?6, ?7, (SELECT chat_id FROM agent_runs WHERE agent_id=?6)
+                ?2, ?3, ?4, ?5, ?6, ?7, (SELECT chat_id FROM agent_sessions WHERE agent_id=?6), ?8
              ) RETURNING revision",
             params![
-                artifact_id, publication.title, filename, media_type, size_bytes, agent_id, tool_call_key
+                artifact_id, publication.title, filename, media_type, size_bytes, agent_id, tool_call_key, run_id
             ],
             |row| row.get(0),
         )?;

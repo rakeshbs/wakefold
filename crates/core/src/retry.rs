@@ -42,7 +42,7 @@ impl Default for ModelRetryPolicy {
 
 pub(crate) async fn stream_turn(
     provider: &dyn Provider,
-    request: ModelRequest<'_>,
+    request: (ModelRequest<'_>, chrono_tz::Tz),
     on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     policy: ModelRetryPolicy,
     cancellation: Option<&CancellationToken>,
@@ -61,16 +61,23 @@ pub(crate) async fn stream_turn(
 
 async fn stream_turn_with_clock<Sleep: Future<Output = ()>>(
     provider: &dyn Provider,
-    request: ModelRequest<'_>,
+    request: (ModelRequest<'_>, chrono_tz::Tz),
     on_text: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     policy: ModelRetryPolicy,
     cancellation: Option<&CancellationToken>,
     now: impl Fn() -> Instant,
     sleep: impl Fn(Duration) -> Sleep,
 ) -> Result<ModelTurn, RunError> {
+    let (request, zone) = request;
     let started = now();
     let mut retries = 0;
     loop {
+        let date = chrono::Utc::now().with_timezone(&zone).date_naive();
+        let date_context = format!("Current date: {date} ({zone}).");
+        let request = ModelRequest {
+            request_context: Some(&date_context),
+            ..request
+        };
         let mut streamed = false;
         let result = await_cancellable(
             provider.stream_turn(request, &mut |chunk| {

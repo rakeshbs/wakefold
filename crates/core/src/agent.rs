@@ -572,7 +572,7 @@ async fn drive(
                 {
                     let summary = crate::retry::stream_turn(
                         provider,
-                        compaction.request(),
+                        (compaction.request(), run.time_zone),
                         &mut |_| {},
                         options.model_retry_policy,
                         cancellation,
@@ -586,11 +586,15 @@ async fn drive(
                 }
                 let turn = crate::retry::stream_turn(
                     provider,
-                    ModelRequest {
-                        messages: &run.state.messages,
-                        tools: &run.skills.built_in_tool_specs,
-                        assistant_replay_data: &run.state.assistant_replay_data,
-                    },
+                    (
+                        ModelRequest {
+                            messages: &run.state.messages,
+                            tools: &run.skills.built_in_tool_specs,
+                            assistant_replay_data: &run.state.assistant_replay_data,
+                            request_context: None,
+                        },
+                        run.time_zone,
+                    ),
                     &mut emit_text,
                     options.model_retry_policy,
                     cancellation,
@@ -656,12 +660,21 @@ async fn drive(
                     ToolExecution::CheckMailbox {
                         from_agent_id: sender,
                         completion_only,
-                    } => run.commit_tool_effect(|tx, id, _, seq| {
-                        Ok(
-                            crate::mailbox::take_message(tx, id, sender, completion_only, seq)?
-                                .unwrap_or(crate::JsonValue::Null),
-                        )
-                    })?,
+                    } => {
+                        let run_id = run.run_id().ok_or(RunError::WaitRequiresJournal {
+                            name: "mailbox.receive".into(),
+                        })?;
+                        run.commit_tool_effect(|tx, _, _, seq| {
+                            Ok(crate::mailbox::take_message(
+                                tx,
+                                run_id,
+                                sender,
+                                completion_only,
+                                seq,
+                            )?
+                            .unwrap_or(crate::JsonValue::Null))
+                        })?
+                    }
                     ToolExecution::Completed(events) => run.commit(events)?,
                     ToolExecution::PublishArtifact(publication) => {
                         run.publish_artifact(publication, cancellation).await?;

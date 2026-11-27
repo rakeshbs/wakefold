@@ -50,7 +50,19 @@ fn offline_provider(
             assert_eq!(body["store"], false);
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
             assert_eq!(body.get("previous_response_id"), None);
-            assert_eq!(body["input"], exchange.input);
+            let mut input = body["input"].as_array().unwrap().clone();
+            if exchange.tools.is_some() {
+                let suffix = input.pop().expect("dated model requests have a suffix");
+                assert_eq!(suffix["role"], "developer");
+                let date = suffix["content"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("Current date: ")
+                    .and_then(|value| value.strip_suffix(" (UTC)."))
+                    .unwrap();
+                assert!(chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok());
+            }
+            assert_eq!(json!(input), exchange.input);
             assert_eq!(body.get("tools"), exchange.tools.as_ref());
 
             Ok::<_, OpenAIError>(stream_response(exchange.events).into())

@@ -28,10 +28,18 @@ impl<'a> JournalTransaction<'a> {
 
     pub(crate) fn append(
         &self,
-        agent_id: i64,
+        run_id: i64,
         expected_last_sequence: u64,
         events: &[RunEvent],
     ) -> Result<u64, JournalError> {
+        let (agent_id, terminal): (i64, bool) = self.transaction.query_row(
+            "SELECT agent_id, status IN ('completed','failed') FROM agent_runs WHERE run_id=?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if terminal && !events.is_empty() {
+            return Err(JournalError::RunEnded { run_id });
+        }
         let mut sequence: u64 = self.transaction.query_row(
             "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE agent_id = ?1",
             [agent_id],
@@ -44,7 +52,7 @@ impl<'a> JournalTransaction<'a> {
             });
         }
         let mut insert = self.transaction.prepare_cached(
-            "INSERT INTO run_events(agent_id, sequence, event_json) VALUES (?1, ?2, ?3)",
+            "INSERT INTO run_events(agent_id, sequence, run_id, event_json) VALUES (?1, ?2, ?3, ?4)",
         )?;
         for event in events {
             sequence += 1;
@@ -53,8 +61,13 @@ impl<'a> JournalTransaction<'a> {
                     .borrow_mut()
                     .push(EventTrace::new(agent_id, sequence, event));
             }
-            record_transition(self, agent_id, sequence, event)?;
-            insert.execute(params![agent_id, sequence, serde_json::to_string(event)?])?;
+            record_transition(self, run_id, agent_id, sequence, event)?;
+            insert.execute(params![
+                agent_id,
+                sequence,
+                run_id,
+                serde_json::to_string(event)?
+            ])?;
         }
         Ok(sequence)
     }

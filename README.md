@@ -12,10 +12,11 @@ use it in their first run request. Wakefold stores the chat's working files in
 `workspaces/<chat_id>/agents/<agent_id>/` under the daemon's state directory.
 The same IDs reopen the workspace after a restart.
 
-The runtime uses the [seven-table SQLite schema](crates/core/src/workspace/schema.sql).
-When upgrading from the previous schema, start with an empty state directory.
-Replace named worker definitions with shared `defaults` and use `agents.spawn`
-for delegation.
+The runtime uses the [six-table SQLite schema](crates/core/src/workspace/schema.sql).
+It upgrades the previous seven-table schema in place. If a previous chat has
+several independent roots, the newest active root becomes the continuing
+agent. If all roots have finished, the newest root becomes the continuing
+agent. Each earlier root keeps its own journal and workspace.
 
 ## Dynamic agents
 
@@ -34,10 +35,17 @@ A daemon can run roots and subagents from one shared configuration. For example:
 }
 ```
 
-Send `chat_id`, `run_key`, and `prompt` to `POST /runs` to start a root.
-The first root can also send an IANA `time_zone` such as `Asia/Kolkata`.
-It defaults to UTC. Each run saves its start date, instructions, and skill
-descriptions. The root loads the `agents` skill and dispatches `agents.spawn`
+Send `chat_id`, `run_key`, and `prompt` to `POST /runs`. It returns the stable
+root `agent_id` and the request's `run_id`. Send a new `run_key` with the same
+`chat_id` to continue the conversation. Retrying the same key and prompt returns
+the same IDs. A second request can start after the previous run has ended.
+
+The first request can set an IANA `time_zone` such as `Asia/Kolkata`. It defaults
+to UTC. The root keeps its workspace and journal across requests. Wakefold
+adds the current date in the chat's time zone to the end of each model
+request. The saved journal holds the conversation and its append-only events.
+
+The root loads the `agents` skill and dispatches `agents.spawn`
 with a `task`. The result contains the child's `agent_id`. Each child starts
 with its own journal, workspace folder, and full per-agent token budget.
 
@@ -51,9 +59,13 @@ roots can load the spawning skill. Agents can load `mailbox` and use:
 - `completion_only: true` on a receive to select a child's final answer or
   failure. Progress messages stay available for a later receive.
 
-`GET /chats/{chat_id}/runs` lists the run tree. `GET /runs/{agent_id}/messages`
-returns up to 128 incoming messages. Pass the last `arrival_order` as `after`
-for the next page. The existing events WebSocket streams each run's journal.
+`GET /chats/{chat_id}/runs` lists the root's requests and child runs.
+`GET /chats/{chat_id}/history?after=<sequence>` reads the root's journal across
+requests. `GET /runs/{run_id}/events` streams events for one request over
+WebSocket. History and run events use the agent's journal sequence numbers.
+
+`GET /runs/{run_id}/messages` returns up to 128 incoming messages. Pass the last
+`arrival_order` as `after` for the next page.
 
 ## Artifacts
 

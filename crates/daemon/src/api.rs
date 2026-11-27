@@ -74,12 +74,10 @@ pub(crate) fn router(
         .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
         .route("/chats", post(create_chat))
         .route("/runs", post(start_run))
-        .route("/runs/{agent_id}/events", get(events))
-        .route(
-            "/runs/{agent_id}/messages",
-            post(post_message).get(messages),
-        )
+        .route("/runs/{run_id}/events", get(events))
+        .route("/runs/{run_id}/messages", post(post_message).get(messages))
         .route("/chats/{chat_id}/runs", get(chat_runs))
+        .route("/chats/{chat_id}/history", get(chat_history))
         .route("/approvals", get(pending_approvals))
         .route("/approvals/{wait_id}", post(resolve_approval))
         .route("/artifacts", get(list_artifacts))
@@ -163,14 +161,14 @@ struct PostMessage {
 }
 
 async fn post_message(
-    Path(agent_id): Path<i64>,
+    Path(run_id): Path<i64>,
     State(state): State<AppState>,
     Json(request): Json<PostMessage>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let id = state
         .database(move |store| {
             store
-                .post_client_message(agent_id, &request.message_key, &request.payload)
+                .post_run_message(run_id, &request.message_key, &request.payload)
                 .map_err(|error| match error {
                     ClientMessageError::EmptyKey => {
                         ApiError(StatusCode::BAD_REQUEST, "message_key must be nonempty")
@@ -189,11 +187,7 @@ async fn post_message(
                 })
         })
         .await?;
-    tracing::info!(
-        agent_id,
-        message_id = id.as_str(),
-        "client message accepted"
-    );
+    tracing::info!(run_id, message_id = id.as_str(), "client message accepted");
     Ok((StatusCode::ACCEPTED, Json(json!({ "message_id": id }))))
 }
 
@@ -254,10 +248,10 @@ async fn start_run(
         .map(str::parse::<wakefold::ChatTimeZone>)
         .transpose()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "unknown time_zone"))?;
-    let id = state
+    let (agent_id, run_id) = state
         .database(move |store| {
             store
-                .queue_root(
+                .queue_chat_turn(
                     request.chat_id,
                     &request.run_key,
                     &request.prompt,
@@ -269,11 +263,18 @@ async fn start_run(
                         StatusCode::CONFLICT,
                         "chat ID and run key already identify a different request",
                     ),
+                    QueueRunError::Busy => ApiError(
+                        StatusCode::CONFLICT,
+                        "the conversation has an unfinished run",
+                    ),
                     _ => ApiError::internal(error),
                 })
         })
         .await?;
-    Ok((StatusCode::ACCEPTED, Json(json!({ "agent_id": id }))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "agent_id": agent_id, "run_id": run_id })),
+    ))
 }
 
 async fn chat_runs(
@@ -284,6 +285,31 @@ async fn chat_runs(
         .database(move |s| s.chat_runs(chat).map(Json).map_err(ApiError::internal))
         .await
 }
+async fn chat_history(
+    State(state): State<AppState>,
+    Path(chat): Path<ChatId>,
+    Query(cursor): Query<EventCursor>,
+) -> Result<Json<Vec<StreamEvent>>, ApiError> {
+    state
+        .database(move |store| {
+            let entries = store
+                .chat_history(chat, cursor.after, PAGE_SIZE)
+                .map_err(ApiError::internal)?
+                .ok_or(ApiError(StatusCode::NOT_FOUND, "unknown chat"))?;
+            Ok(Json(
+                entries
+                    .into_iter()
+                    .map(|entry| StreamEvent {
+                        sequence: entry.sequence,
+                        run_id: entry.run_id,
+                        event: entry.event,
+                    })
+                    .collect(),
+            ))
+        })
+        .await
+}
+
 #[derive(Deserialize)]
 struct MessageCursor {
     #[serde(default)]
@@ -296,7 +322,7 @@ async fn messages(
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     state
         .database(move |s| {
-            s.mailbox_messages(id, cursor.after)
+            s.run_mailbox(id, cursor.after)
                 .map(Json)
                 .map_err(ApiError::internal)
         })
@@ -362,11 +388,11 @@ struct EventCursor {
     after: u64,
 }
 
-async fn page(state: &AppState, agent_id: i64, after: u64) -> Result<RunEventPage, ApiError> {
+async fn page(state: &AppState, run_id: i64, after: u64) -> Result<RunEventPage, ApiError> {
     state
         .database(move |store| {
             store
-                .run_event_page(agent_id, after, PAGE_SIZE)
+                .run_event_page(run_id, after, PAGE_SIZE)
                 .map_err(ApiError::internal)?
                 .ok_or(ApiError(StatusCode::NOT_FOUND, "unknown run"))
         })
@@ -374,27 +400,28 @@ async fn page(state: &AppState, agent_id: i64, after: u64) -> Result<RunEventPag
 }
 
 async fn events(
-    Path(agent_id): Path<i64>,
+    Path(run_id): Path<i64>,
     Query(cursor): Query<EventCursor>,
     State(state): State<AppState>,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let first = page(&state, agent_id, cursor.after).await?;
+    let first = page(&state, run_id, cursor.after).await?;
     Ok(upgrade
         .max_message_size(1024)
-        .on_upgrade(move |socket| stream_events(socket, state, agent_id, cursor.after, first)))
+        .on_upgrade(move |socket| stream_events(socket, state, run_id, cursor.after, first)))
 }
 
 #[derive(Serialize)]
 struct StreamEvent {
     sequence: u64,
+    run_id: i64,
     event: RunEvent,
 }
 
 async fn stream_events(
     mut socket: WebSocket,
     state: AppState,
-    agent_id: i64,
+    run_id: i64,
     mut after: u64,
     mut batch: RunEventPage,
 ) {
@@ -404,6 +431,7 @@ async fn stream_events(
             after = entry.sequence;
             let Ok(event) = serde_json::to_string(&StreamEvent {
                 sequence: after,
+                run_id: entry.run_id,
                 event: entry.event,
             }) else {
                 return;
@@ -436,7 +464,7 @@ async fn stream_events(
                 }
             }
         }
-        match page(&state, agent_id, after).await {
+        match page(&state, run_id, after).await {
             Ok(next) => batch = next,
             Err(_) => {
                 let _ = socket

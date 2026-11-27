@@ -12,13 +12,19 @@ use crate::{JournalError, JsonValue, PendingWait, RunEvent, WorkspaceStore};
 
 pub(crate) fn record_transition(
     tx: &JournalTransaction<'_>,
+    run_id: i64,
     agent_id: i64,
     sequence: u64,
     event: &RunEvent,
 ) -> Result<(), JournalError> {
     let sql = tx.sql();
-    let status = match event {
-        RunEvent::RunStarted(_) => "runnable",
+    match event {
+        RunEvent::RunStarted(_) => {
+            sql.execute(
+                "UPDATE agent_runs SET status='runnable' WHERE run_id=?1",
+                [run_id],
+            )?;
+        }
         RunEvent::MailboxMessageSent {
             message_id,
             to_agent_id,
@@ -32,7 +38,6 @@ pub(crate) fn record_transition(
                 crate::mailbox::MessageKind::Message,
                 payload,
             )?;
-            return Ok(());
         }
         RunEvent::WaitStarted(wait) => {
             let wake_at = match wait.on {
@@ -42,42 +47,43 @@ pub(crate) fn record_transition(
                 ),
                 _ => None,
             };
-            let inserted = sql.execute(
-                "INSERT INTO run_waits(agent_id, wait_id, wait_kind, wake_at_ms, start_event_sequence)
-                 VALUES(?1, ?2, ?3, ?4, ?5) ON CONFLICT(agent_id) DO NOTHING",
-                params![agent_id, wait.id, wait.on.source(), wake_at, sequence],
+            let updated = sql.execute(
+                "UPDATE agent_runs SET status='waiting', wait_id=?2, wait_kind=?3,
+                     wake_at_ms=?4, wait_event_sequence=?5 WHERE run_id=?1 AND status='runnable'",
+                params![run_id, wait.id, wait.on.source(), wake_at, sequence],
             )?;
-            if inserted == 0 {
-                return Err(JournalError::InvalidWait("run already has a pending wait"));
+            if updated == 0 {
+                return Err(JournalError::InvalidWait("run cannot start a wait"));
             }
-            "waiting"
         }
         RunEvent::Woken { wait_id, .. } => {
             let updated = sql.execute(
-                "DELETE FROM run_waits
-                 WHERE agent_id = ?1 AND wait_id = ?2",
-                params![agent_id, wait_id],
+                "UPDATE agent_runs SET status='runnable', wait_id=NULL, wait_kind=NULL,
+                     wake_at_ms=NULL, wait_event_sequence=NULL WHERE run_id=?1 AND wait_id=?2",
+                params![run_id, wait_id],
             )?;
             if updated == 0 {
                 return Err(JournalError::InvalidWait("no matching pending wait"));
             }
-            "runnable"
         }
         RunEvent::RunFinished(answer) => {
-            sql.execute("DELETE FROM run_waits WHERE agent_id = ?1", [agent_id])?;
+            finish_run(tx, run_id, "completed")?;
             crate::dynamic::finish(tx, agent_id, Ok(answer))?;
-            "completed"
         }
         RunEvent::RunFailed(error) => {
-            sql.execute("DELETE FROM run_waits WHERE agent_id = ?1", [agent_id])?;
+            finish_run(tx, run_id, "failed")?;
             crate::dynamic::finish(tx, agent_id, Err(error))?;
-            "failed"
         }
-        _ => return Ok(()),
-    };
-    sql.execute(
-        "UPDATE agent_runs SET status=?2 WHERE agent_id=?1",
-        params![agent_id, status],
+        _ => {}
+    }
+    Ok(())
+}
+
+fn finish_run(tx: &JournalTransaction<'_>, run_id: i64, status: &str) -> Result<(), JournalError> {
+    tx.sql().execute(
+        "UPDATE agent_runs SET status=?2, wait_id=NULL, wait_kind=NULL,
+             wake_at_ms=NULL, wait_event_sequence=NULL WHERE run_id=?1",
+        params![run_id, status],
     )?;
     Ok(())
 }
@@ -98,21 +104,21 @@ impl WorkspaceStore {
         };
         let (source, payload) = event.into_result();
         let tx = JournalTransaction::begin(&mut self.connection)?;
-        let pending = tx
+        let pending: Option<(i64, i64, u64)> = tx
             .sql()
             .query_row(
-                "SELECT agent_id, start_event_sequence FROM run_waits
+                "SELECT run_id, agent_id, wait_event_sequence FROM agent_runs
                  WHERE wait_id = ?1
                    AND (wait_kind = ?2 OR (?2 = 'approval' AND wait_kind = 'tool_approval'))",
                 params![wait_id, source],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some((agent_id, sequence)) = pending {
-            record_wake(&tx, agent_id, sequence, wait_id.into(), payload)?;
+        if let Some((run_id, _, sequence)) = pending {
+            record_wake(&tx, run_id, sequence, wait_id.into(), payload)?;
         }
         tx.commit()?;
-        if let (Some((agent_id, _)), Some(approved)) = (pending, approval) {
+        if let (Some((_, agent_id, _)), Some(approved)) = (pending, approval) {
             tracing::info!(target: "wakefold::journal", agent_id, wait_id, approved, "approval decision committed");
         }
         Ok(pending.is_some())
@@ -128,8 +134,8 @@ impl WorkspaceStore {
     /// Returns a journal error if an approval cannot be read or decoded.
     pub fn pending_tool_approvals(&self) -> Result<Vec<(i64, PendingWait)>, JournalError> {
         let mut query = self.connection.prepare_cached(
-            "SELECT rw.agent_id, e.event_json FROM run_waits rw
-             JOIN run_events e ON e.agent_id = rw.agent_id AND e.sequence = rw.start_event_sequence
+            "SELECT rw.agent_id, e.event_json FROM agent_runs rw
+             JOIN run_events e ON e.run_id = rw.run_id AND e.sequence = rw.wait_event_sequence
              WHERE rw.wait_kind = 'tool_approval'
              ORDER BY rw.agent_id",
         )?;
@@ -167,9 +173,9 @@ impl WorkspaceStore {
         let tx = JournalTransaction::begin(&mut self.connection)?;
         let due = {
             let mut query = tx.sql().prepare_cached(
-                "SELECT agent_id, start_event_sequence, wait_id, wake_at_ms FROM run_waits
+                "SELECT run_id, wait_event_sequence, wait_id, wake_at_ms FROM agent_runs
                 WHERE wake_at_ms IS NOT NULL AND wake_at_ms <= ?1
-                ORDER BY wake_at_ms, agent_id LIMIT ?2",
+                ORDER BY wake_at_ms, run_id LIMIT ?2",
             )?;
             let now = current_millis(now);
             let limit = i64::try_from(limit.get()).unwrap_or(i64::MAX);
@@ -180,9 +186,9 @@ impl WorkspaceStore {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let count = due.len();
-        for (agent_id, sequence, wait_id, wake_at_ms) in due {
+        for (run_id, sequence, wait_id, wake_at_ms) in due {
             let payload = json!({ "wake_at_unix_ms": wake_at_ms });
-            record_wake(&tx, agent_id, sequence, wait_id, payload)?;
+            record_wake(&tx, run_id, sequence, wait_id, payload)?;
         }
         tx.commit()?;
         Ok(count)
@@ -191,11 +197,11 @@ impl WorkspaceStore {
 
 fn record_wake(
     tx: &JournalTransaction<'_>,
-    agent_id: i64,
+    run_id: i64,
     sequence: u64,
     wait_id: String,
     payload: JsonValue,
 ) -> Result<(), JournalError> {
-    tx.append(agent_id, sequence, &[RunEvent::Woken { wait_id, payload }])?;
+    tx.append(run_id, sequence, &[RunEvent::Woken { wait_id, payload }])?;
     Ok(())
 }

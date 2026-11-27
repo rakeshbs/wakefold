@@ -152,7 +152,7 @@ fn interrupted_batch_rolls_back_all_its_entries() {
 }
 
 #[test]
-fn fresh_schema_has_seven_tables_and_reopens_reserved_workspaces() {
+fn fresh_schema_has_six_tables_and_reopens_reserved_workspaces() {
     let state = tempfile::tempdir().unwrap();
     let run = WorkspaceStore::open(state.path())
         .unwrap()
@@ -173,12 +173,11 @@ fn fresh_schema_has_seven_tables_and_reopens_reserved_workspaces() {
         tables,
         [
             "agent_runs",
+            "agent_sessions",
             "artifact_revisions",
             "artifacts",
-            "chats",
             "mailbox_messages",
-            "run_events",
-            "run_waits"
+            "run_events"
         ]
     );
     let status = || {

@@ -266,6 +266,9 @@ fn input_items(request: ModelRequest<'_>) -> Result<Vec<InputItem>, ProviderErro
         }
     }
 
+    if let Some(context) = request.request_context {
+        items.push(text_message(Role::Developer, context));
+    }
     Ok(items)
 }
 

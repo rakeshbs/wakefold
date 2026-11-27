@@ -14,6 +14,7 @@ const PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(128).expect("page size is nonz
 #[derive(Serialize)]
 struct ReplayEvent<'a> {
     agent_id: i64,
+    run_id: i64,
     sequence: u64,
     event: &'a RunEvent,
 }
@@ -29,15 +30,17 @@ pub(crate) fn write(
     for agent_id in runs {
         let mut after = 0;
         loop {
-            let page = journal
-                .run_event_page(agent_id, after, PAGE_SIZE)?
-                .ok_or_else(|| format!("unknown run {agent_id}"))?;
-            let count = page.entries.len();
-            for entry in page.entries {
+            let entries = journal.agent_events(agent_id, after, PAGE_SIZE)?;
+            if entries.is_empty() && after == 0 {
+                return Err(format!("unknown agent {agent_id}").into());
+            }
+            let count = entries.len();
+            for entry in entries {
                 serde_json::to_writer(
                     &mut output,
                     &ReplayEvent {
                         agent_id,
+                        run_id: entry.run_id,
                         sequence: entry.sequence,
                         event: &entry.event,
                     },

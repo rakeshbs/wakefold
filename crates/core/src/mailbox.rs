@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
 
-use crate::journal::{JournalTransaction, tail};
+use crate::journal::JournalTransaction;
 use crate::{
     JournalEntry, JournalError, JsonValue, PendingWait, RunEvent, Tool, ToolContext, ToolError,
     ToolOutput, ToolRecovery, ToolSpec, WaitOn, WorkspaceStore,
@@ -56,6 +56,28 @@ impl WorkspaceStore {
         message_key: &str,
         payload: &JsonValue,
     ) -> Result<String, ClientMessageError> {
+        let run: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT run_id FROM agent_runs WHERE agent_id=?1 ORDER BY run_id DESC LIMIT 1",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        self.post_run_message(
+            run.ok_or(ClientMessageError::UnknownRun)?,
+            message_key,
+            payload,
+        )
+    }
+
+    /// Send a host message to a particular run, including retries after it finishes.
+    pub fn post_run_message(
+        &mut self,
+        run_id: i64,
+        message_key: &str,
+        payload: &JsonValue,
+    ) -> Result<String, ClientMessageError> {
         if message_key.trim().is_empty() {
             return Err(ClientMessageError::EmptyKey);
         }
@@ -64,8 +86,8 @@ impl WorkspaceStore {
             .sql()
             .query_row(
                 "SELECT message_id, payload_json FROM mailbox_messages
-             WHERE to_agent_id = ?1 AND client_message_key = ?2",
-                params![agent_id, message_key],
+             WHERE to_run_id = ?1 AND client_message_key = ?2",
+                params![run_id, message_key],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
@@ -77,19 +99,29 @@ impl WorkspaceStore {
                 Err(ClientMessageError::KeyConflict)
             };
         }
-        let Some((_, terminal)) = tail(tx.sql(), agent_id)? else {
+        let saved: Option<(i64, String)> = tx
+            .sql()
+            .query_row(
+                "SELECT agent_id,status FROM agent_runs WHERE run_id=?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((agent_id, status)) = saved else {
             return Err(ClientMessageError::UnknownRun);
         };
-        if terminal {
-            return Err(ClientMessageError::RunEnded);
+        match status.as_str() {
+            "runnable" | "waiting" => {}
+            "reserved" => return Err(ClientMessageError::UnknownRun),
+            _ => return Err(ClientMessageError::RunEnded),
         }
         let id = format!("client-{:032x}", rand::random::<u128>());
         tx.sql().execute(
-            "INSERT INTO mailbox_messages(message_id, chat_id, to_agent_id, message_kind, payload_json, client_message_key)
-             SELECT ?1, chat_id, agent_id, 'message', ?3, ?4 FROM agent_runs WHERE agent_id=?2",
+            "INSERT INTO mailbox_messages(message_id, chat_id, to_agent_id, message_kind, payload_json, client_message_key, to_run_id)
+             SELECT ?1, chat_id, agent_id, 'message', ?3, ?4, run_id FROM agent_runs WHERE run_id=?2",
             params![
                 id,
-                agent_id,
+                run_id,
                 serde_json::to_string(payload).map_err(JournalError::from)?,
                 message_key
             ],
@@ -220,7 +252,7 @@ impl Tool for WaitForMessage {
 
 pub(crate) enum MessageKind {
     Message,
-    ChildOutcome,
+    ChildOutcome(i64),
 }
 
 pub(crate) fn record_sent_message(
@@ -232,16 +264,18 @@ pub(crate) fn record_sent_message(
     payload: &JsonValue,
 ) -> Result<(), JournalError> {
     let inserted = tx.sql().execute(
-        "INSERT INTO mailbox_messages(message_id, chat_id, from_agent_id, to_agent_id, payload_json, message_kind)
-         SELECT ?1, sender.chat_id, sender.agent_id, recipient.agent_id, ?4, ?5
-         FROM agent_runs sender JOIN agent_runs recipient USING (chat_id)
+        "INSERT INTO mailbox_messages(message_id, chat_id, from_agent_id, to_agent_id, payload_json, message_kind, to_run_id)
+         SELECT ?1, sender.chat_id, sender.agent_id, recipient.agent_id, ?4, ?5,
+                COALESCE(?6, CASE WHEN sender.parent_agent_id=recipient.agent_id THEN sender.spawned_by_run_id END)
+         FROM agent_sessions sender JOIN agent_sessions recipient USING (chat_id)
          WHERE sender.agent_id = ?2 AND recipient.agent_id = ?3",
         params![
             message_id,
             from_agent_id,
             to_agent_id,
             serde_json::to_string(payload)?,
-            match kind { MessageKind::Message => "message", MessageKind::ChildOutcome => "child_outcome" }
+            match kind { MessageKind::Message => "message", MessageKind::ChildOutcome(_) => "child_outcome" },
+            match kind { MessageKind::Message => None, MessageKind::ChildOutcome(run) => Some(run) }
         ],
     )?;
     if inserted == 0 {
@@ -260,15 +294,21 @@ pub(crate) fn deliver_waiting_message(
     let pending = tx
         .sql()
         .query_row(
-            "SELECT rw.start_event_sequence, e.event_json
-         FROM run_waits rw
-         JOIN run_events e ON e.agent_id = rw.agent_id AND e.sequence = rw.start_event_sequence
+            "SELECT rw.wait_event_sequence, e.event_json, rw.run_id
+         FROM agent_runs rw
+         JOIN run_events e ON e.run_id = rw.run_id AND e.sequence = rw.wait_event_sequence
          WHERE rw.agent_id = ?1 AND rw.wait_kind = 'mailbox_message'",
             [to_agent_id],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((wait_sequence, wait_json)) = pending else {
+    let Some((wait_sequence, wait_json, run_id)) = pending else {
         return Ok(None);
     };
     let RunEvent::WaitStarted(PendingWait { id, on }) = serde_json::from_str(&wait_json)? else {
@@ -279,20 +319,24 @@ pub(crate) fn deliver_waiting_message(
         WaitOn::ChildOutcome { from_agent_id } => (from_agent_id, true),
         _ => return Err(JournalError::InvalidWait("expected mailbox wait")),
     };
-    let Some(payload) = take_message(tx, to_agent_id, sender, only, wait_sequence + 1)? else {
+    let Some(payload) = take_message(tx, run_id, sender, only, wait_sequence + 1)? else {
         return Ok(None);
     };
     let event = RunEvent::Woken {
         wait_id: id,
         payload,
     };
-    let sequence = tx.append(to_agent_id, wait_sequence, std::slice::from_ref(&event))?;
-    Ok(Some(JournalEntry { sequence, event }))
+    let sequence = tx.append(run_id, wait_sequence, std::slice::from_ref(&event))?;
+    Ok(Some(JournalEntry {
+        sequence,
+        event,
+        run_id,
+    }))
 }
 
 pub(crate) fn take_message(
     tx: &JournalTransaction<'_>,
-    to_agent_id: i64,
+    run_id: i64,
     from_agent_id: Option<i64>,
     completion_only: bool,
     sequence: u64,
@@ -301,10 +345,11 @@ pub(crate) fn take_message(
         .sql()
         .query_row(
             "SELECT message_id, from_agent_id, payload_json FROM mailbox_messages
-         WHERE to_agent_id = ?1 AND received_event_sequence IS NULL
+         WHERE to_agent_id = (SELECT agent_id FROM agent_runs WHERE run_id=?1)
+           AND (to_run_id IS NULL OR to_run_id=?1) AND received_event_sequence IS NULL
            AND (?2 IS NULL OR from_agent_id = ?2) AND (NOT ?3 OR message_kind = 'child_outcome')
          ORDER BY arrival_order LIMIT 1",
-            params![to_agent_id, from_agent_id, completion_only],
+            params![run_id, from_agent_id, completion_only],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -330,12 +375,38 @@ pub(crate) fn take_message(
 impl WorkspaceStore {
     /// Read a page of mailbox history without consuming messages.
     pub fn mailbox_messages(&self, agent: i64, after: i64) -> Result<Vec<JsonValue>, JournalError> {
+        self.read_mailbox(agent, None, after)
+    }
+
+    /// Read messages addressed to this run, along with messages shared by the agent.
+    pub fn run_mailbox(&self, run_id: i64, after: i64) -> Result<Vec<JsonValue>, JournalError> {
+        let agent: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT agent_id FROM agent_runs WHERE run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match agent {
+            Some(agent) => self.read_mailbox(agent, Some(run_id), after),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn read_mailbox(
+        &self,
+        agent: i64,
+        run: Option<i64>,
+        after: i64,
+    ) -> Result<Vec<JsonValue>, JournalError> {
         let mut query = self.connection.prepare(
-            "SELECT arrival_order, message_id, from_agent_id, payload_json, received_event_sequence, message_kind
+            "SELECT arrival_order, message_id, from_agent_id, payload_json, received_event_sequence, message_kind, to_run_id
              FROM mailbox_messages WHERE to_agent_id = ?1 AND arrival_order > ?2
+               AND (?3 IS NULL OR to_run_id IS NULL OR to_run_id=?3)
              ORDER BY arrival_order LIMIT 128",
         )?;
-        let mut rows = query.query(params![agent, after])?;
+        let mut rows = query.query(params![agent, after, run])?;
         let mut messages = Vec::new();
         while let Some(row) = rows.next()? {
             messages.push(json!({
@@ -344,6 +415,7 @@ impl WorkspaceStore {
                 "from_agent_id": row.get::<_, Option<i64>>(2)?,
                 "payload": serde_json::from_str::<JsonValue>(&row.get::<_, String>(3)?)?,
                 "message_kind": row.get::<_, String>(5)?,
+                "to_run_id": row.get::<_, Option<i64>>(6)?,
                 "consumed_sequence": row.get::<_, Option<i64>>(4)?,
                 "received_event_sequence": row.get::<_, Option<i64>>(4)?,
             }));

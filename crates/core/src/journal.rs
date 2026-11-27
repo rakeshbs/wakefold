@@ -27,7 +27,7 @@ pub(crate) use write::JournalTransaction;
 pub enum RunEvent {
     /// The initial user prompt.
     RunStarted(String),
-    /// Saved instructions and host date surrounding the original task.
+    /// Saved instructions and agent identity for the first request.
     StartupContext {
         instructions: String,
         run_details: String,
@@ -88,7 +88,9 @@ pub enum RunEvent {
 /// A stored event and its one-based position within this run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalEntry {
-    /// Position assigned when the transaction committed.
+    /// Run responsible for this event.
+    pub run_id: i64,
+    /// Position in the agent’s journal assigned when the transaction committed.
     pub sequence: u64,
     /// The recorded transition.
     pub event: RunEvent,
@@ -115,6 +117,12 @@ pub enum JournalError {
         expected: u64,
         /// Last committed sequence, or zero for an empty journal.
         actual: u64,
+    },
+    /// A completed or failed run cannot accept further events.
+    #[error("run {run_id} has ended")]
+    RunEnded {
+        /// ID of the completed or failed request.
+        run_id: i64,
     },
     /// A live driver already owns this run.
     #[error("run {agent_id} is already active")]
@@ -146,6 +154,7 @@ pub enum JournalError {
 #[derive(Debug)]
 pub struct RunJournal<'a> {
     connection: &'a mut Connection,
+    pub(crate) run_id: i64,
     pub(crate) workspace: RunWorkspace,
     lock_path: PathBuf,
     pub(crate) artifact_directory: PathBuf,
@@ -155,12 +164,14 @@ pub struct RunJournal<'a> {
 impl<'a> RunJournal<'a> {
     pub(crate) fn new(
         connection: &'a mut Connection,
+        run_id: i64,
         workspace: RunWorkspace,
         lock_path: PathBuf,
         artifact_directory: PathBuf,
     ) -> Self {
         Self {
             connection,
+            run_id,
             workspace,
             lock_path,
             artifact_directory,
@@ -219,7 +230,7 @@ impl<'a> RunJournal<'a> {
         events: &[RunEvent],
     ) -> Result<(u64, Option<RunEvent>), JournalError> {
         let tx = JournalTransaction::begin(self.connection)?;
-        let sequence = tx.append(self.workspace.agent_id(), expected_last_sequence, events)?;
+        let sequence = tx.append(self.run_id, expected_last_sequence, events)?;
         let wake = match events.last() {
             Some(RunEvent::WaitStarted(PendingWait {
                 on: crate::WaitOn::MailboxMessage { .. } | crate::WaitOn::ChildOutcome { .. },
@@ -250,13 +261,41 @@ impl<'a> RunJournal<'a> {
         let tx = self.connection.transaction()?;
         let start: u64 = tx.query_row(
             "SELECT COALESCE(MAX(sequence), 0) FROM run_events
-             WHERE agent_id = ?1 AND json_extract(event_json, '$.kind') = 'compacted'",
-            [self.workspace.agent_id()],
+             WHERE agent_id=?1 AND run_id<=?2 AND json_extract(event_json, '$.kind')='compacted'",
+            params![self.workspace.agent_id(), self.run_id],
             |row| row.get(0),
         )?;
-        let entries = read_entries(&tx, self.workspace.agent_id(), start.saturating_sub(1))?;
+        let mut query = tx.prepare(
+            "SELECT sequence, event_json, run_id FROM run_events
+             WHERE agent_id=?1 AND run_id<=?2 AND sequence>=?3 ORDER BY sequence",
+        )?;
+        let entries =
+            decode_entries(query.query(params![self.workspace.agent_id(), self.run_id, start])?)?;
+        drop(query);
         tx.commit()?;
         Ok(entries)
+    }
+
+    pub(crate) fn prompt(&self) -> Result<Option<String>, JournalError> {
+        run_prompt(self.connection, self.run_id)
+    }
+
+    pub(crate) fn time_zone(&self) -> Result<chrono_tz::Tz, JournalError> {
+        let zone: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT s.time_zone FROM agent_runs r JOIN agent_sessions s USING(chat_id)
+             WHERE r.run_id=?1 AND s.is_chat_root=1",
+                [self.run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        zone.map_or(Ok(chrono_tz::UTC), |value| {
+            value
+                .parse()
+                .map_err(|_| JournalError::InvalidWait("invalid saved chat time zone"))
+        })
     }
 
     pub(crate) fn validate_artifact_target(
@@ -277,7 +316,7 @@ impl<'a> RunJournal<'a> {
         let tx = JournalTransaction::begin(self.connection)?;
         let id = self.workspace.agent_id();
         let event = RunEvent::ToolCallCompleted(ToolResult::new(call_id, effect(&tx, id)?));
-        let sequence = tx.append(id, expected, std::slice::from_ref(&event))?;
+        let sequence = tx.append(self.run_id, expected, std::slice::from_ref(&event))?;
         tx.commit()?;
         if let Some(hook) = self.commit_hook {
             hook(sequence, std::slice::from_ref(&event));
@@ -293,13 +332,13 @@ impl<'a> RunJournal<'a> {
     ) -> Result<(u64, [RunEvent; 2]), RunError> {
         let tx = JournalTransaction::begin(self.connection)?;
         let agent_id = self.workspace.agent_id();
-        let revision = copy.record(tx.sql(), agent_id)?;
+        let revision = copy.record(tx.sql(), agent_id, self.run_id)?;
         let result = serde_json::to_value(&revision).map_err(JournalError::from)?;
         let events = [
             RunEvent::ArtifactPublished(revision),
             RunEvent::ToolCallCompleted(ToolResult::new(call_id, result)),
         ];
-        let sequence = tx.append(agent_id, expected_last_sequence, &events)?;
+        let sequence = tx.append(self.run_id, expected_last_sequence, &events)?;
         tx.commit()?;
         if let Some(hook) = self.commit_hook {
             hook(sequence, &events);
@@ -308,13 +347,13 @@ impl<'a> RunJournal<'a> {
     }
 
     /// Load committed entries strictly after the supplied position in order.
-    /// Pass zero to read the complete journal.
+    /// Pass zero to read all entries for this run.
     ///
     /// # Errors
     ///
     /// Returns an error if the query fails or a stored event cannot be decoded.
     pub fn load_after(&self, sequence: u64) -> Result<Vec<JournalEntry>, JournalError> {
-        read_entries(self.connection, self.workspace.agent_id(), sequence)
+        read_entry_page(self.connection, self.run_id, sequence, -1)
     }
 
     /// Record an execution failure for a run, returning whether it changed.
@@ -328,25 +367,44 @@ impl<'a> RunJournal<'a> {
     pub fn record_failure(&mut self, error: String) -> Result<bool, JournalError> {
         let _driver_lock = self.lock_driver()?;
         let tx = JournalTransaction::begin(self.connection)?;
-        let id = self.workspace.agent_id();
-        let Some((sequence, terminal)) = tail(tx.sql(), id)? else {
+        let Some((sequence, terminal)) = run_tail(tx.sql(), self.run_id)? else {
             return Ok(false);
         };
         let suspended: bool = tx.sql().query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_waits WHERE agent_id = ?1)",
-            [id],
+            "SELECT status='waiting' FROM agent_runs WHERE run_id=?1",
+            [self.run_id],
             |row| row.get(0),
         )?;
         if terminal || suspended {
             return Ok(false);
         }
-        tx.append(id, sequence, &[RunEvent::RunFailed(error)])?;
+        tx.append(self.run_id, sequence, &[RunEvent::RunFailed(error)])?;
         tx.commit()?;
         Ok(true)
     }
 }
 
 impl WorkspaceStore {
+    /// Page through the root agent's history across all requests, using agent sequence numbers.
+    pub fn chat_history(
+        &self,
+        chat: crate::ChatId,
+        after: u64,
+        limit: NonZeroUsize,
+    ) -> Result<Option<Vec<JournalEntry>>, JournalError> {
+        let agent: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT agent_id FROM agent_sessions WHERE chat_id=?1 AND is_chat_root=1",
+                [chat],
+                |row| row.get(0),
+            )
+            .optional()?;
+        agent
+            .map(|id| read_agent_entries(&self.connection, id, after, limit))
+            .transpose()
+    }
+
     /// Read a page of one run's journal without opening or creating its workspace.
     ///
     /// Returns `None` if the run has no journal.
@@ -356,14 +414,14 @@ impl WorkspaceStore {
     /// Returns a journal error if the page cannot be read or decoded.
     pub fn run_event_page(
         &self,
-        agent_id: i64,
+        run_id: i64,
         after: u64,
         limit: NonZeroUsize,
     ) -> Result<Option<RunEventPage>, JournalError> {
         // Read the completion marker and page from the same snapshot so that
         // a finishing run cannot close a stream before its final event is sent.
         let tx = self.connection.unchecked_transaction()?;
-        let page = read_run_page(&tx, agent_id, after, limit)?;
+        let page = read_run_page(&tx, run_id, after, limit)?;
         tx.commit()?;
         Ok(page)
     }
@@ -399,17 +457,27 @@ impl JournalReplay {
     /// Returns a journal error if the events cannot be read or decoded.
     pub fn run_event_page(
         &self,
-        agent_id: i64,
+        run_id: i64,
         after: u64,
         limit: NonZeroUsize,
     ) -> Result<Option<RunEventPage>, JournalError> {
-        read_run_page(&self.connection, agent_id, after, limit)
+        read_run_page(&self.connection, run_id, after, limit)
+    }
+
+    /// Follow an agent's journal across all its requests in this snapshot.
+    pub fn agent_events(
+        &self,
+        agent: i64,
+        after: u64,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<JournalEntry>, JournalError> {
+        read_agent_entries(&self.connection, agent, after, limit)
     }
 
     /// List children in creation order in this replay snapshot.
     pub fn child_ids(&self, parent: i64) -> Result<Vec<i64>, JournalError> {
         let mut stmt = self.connection.prepare(
-            "SELECT agent_id FROM agent_runs WHERE parent_agent_id=?1 ORDER BY agent_id",
+            "SELECT agent_id FROM agent_sessions WHERE parent_agent_id=?1 ORDER BY agent_id",
         )?;
         Ok(stmt
             .query_map([parent], |r| r.get(0))?
@@ -419,16 +487,16 @@ impl JournalReplay {
 
 fn read_run_page(
     connection: &Connection,
-    agent_id: i64,
+    run_id: i64,
     after: u64,
     limit: NonZeroUsize,
 ) -> Result<Option<RunEventPage>, JournalError> {
-    let Some((last, terminal)) = tail(connection, agent_id)? else {
+    let Some((last, terminal)) = run_tail(connection, run_id)? else {
         return Ok(None);
     };
     let entries = read_entry_page(
         connection,
-        agent_id,
+        run_id,
         after,
         i64::try_from(limit.get()).unwrap_or(i64::MAX),
     )?;
@@ -453,17 +521,37 @@ pub(crate) fn tail(
         .optional()?)
 }
 
-fn read_entries(
+fn run_tail(connection: &Connection, run: i64) -> Result<Option<(u64, bool)>, JournalError> {
+    Ok(connection
+        .query_row(
+            "SELECT sequence, json_extract(event_json, '$.kind') IN ('run_finished','run_failed')
+         FROM run_events WHERE run_id=?1 ORDER BY sequence DESC LIMIT 1",
+            [run],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+pub(crate) fn run_prompt(
     connection: &Connection,
-    agent_id: i64,
-    sequence: u64,
-) -> Result<Vec<JournalEntry>, JournalError> {
-    read_entry_page(connection, agent_id, sequence, -1)
+    run: i64,
+) -> Result<Option<String>, JournalError> {
+    let raw: Option<String> = connection
+        .query_row(
+            "SELECT event_json FROM run_events WHERE run_id=?1 ORDER BY sequence LIMIT 1",
+            [run],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match raw.as_deref().map(serde_json::from_str).transpose()? {
+        Some(RunEvent::RunStarted(prompt)) => Ok(Some(prompt)),
+        _ => Ok(None),
+    }
 }
 
 fn read_entry_page(
     connection: &Connection,
-    agent_id: i64,
+    run_id: i64,
     sequence: u64,
     limit: i64,
 ) -> Result<Vec<JournalEntry>, JournalError> {
@@ -471,14 +559,35 @@ fn read_entry_page(
         return Ok(Vec::new());
     }
     let mut stmt = connection.prepare_cached(
-        "SELECT sequence, event_json FROM run_events
-             WHERE agent_id = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
+        "SELECT sequence, event_json, run_id FROM run_events
+             WHERE run_id = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
     )?;
-    let mut rows = stmt.query(params![agent_id, sequence, limit])?;
+    decode_entries(stmt.query(params![run_id, sequence, limit])?)
+}
+
+fn read_agent_entries(
+    connection: &Connection,
+    agent: i64,
+    after: u64,
+    limit: NonZeroUsize,
+) -> Result<Vec<JournalEntry>, JournalError> {
+    let Ok(after) = i64::try_from(after) else {
+        return Ok(Vec::new());
+    };
+    let limit = i64::try_from(limit.get()).unwrap_or(i64::MAX);
+    let mut query = connection.prepare_cached(
+        "SELECT sequence, event_json, run_id FROM run_events
+         WHERE agent_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
+    )?;
+    decode_entries(query.query(params![agent, after, limit])?)
+}
+
+fn decode_entries(mut rows: rusqlite::Rows<'_>) -> Result<Vec<JournalEntry>, JournalError> {
     let mut entries = Vec::new();
     while let Some(row) = rows.next()? {
         entries.push(JournalEntry {
             sequence: row.get(0)?,
+            run_id: row.get(2)?,
             event: serde_json::from_str(row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?)?,
         });
     }

@@ -31,7 +31,10 @@ impl Script {
     ) -> Result<ModelTurn, RunError> {
         stream_turn_with_clock(
             self,
-            ModelRequest::new(&[Message::User(String::from("Hello"))], &[]),
+            (
+                ModelRequest::new(&[Message::User(String::from("Hello"))], &[]),
+                chrono_tz::UTC,
+            ),
             on_text,
             policy,
             cancellation,

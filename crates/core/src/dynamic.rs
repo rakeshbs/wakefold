@@ -22,6 +22,9 @@ pub enum QueueRunError {
     /// The chat ID and run key belong to a different request.
     #[error("this chat ID and run key already belong to a different request")]
     Conflict,
+    /// The agent already has an unfinished request.
+    #[error("the conversation has an unfinished run")]
+    Busy,
     /// The journal could not save or verify the request.
     #[error(transparent)]
     Journal(#[from] JournalError),
@@ -52,7 +55,8 @@ pub struct AgentSettings {
 }
 
 impl WorkspaceStore {
-    /// Admit a root using a snapshot of its defaults. Retries return the original agent ID.
+    /// Admit a request for the chat's root agent and return its stable agent ID.
+    /// Use [`Self::queue_chat_turn`] to get the request's ID as well.
     pub fn queue_root(
         &mut self,
         chat_id: ChatId,
@@ -61,43 +65,77 @@ impl WorkspaceStore {
         settings: &AgentSettings,
         time_zone: Option<chrono_tz::Tz>,
     ) -> Result<i64, QueueRunError> {
+        self.queue_chat_turn(chat_id, run_key, task, settings, time_zone)
+            .map(|(agent_id, _)| agent_id)
+    }
+
+    /// Append a user request to this chat, returning the stable agent ID and the new run ID.
+    ///
+    /// Retrying the same key and prompt returns the saved IDs. A new request
+    /// requires the preceding run to be completed or failed.
+    pub fn queue_chat_turn(
+        &mut self,
+        chat_id: ChatId,
+        run_key: &str,
+        task: &str,
+        settings: &AgentSettings,
+        time_zone: Option<chrono_tz::Tz>,
+    ) -> Result<(i64, i64), QueueRunError> {
         let tx = JournalTransaction::begin(&mut self.connection)?;
-        let id = crate::workspace::reserve_run(tx.sql(), chat_id, run_key)?;
-        let previous: Option<(String, bool)> = tx
-            .sql()
-            .query_row(
-                "SELECT event_json, parent_agent_id IS NULL AND settings_json IS NOT NULL
-             FROM agent_runs JOIN run_events USING(agent_id) WHERE agent_id = ?1 AND sequence = 1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        tx.sql().execute(
-            "UPDATE chats SET time_zone = ?2 WHERE chat_id = ?1 AND time_zone IS NULL",
-            params![chat_id, time_zone.unwrap_or(chrono_tz::UTC).name()],
-        )?;
-        let zone = zone_for_run(&tx, id)?;
-        if time_zone.is_some_and(|requested| requested != zone) {
-            return Err(QueueRunError::Conflict);
-        }
-        if let Some((event, root)) = previous {
-            if !root
-                || !matches!(serde_json::from_str(&event).map_err(JournalError::from)?, RunEvent::RunStarted(saved) if saved==task)
+        let existing = crate::workspace::find_run(tx.sql(), chat_id, run_key)?;
+        let root = crate::workspace::ensure_root(tx.sql(), chat_id)?;
+        if let Some((run, agent)) = existing {
+            let saved = crate::journal::run_prompt(tx.sql(), run)?;
+            // Migrated requests may belong to a previously independent root.
+            let was_root: bool = tx.sql().query_row(
+                "SELECT parent_agent_id IS NULL AND settings_json IS NOT NULL
+                 FROM agent_sessions WHERE agent_id=?1",
+                [agent],
+                |row| row.get(0),
+            )?;
+            if !was_root || saved.as_deref() != Some(task) {
+                return Err(QueueRunError::Conflict);
+            }
+            if let Some(requested) = time_zone
+                && zone_for_chat(&tx, chat_id)? != requested
             {
                 return Err(QueueRunError::Conflict);
             }
-        } else {
-            admit(&tx, id, None, task, settings, zone)?;
+            tx.commit()?;
+            return Ok((agent, run));
         }
+        let busy: bool = tx.sql().query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent_id=?1 AND status IN ('runnable','waiting'))",
+            [root], |row| row.get(0),
+        )?;
+        if busy {
+            return Err(QueueRunError::Busy);
+        }
+        tx.sql().execute(
+            "UPDATE agent_sessions SET time_zone=COALESCE(time_zone,?2),
+                                      settings_json=COALESCE(settings_json,?3)
+             WHERE agent_id=?1",
+            params![
+                root,
+                time_zone.unwrap_or(chrono_tz::UTC).name(),
+                serde_json::to_string(settings).map_err(JournalError::from)?
+            ],
+        )?;
+        if time_zone.is_some() && time_zone != Some(zone_for_chat(&tx, chat_id)?) {
+            return Err(QueueRunError::Conflict);
+        }
+        let run = crate::workspace::insert_run(tx.sql(), chat_id, root, run_key)?;
+        admit(&tx, run, root, None, task, settings)?;
         tx.commit()?;
-        Ok(id)
+        Ok((root, run))
     }
 
-    /// Settings for dynamic runs that may still need a provider after restart.
+    /// Settings saved for agents that can continue after restart.
     pub fn active_agent_settings(&self) -> Result<Vec<AgentSettings>, JournalError> {
         let mut stmt = self.connection.prepare(
-            "SELECT DISTINCT settings_json FROM agent_runs WHERE settings_json IS NOT NULL
-             AND status IN ('runnable','waiting')",
+            "SELECT DISTINCT s.settings_json FROM agent_sessions s WHERE s.settings_json IS NOT NULL
+             AND (s.is_chat_root=1 OR EXISTS (SELECT 1 FROM agent_runs r WHERE r.agent_id=s.agent_id
+                                               AND r.status IN ('runnable','waiting')))",
         )?;
         stmt.query_map([], |r| r.get::<_, String>(0))?
             .map(|s| Ok(serde_json::from_str(&s?)?))
@@ -107,18 +145,20 @@ impl WorkspaceStore {
     /// List run identities, their parents, tasks and latest journal event in a chat.
     pub fn chat_runs(&self, chat: ChatId) -> Result<Vec<JsonValue>, JournalError> {
         let mut query = self.connection.prepare(
-            "SELECT wr.agent_id, wr.parent_agent_id, wr.run_key, wr.status,
-                    json_extract(first.event_json, '$.data'),
-                    (SELECT json_extract(event_json, '$.kind') FROM run_events e
-                     WHERE e.agent_id = wr.agent_id ORDER BY sequence DESC LIMIT 1)
-             FROM agent_runs wr
-             JOIN run_events first ON first.agent_id = wr.agent_id AND first.sequence = 1
-             WHERE chat_id = ?1 ORDER BY wr.agent_id",
+            "SELECT r.agent_id, s.parent_agent_id, r.run_key, r.status,
+                    (SELECT json_extract(event_json, '$.data') FROM run_events
+                     WHERE run_id=r.run_id ORDER BY sequence LIMIT 1),
+                    (SELECT json_extract(event_json, '$.kind') FROM run_events
+                     WHERE run_id=r.run_id ORDER BY sequence DESC LIMIT 1), r.run_id, s.spawned_by_run_id
+             FROM agent_runs r JOIN agent_sessions s USING(agent_id)
+             WHERE r.chat_id=?1 AND r.status<>'reserved' ORDER BY r.run_id",
         )?;
         let rows = query.query_map([chat], |row| {
             Ok(json!({
                 "agent_id": row.get::<_, i64>(0)?,
+                "run_id": row.get::<_, i64>(6)?,
                 "parent_agent_id": row.get::<_, Option<i64>>(1)?,
+                "spawned_by_run_id": row.get::<_, Option<i64>>(7)?,
                 "run_key": row.get::<_, String>(2)?,
                 "status": row.get::<_, String>(3)?,
                 "task": row.get::<_, String>(4)?,
@@ -129,10 +169,10 @@ impl WorkspaceStore {
     }
 }
 
-fn zone_for_run(tx: &JournalTransaction<'_>, id: i64) -> Result<chrono_tz::Tz, JournalError> {
+fn zone_for_chat(tx: &JournalTransaction<'_>, chat: ChatId) -> Result<chrono_tz::Tz, JournalError> {
     let zone: String = tx.sql().query_row(
-        "SELECT time_zone FROM chats JOIN agent_runs USING(chat_id) WHERE agent_id=?1",
-        [id],
+        "SELECT COALESCE(time_zone,'UTC') FROM agent_sessions WHERE chat_id=?1 AND is_chat_root=1",
+        [chat],
         |r| r.get(0),
     )?;
     zone.parse()
@@ -141,16 +181,17 @@ fn zone_for_run(tx: &JournalTransaction<'_>, id: i64) -> Result<chrono_tz::Tz, J
 
 fn admit(
     tx: &JournalTransaction<'_>,
-    id: i64,
+    run: i64,
+    agent: i64,
     parent: Option<i64>,
     task: &str,
     settings: &AgentSettings,
-    zone: chrono_tz::Tz,
 ) -> Result<(), JournalError> {
-    tx.sql().execute(
-        "UPDATE agent_runs SET parent_agent_id=?2, settings_json=?3 WHERE agent_id=?1",
-        params![id, parent, serde_json::to_string(settings)?],
-    )?;
+    let tail = crate::journal::tail(tx.sql(), agent)?.map_or(0, |(sequence, _)| sequence);
+    if tail != 0 {
+        tx.append(run, tail, &[RunEvent::RunStarted(task.to_owned())])?;
+        return Ok(());
+    }
     let mut instructions = settings.instructions.clone();
     instructions.push_str("\nAvailable skills:");
     for (name, description) in &settings.catalog {
@@ -158,13 +199,12 @@ fn admit(
             instructions.push_str(&format!("\n{name}: {description}"));
         }
     }
-    let date = chrono::Utc::now().with_timezone(&zone).date_naive();
-    let mut run_details = format!("Start date: {date} ({zone}). Your agent ID is {id}.");
+    let mut run_details = format!("Your agent ID is {agent}.");
     if let Some(parent) = parent {
         run_details.push_str(&format!(" Your parent agent ID is {parent}."));
     }
     tx.append(
-        id,
+        run,
         0,
         &[
             RunEvent::RunStarted(task.to_owned()),
@@ -183,30 +223,33 @@ pub(crate) fn spawn(
     key: &str,
     task: &str,
 ) -> Result<JsonValue, JournalError> {
-    let saved: String = tx
+    let (chat, parent_run, saved): (ChatId, i64, String) = tx
         .sql()
         .query_row(
-            "SELECT settings_json FROM agent_runs WHERE agent_id=?1 AND settings_json IS NOT NULL AND parent_agent_id IS NULL",
+            "SELECT s.chat_id, r.run_id, s.settings_json FROM agent_sessions s
+         JOIN agent_runs r USING(agent_id) WHERE s.agent_id=?1 AND s.settings_json IS NOT NULL
+         AND s.parent_agent_id IS NULL AND r.status='runnable'",
             [parent],
-            |r| r.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
         .ok_or(JournalError::InvalidWait("only a root agent can spawn"))?;
-    let child = tx.sql().query_row(
-        "INSERT INTO agent_runs(chat_id, run_key)
-         SELECT chat_id, ?2 FROM agent_runs WHERE agent_id = ?1 RETURNING agent_id",
-        params![parent, key],
-        |row| row.get(0),
+    let child =
+        crate::workspace::create_session(tx.sql(), chat, false, Some((parent, parent_run)))?;
+    let run = crate::workspace::insert_run(tx.sql(), chat, child, key)?;
+    tx.sql().execute(
+        "UPDATE agent_sessions SET settings_json=?2 WHERE agent_id=?1",
+        params![child, saved],
     )?;
     admit(
         tx,
+        run,
         child,
         Some(parent),
         task,
         &serde_json::from_str(&saved)?,
-        zone_for_run(tx, parent)?,
     )?;
-    Ok(json!({"agent_id":child}))
+    Ok(json!({"agent_id": child, "run_id": run}))
 }
 
 pub(crate) fn finish(
@@ -214,11 +257,11 @@ pub(crate) fn finish(
     child: i64,
     result: Result<&str, &str>,
 ) -> Result<(), JournalError> {
-    let parent: Option<i64> = tx.sql().query_row(
-        "SELECT parent_agent_id FROM agent_runs WHERE agent_id = ?1 AND parent_agent_id IS NOT NULL",
-        [child], |row| row.get(0),
+    let parent: Option<(i64, i64)> = tx.sql().query_row(
+        "SELECT parent_agent_id, spawned_by_run_id FROM agent_sessions WHERE agent_id = ?1 AND parent_agent_id IS NOT NULL",
+        [child], |row| Ok((row.get(0)?,row.get(1)?)),
     ).optional()?;
-    if let Some(parent) = parent {
+    if let Some((parent, parent_run)) = parent {
         let payload = match result {
             Ok(answer) => json!({"kind":"completed","answer":answer}),
             Err(error) => json!({"kind":"failed","error":error}),
@@ -228,7 +271,7 @@ pub(crate) fn finish(
             &format!("outcome-{child}"),
             child,
             parent,
-            crate::mailbox::MessageKind::ChildOutcome,
+            crate::mailbox::MessageKind::ChildOutcome(parent_run),
             &payload,
         )?;
     }

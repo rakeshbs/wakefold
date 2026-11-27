@@ -97,7 +97,7 @@ fn resumes_a_saved_single_tool_call_from_an_older_journal() -> Result<(), Box<dy
             }
         });
         rusqlite::Connection::open(dir.path().join("wakefold.sqlite3"))?.execute(
-            "INSERT INTO run_events(agent_id, sequence, event_json) VALUES (?1, 3, ?2)",
+            "INSERT INTO run_events(agent_id, sequence, run_id, event_json) VALUES (?1, 3, ?1, ?2)",
             rusqlite::params![workspace.agent_id(), event.to_string()],
         )?;
     }

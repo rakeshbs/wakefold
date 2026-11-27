@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::ChatId;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// A failure to open workspace metadata or materialize a directory.
 #[derive(Debug, Error)]
@@ -86,21 +86,7 @@ impl WorkspaceStore {
         }
         connection.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")?;
         if schema_version(&connection)? != SCHEMA_VERSION {
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Another opener may have initialized this database while we waited.
-            let version = schema_version(&tx)?;
-            if version != SCHEMA_VERSION {
-                let empty = tx.query_row(
-                    "SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*')",
-                    [], |row| row.get::<_, bool>(0),
-                )?;
-                if !empty || version != 0 {
-                    return Err(WorkspaceError::IncompatibleDatabase(state));
-                }
-                tx.execute_batch(include_str!("workspace/schema.sql"))?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            tx.commit()?;
+            initialize_schema(&mut connection, &state)?;
         }
         Ok(Self { connection, state })
     }
@@ -113,8 +99,7 @@ impl WorkspaceStore {
     /// Returns an error if the chat could not be saved.
     pub fn create_chat(&self) -> Result<ChatId, WorkspaceError> {
         let chat_id = ChatId::new_v4();
-        self.connection
-            .execute("INSERT INTO chats(chat_id) VALUES (?1)", [chat_id])?;
+        create_session(&self.connection, chat_id, true, None)?;
         Ok(chat_id)
     }
 
@@ -128,13 +113,14 @@ impl WorkspaceStore {
         chat_id: ChatId,
         run_key: &str,
     ) -> Result<crate::RunJournal<'_>, WorkspaceError> {
-        let run = self.open_run_workspace(chat_id, run_key)?;
+        let (run_id, run) = self.open_workspace(chat_id, run_key)?;
         let locks = self.state.join("run-locks");
         fs::create_dir_all(&locks)?;
         let lock_path = locks.join(run.agent_id().to_string());
         let artifact_directory = crate::artifact::directory(&self.state);
         Ok(crate::RunJournal::new(
             &mut self.connection,
+            run_id,
             run,
             lock_path,
             artifact_directory,
@@ -155,15 +141,27 @@ impl WorkspaceStore {
         chat_id: ChatId,
         run_key: &str,
     ) -> Result<RunWorkspace, WorkspaceError> {
+        self.open_workspace(chat_id, run_key)
+            .map(|(_, workspace)| workspace)
+    }
+
+    fn open_workspace(
+        &mut self,
+        chat_id: ChatId,
+        run_key: &str,
+    ) -> Result<(i64, RunWorkspace), WorkspaceError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let agent_id = reserve_run(&tx, chat_id, run_key)?;
-        // Reserve the run durably before creating files. An interrupted
-        // initialization can then finish without reassigning the directory.
+        let (run_id, agent_id) = if let Some(run) = find_run(&tx, chat_id, run_key)? {
+            run
+        } else {
+            let agent_id = create_session(&tx, chat_id, false, None)?;
+            (insert_run(&tx, chat_id, agent_id, run_key)?, agent_id)
+        };
         tx.commit()?;
         let workspace = RunWorkspace {
-            chat_root: chat_directory(&self.state, chat_id),
+            chat_root: self.state.join("workspaces").join(chat_id.to_string()),
             agent_id,
         };
         fs::create_dir_all(
@@ -171,7 +169,7 @@ impl WorkspaceStore {
                 .chat_root
                 .join(workspace.agent_relative_directory()),
         )?;
-        Ok(workspace)
+        Ok((run_id, workspace))
     }
 }
 
@@ -179,28 +177,111 @@ fn schema_version(db: &Connection) -> rusqlite::Result<i64> {
     db.pragma_query_value(None, "user_version", |row| row.get(0))
 }
 
-fn chat_directory(state: &Path, chat_id: ChatId) -> PathBuf {
-    state.join("workspaces").join(chat_id.to_string())
+fn initialize_schema(db: &mut Connection, state: &Path) -> Result<(), WorkspaceError> {
+    // Renaming the old tables rewrites their foreign keys. Validate the rebuilt
+    // graph inside the same transaction before re-enabling enforcement.
+    db.pragma_update(None, "foreign_keys", false)?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    match schema_version(&tx)? {
+        SCHEMA_VERSION => {}
+        1 => {
+            tx.execute_batch(include_str!("workspace/upgrade_v1.sql"))?;
+            tx.execute_batch(include_str!("workspace/schema.sql"))?;
+            tx.execute_batch(include_str!("workspace/copy_v1.sql"))?;
+        }
+        0 if tx.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? =>
+        {
+            tx.execute_batch(include_str!("workspace/schema.sql"))?
+        }
+        _ => return Err(WorkspaceError::IncompatibleDatabase(state.to_owned())),
+    }
+    let invalid: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid {
+        return Err(WorkspaceError::IncompatibleDatabase(state.to_owned()));
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    db.pragma_update(None, "foreign_keys", true)?;
+    Ok(())
 }
 
-pub(crate) fn reserve_run(
-    tx: &rusqlite::Transaction<'_>,
-    chat_id: ChatId,
-    run_key: &str,
-) -> Result<i64, rusqlite::Error> {
-    tx.execute(
-        "INSERT INTO chats(chat_id) VALUES (?1) ON CONFLICT(chat_id) DO NOTHING",
-        [chat_id],
-    )?;
-    let keys = params![chat_id, run_key];
-    tx.execute(
-        "INSERT INTO agent_runs(chat_id, run_key) VALUES (?1, ?2)
-         ON CONFLICT(chat_id, run_key) DO NOTHING",
-        keys,
-    )?;
-    tx.query_row(
-        "SELECT agent_id FROM agent_runs WHERE chat_id = ?1 AND run_key = ?2",
-        keys,
+pub(crate) fn find_run(
+    db: &Connection,
+    chat: ChatId,
+    key: &str,
+) -> rusqlite::Result<Option<(i64, i64)>> {
+    use rusqlite::OptionalExtension;
+    db.query_row(
+        "SELECT run_id, agent_id FROM agent_runs WHERE chat_id=?1 AND run_key=?2",
+        params![chat, key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+fn next_id(db: &Connection) -> rusqlite::Result<i64> {
+    db.query_row(
+        "SELECT MAX((SELECT COALESCE(MAX(agent_id),0) FROM agent_sessions),
+                    (SELECT COALESCE(MAX(run_id),0) FROM agent_runs)) + 1",
+        [],
         |row| row.get(0),
     )
+}
+
+pub(crate) fn ensure_root(db: &Connection, chat: ChatId) -> rusqlite::Result<i64> {
+    use rusqlite::OptionalExtension;
+    let agent = db
+        .query_row(
+            "SELECT agent_id FROM agent_sessions WHERE chat_id=?1 AND is_chat_root=1",
+            [chat],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match agent {
+        Some(id) => Ok(id),
+        None => create_session(db, chat, true, None),
+    }
+}
+
+pub(crate) fn create_session(
+    db: &Connection,
+    chat: ChatId,
+    is_root: bool,
+    parent: Option<(i64, i64)>,
+) -> rusqlite::Result<i64> {
+    db.query_row(
+        "INSERT INTO agent_sessions(agent_id,chat_id,is_chat_root,parent_agent_id,spawned_by_run_id)
+         SELECT MAX((SELECT COALESCE(MAX(agent_id),0) FROM agent_sessions),
+                    (SELECT COALESCE(MAX(run_id),0) FROM agent_runs)) + 1, ?1,?2,?3,?4
+         RETURNING agent_id",
+        params![chat, is_root, parent.map(|p| p.0), parent.map(|p| p.1)],
+        |row| row.get(0),
+    )
+}
+
+pub(crate) fn insert_run(
+    db: &Connection,
+    chat: ChatId,
+    agent: i64,
+    key: &str,
+) -> rusqlite::Result<i64> {
+    let has_run: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent_id=?1 OR run_id=?1)",
+        [agent],
+        |row| row.get(0),
+    )?;
+    let run = if has_run { next_id(db)? } else { agent };
+    db.execute(
+        "INSERT INTO agent_runs(run_id,agent_id,chat_id,run_key) VALUES (?1,?2,?3,?4)",
+        params![run, agent, chat, key],
+    )?;
+    Ok(run)
 }

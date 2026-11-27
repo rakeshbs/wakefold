@@ -42,6 +42,7 @@ impl RunState {
         turn: ModelTurn,
         skills: &RunSkills<'_>,
         options: &RunOptions,
+        historical: bool,
     ) -> Result<(), RunError> {
         let response = turn.response;
         if let crate::ModelResponse::ToolCalls { text, calls } = &response
@@ -54,7 +55,10 @@ impl RunState {
         }
         self.usage.record(turn.usage)?;
         self.model_turns += 1;
-        if self.model_turns < options.max_model_turns && !response.tool_calls().is_empty() {
+        if !historical
+            && self.model_turns < options.max_model_turns
+            && !response.tool_calls().is_empty()
+        {
             self.usage.check_budget(options.token_budget)?;
             validate_calls(response.tool_calls(), &mut self.used_call_ids, skills)?;
         }
@@ -90,6 +94,7 @@ pub(super) struct RunDriver<'a, 'db, 'skills> {
     pub state: RunState,
     pub skills: RunSkills<'skills>,
     pub phase: RunPhase,
+    pub time_zone: chrono_tz::Tz,
 }
 
 impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
@@ -99,9 +104,18 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         skills: RunSkills<'skills>,
         options: &'a RunOptions,
     ) -> Result<Self, RunError> {
-        let entries = match &mut journal {
-            Some(journal) => journal.recovery_entries()?,
-            None => Vec::new(),
+        let (entries, run_id, time_zone) = match &mut journal {
+            Some(journal) => {
+                if journal.prompt()?.is_some_and(|original| original != prompt) {
+                    return Err(RunError::ResumePromptMismatch);
+                }
+                (
+                    journal.recovery_entries()?,
+                    journal.run_id,
+                    journal.time_zone()?,
+                )
+            }
+            None => (Vec::new(), 0, chrono_tz::UTC),
         };
         let mut run = Self {
             journal,
@@ -110,37 +124,14 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             state: RunState::default(),
             skills,
             phase: RunPhase::Ready,
+            time_zone,
         };
-        let Some(first) = entries.first() else {
+        if entries.is_empty() {
             run.commit([RunEvent::RunStarted(prompt)])?;
             return Ok(run);
-        };
-        let original_prompt = match &first.event {
-            RunEvent::RunStarted(original) => original,
-            RunEvent::TranscriptCompacted(snapshot) => {
-                let Some(Message::User(original)) = snapshot
-                    .state
-                    .messages
-                    .iter()
-                    .find(|m| matches!(m, Message::User(_)))
-                else {
-                    return Err(RunError::InvalidJournal(
-                        "checkpoint is missing the initial user prompt",
-                    ));
-                };
-                original
-            }
-            _ => {
-                return Err(RunError::InvalidJournal(
-                    "expected a run start or checkpoint",
-                ));
-            }
-        };
-        if original_prompt != &prompt {
-            return Err(RunError::ResumePromptMismatch);
         }
         for entry in entries {
-            run.apply(entry.event)?;
+            run.apply(entry.event, entry.run_id != run_id)?;
             run.tail = entry.sequence;
         }
         if let RunPhase::ToolPrepared { call, recovery, .. } = &run.phase
@@ -153,6 +144,17 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             });
         }
         Ok(run)
+    }
+
+    pub fn run_id(&self) -> Option<i64> {
+        self.journal.as_ref().map(|journal| journal.run_id)
+    }
+
+    fn restore_skill(&mut self, name: &str, historical: bool) -> Result<(), RunError> {
+        match self.skills.activate(name) {
+            Err(RunError::MissingSkillOnResume { .. }) if historical => Ok(()),
+            result => result,
+        }
     }
 
     pub fn prepare_tool_call(&mut self, call: ToolCall) -> Result<(), RunError> {
@@ -247,7 +249,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         let (sequence, events) = journal.commit_artifact(self.tail, call.id.clone(), copy)?;
         self.tail = sequence;
         for event in events {
-            self.apply(event)?;
+            self.apply(event, false)?;
         }
         Ok(())
     }
@@ -278,7 +280,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                 effect(tx, id, tool_call_key, self.tail + 1)
             })?;
         self.tail = sequence;
-        self.apply(event)
+        self.apply(event, false)
     }
 
     pub fn commit(
@@ -293,15 +295,34 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             None
         };
         for event in events.into_iter().chain(mailbox_wake) {
-            self.apply(event)?;
+            self.apply(event, false)?;
         }
         Ok(())
     }
 
-    fn apply(&mut self, event: RunEvent) -> Result<(), RunError> {
+    fn apply(&mut self, event: RunEvent, historical: bool) -> Result<(), RunError> {
         let action = || next_action(&self.state.messages, usize::MAX);
         self.phase = match (&self.phase, event) {
             (RunPhase::Ready, RunEvent::RunStarted(prompt)) if self.state.messages.is_empty() => {
+                self.state.messages.push(Message::User(prompt));
+                RunPhase::Ready
+            }
+            (RunPhase::Finished(_) | RunPhase::Failed(_), RunEvent::RunStarted(prompt)) => {
+                if matches!(self.phase, RunPhase::Failed(_))
+                    && matches!(action(), Some(Action::Finish(_) | Action::RunTool(_)))
+                {
+                    // An unfinished model exchange stays in the audit journal.
+                    // Drop it from the next provider request so every call has a result.
+                    let mut last = self.state.messages.len();
+                    while matches!(self.state.messages.get(last - 1), Some(Message::Tool(_))) {
+                        last -= 1;
+                    }
+                    self.state.messages.truncate(last - 1);
+                    self.state.assistant_replay_data.pop();
+                }
+                self.state.model_turns = 0;
+                self.state.usage = RunUsage::default();
+                self.state.used_call_ids.clear();
                 self.state.messages.push(Message::User(prompt));
                 RunPhase::Ready
             }
@@ -315,14 +336,21 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
                 self.state
                     .messages
                     .insert(0, Message::Developer(instructions));
-                self.state.messages.push(Message::Developer(run_details));
+                self.state
+                    .messages
+                    .push(Message::Developer(without_legacy_date(run_details)));
                 RunPhase::Ready
             }
             (RunPhase::Ready, RunEvent::TranscriptCompacted(snapshot)) => {
                 for name in snapshot.loaded_skill_names {
-                    self.skills.activate(&name)?;
+                    self.restore_skill(&name, historical)?;
                 }
                 self.state = snapshot.state;
+                if let Some(Message::Developer(details)) = self.state.messages.get_mut(2)
+                    && details.starts_with("Start date: ")
+                {
+                    *details = without_legacy_date(std::mem::take(details));
+                }
                 RunPhase::Ready
             }
             (RunPhase::Ready, RunEvent::ModelCallRequested)
@@ -332,7 +360,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             }
             (RunPhase::ModelRequested, RunEvent::ModelCallCompleted(turn)) => {
                 self.state
-                    .record_model_turn(turn, &self.skills, self.options)?;
+                    .record_model_turn(turn, &self.skills, self.options, historical)?;
                 RunPhase::Ready
             }
             (
@@ -355,7 +383,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             (RunPhase::ToolPrepared { call, .. }, RunEvent::SkillLoaded(name))
                 if call.name == LOADER && call.arguments["name"].as_str() == Some(&name) =>
             {
-                self.skills.activate(&name)?;
+                self.restore_skill(&name, historical)?;
                 return Ok(());
             }
             (RunPhase::ToolPrepared { call, .. }, RunEvent::ArtifactPublished(_))
@@ -368,7 +396,7 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
             {
                 if call.name == LOADER
                     && !call.arguments["name"].as_str().is_some_and(|name| {
-                        self.skills.is_loaded(name)
+                        (historical || self.skills.is_loaded(name))
                             && result.value["loaded"].as_str() == Some(name)
                             && result.value["tools"].is_array()
                     })
@@ -479,4 +507,16 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
 
 fn new_event_id() -> String {
     format!("wakefold-{:032x}", rand::random::<u128>())
+}
+
+// v1 saved a start date alongside the agent identity. Preserve the event,
+// but leave that old date out of the reconstructed provider transcript.
+fn without_legacy_date(details: String) -> String {
+    match details
+        .strip_prefix("Start date: ")
+        .and_then(|s| s.split_once(". Your agent ID is "))
+    {
+        Some((_, identity)) => format!("Your agent ID is {identity}"),
+        None => details,
+    }
 }

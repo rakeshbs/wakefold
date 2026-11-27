@@ -1,4 +1,5 @@
 mod artifacts;
+mod continuation;
 mod dynamic;
 
 use std::collections::BTreeMap;
@@ -486,7 +487,7 @@ async fn http_workflow_survives_daemon_restart() {
         std::fs::write(&config, settings.to_string()).unwrap();
         let (_daemon, address) = launch(&config, ORDER_TEST).await;
         let no_budget: Value = client.post(format!("http://{address}/runs"))
-            .json(&json!({"chat_id": wakefold::ChatId::from_u128(1), "run_key": "blocked", "prompt": "Must not start"}))
+            .json(&json!({"chat_id": wakefold::ChatId::from_u128(4), "run_key": "blocked", "prompt": "Must not start"}))
             .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
         let id = no_budget["agent_id"].as_i64().unwrap();
         let (mut socket, _) = connect_async(format!("ws://{address}/runs/{id}/events")).await.unwrap();

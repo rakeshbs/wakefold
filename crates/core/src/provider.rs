@@ -210,6 +210,8 @@ pub struct ModelRequest<'a> {
     /// Entries may be `None` when the provider returned no replay data. An
     /// empty slice means replay data is unavailable for the entire transcript.
     pub assistant_replay_data: &'a [Option<JsonValue>],
+    /// Request-only developer context. Providers append it after all transcript items.
+    pub request_context: Option<&'a str>,
 }
 
 impl<'a> ModelRequest<'a> {
@@ -219,6 +221,7 @@ impl<'a> ModelRequest<'a> {
             messages,
             tools,
             assistant_replay_data: &[],
+            request_context: None,
         }
     }
 }
