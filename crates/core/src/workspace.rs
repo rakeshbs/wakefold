@@ -104,6 +104,7 @@ impl WorkspaceStore {
         connection.execute_batch(crate::delegation::SCHEMA)?;
         crate::mailbox::initialize_schema(&mut connection)?;
         connection.execute_batch(crate::queued_run::SCHEMA)?;
+        connection.execute_batch(crate::dynamic::SCHEMA)?;
         connection.execute_batch(crate::artifact::SCHEMA)?;
         Ok(Self { connection, state })
     }

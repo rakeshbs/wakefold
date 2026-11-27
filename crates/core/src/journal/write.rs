@@ -93,6 +93,7 @@ impl EventTrace {
     fn new(agent_id: i64, sequence: u64, event: &RunEvent) -> Self {
         let mut details = TraceDetails::default();
         let kind = match event {
+            RunEvent::StartupContext { .. } => "startup_context",
             RunEvent::RunStarted(_) => "run_started",
             RunEvent::ModelCallRequested => "model_call_requested",
             RunEvent::ModelCallCompleted(turn) => {

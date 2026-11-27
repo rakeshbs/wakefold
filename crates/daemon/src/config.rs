@@ -36,7 +36,10 @@ pub(crate) struct Config {
     #[cfg(feature = "sandbox")]
     #[serde(default)]
     sandbox: Option<sandbox::Config>,
+    #[serde(default)]
     agents: BTreeMap<String, AgentConfig>,
+    #[serde(default)]
+    defaults: Option<wakefold::AgentSettings>,
 }
 
 impl Config {
@@ -137,12 +140,19 @@ pub(crate) struct Agent {
     pub(crate) options: RunOptions,
 }
 
+pub(crate) struct SharedProfile {
+    pub(crate) provider: Box<dyn Provider>,
+    pub(crate) options: RunOptions,
+}
+
 pub(crate) struct Runtime {
     pub(crate) state_directory: PathBuf,
     pub(crate) bind: SocketAddr,
     pub(crate) max_concurrent: NonZeroUsize,
     pub(crate) skills: BTreeMap<String, RegisteredSkill>,
     pub(crate) agents: BTreeMap<String, Agent>,
+    pub(crate) defaults: Option<wakefold::AgentSettings>,
+    pub(crate) profiles: BTreeMap<wakefold::AgentSettings, SharedProfile>,
     pub(crate) mcp_servers: BTreeMap<String, McpServer>,
     #[cfg(feature = "sandbox")]
     pub(crate) sandbox: Option<Arc<Sandbox>>,
@@ -158,7 +168,7 @@ impl Runtime {
         if !config.bind.ip().is_loopback() {
             return Err("daemon bind address must be loopback".into());
         }
-        if config.agents.is_empty() {
+        if config.agents.is_empty() && config.defaults.is_none() {
             return Err("configure at least one agent".into());
         }
         // Own the state directory before starting the configured server processes.
@@ -183,6 +193,9 @@ impl Runtime {
         for (name, skill) in config.skills {
             let mut tools: Vec<Box<dyn Tool>> = Vec::new();
             for tool in skill.tools {
+                if config.defaults.is_some() && matches!(tool, ToolConfig::Delegate { .. }) {
+                    return Err("shared defaults use agents.spawn for delegation".into());
+                }
                 tools.push(match tool {
                     ToolConfig::TimerWait => Box::new(TimerWait),
                     ToolConfig::SendMessage => Box::new(SendMessage),
@@ -263,6 +276,87 @@ impl Runtime {
                 description: "Publish finished files from the chat workspace".into(),
                 tools: vec![Box::new(PublishArtifact)],
             });
+        let mut defaults = config.defaults;
+        let saved =
+            wakefold::WorkspaceStore::open(&config.state_directory)?.active_agent_settings()?;
+        if defaults.is_some() || !saved.is_empty() {
+            for (name, description, tools) in [
+                (
+                    "agents",
+                    "Spawn independent subagents",
+                    vec![Box::new(wakefold::SpawnAgent) as Box<dyn Tool>],
+                ),
+                (
+                    "mailbox",
+                    "Send messages, check replies, or wait for child outcomes",
+                    vec![
+                        Box::new(SendMessage) as Box<dyn Tool>,
+                        Box::new(WaitForMessage),
+                    ],
+                ),
+            ] {
+                if skills
+                    .insert(
+                        name.into(),
+                        RegisteredSkill {
+                            description: description.into(),
+                            tools,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(format!("{name} is a built-in dynamic agent skill").into());
+                }
+            }
+        }
+        if let Some(settings) = &mut defaults {
+            settings.catalog = skills
+                .iter()
+                .map(|(name, s)| (name.clone(), s.description.clone()))
+                .collect();
+            let mut grants = BTreeMap::new();
+            for (name, skill) in &skills {
+                for tool in &skill.tools {
+                    let qualified = format!("{name}.{}", tool.spec().name);
+                    let grant = settings
+                        .tool_grants
+                        .remove(&qualified)
+                        .unwrap_or(ToolGrant::Allow);
+                    if grants.insert(qualified.clone(), grant).is_some() {
+                        return Err(format!("duplicate tool {qualified}").into());
+                    }
+                }
+            }
+            if let Some(unknown) = settings.tool_grants.keys().next() {
+                return Err(format!("unknown tool {unknown}").into());
+            }
+            settings.tool_grants = grants;
+        }
+        let mut profiles = BTreeMap::new();
+        for settings in saved.into_iter().chain(defaults.iter().cloned()) {
+            if let Entry::Vacant(entry) = profiles.entry(settings) {
+                let settings = entry.key();
+                let mut options = RunOptions::new(settings.max_model_turns.get())
+                    .with_token_budget(settings.token_budget)
+                    .with_tool_grants(settings.tool_grants.iter().filter_map(|(name, saved)| {
+                        let current = match &defaults {
+                            Some(defaults) => defaults.tool_grants.get(name)?,
+                            None => saved,
+                        };
+                        let grant = if *current == ToolGrant::RequireApproval {
+                            *current
+                        } else {
+                            *saved
+                        };
+                        Some((name.as_str(), grant))
+                    }));
+                if let Some(limit) = settings.context_byte_budget {
+                    options = options.with_context_byte_budget(limit.get());
+                }
+                let provider = provider(&settings.model)?;
+                entry.insert(SharedProfile { provider, options });
+            }
+        }
         let mut agents = BTreeMap::new();
         for (name, agent) in config.agents {
             let mut available_tools = BTreeSet::new();
@@ -312,6 +406,8 @@ impl Runtime {
             max_concurrent: config.max_concurrent,
             skills,
             agents,
+            defaults,
+            profiles,
             mcp_servers,
             #[cfg(feature = "sandbox")]
             sandbox,

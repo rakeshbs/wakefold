@@ -23,6 +23,11 @@ pub struct Skill<'a> {
 }
 
 impl<'a> Skill<'a> {
+    /// Name used to load this skill.
+    pub fn name(&self) -> &str {
+        self.name
+    }
+
     /// Make these tools available to runs configured with this skill.
     pub fn new(name: &'a str, description: &'a str, tools: &'a [&'a dyn Tool]) -> Self {
         Self {
@@ -48,6 +53,13 @@ const LOADER_RECOVERY: ToolRecovery = ToolRecovery::RetryAfterCrash;
 pub(crate) const DISPATCHER: &str = "call_tool";
 
 pub(crate) enum ToolExecution {
+    /// Start a child and return its ID.
+    SpawnAgent(String),
+    /// Check for a matching message without waiting.
+    CheckMailbox {
+        from_agent_id: Option<i64>,
+        completion_only: bool,
+    },
     Completed(Vec<RunEvent>),
     PublishArtifact(crate::ArtifactPublication),
     Waiting(WaitOn),
@@ -236,6 +248,16 @@ impl<'a> RunSkills<'a> {
             })?;
             match handler.call_with_output(context, arguments).await? {
                 ToolOutput::Value(value) => value,
+                ToolOutput::SpawnAgent(task) => return Ok(ToolExecution::SpawnAgent(task)),
+                ToolOutput::CheckMailbox {
+                    from_agent_id,
+                    completion_only,
+                } => {
+                    return Ok(ToolExecution::CheckMailbox {
+                        from_agent_id,
+                        completion_only,
+                    });
+                }
                 ToolOutput::PublishArtifact(publication) => {
                     return Ok(ToolExecution::PublishArtifact(publication));
                 }

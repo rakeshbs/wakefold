@@ -38,6 +38,16 @@ pub struct ScheduledRun {
     pub delegation: Option<DelegatedRun>,
     /// The saved agent definition for an admitted run or delegated worker.
     pub agent_name: Option<String>,
+    /// Saved shared configuration for dynamic runs.
+    pub dynamic: Option<Box<DynamicRun>>,
+}
+
+/// Shared settings and parentage saved at admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicRun {
+    pub settings: crate::AgentSettings,
+    /// Parent of a dynamically spawned child.
+    pub parent_agent_id: Option<i64>,
 }
 
 /// Configuration the host supplies when the scheduler resumes a run.
@@ -249,11 +259,12 @@ impl WorkspaceStore {
                 ORDER BY 1 LIMIT ?1
             )
             SELECT ready.agent_id, wr.chat_id, wr.run_key, e.event_json,
-                   d.parent_agent_id, d.worker, COALESCE(q.agent_name, d.worker)
+                   d.parent_agent_id, d.worker, COALESCE(q.agent_name, d.worker), dynamic.settings, dynamic.parent_agent_id
             FROM ready
             JOIN workspace_runs wr USING (agent_id)
             JOIN run_events e ON e.agent_id = ready.agent_id AND e.sequence = 1
             LEFT JOIN delegated_runs d ON d.child_agent_id = ready.agent_id
+            LEFT JOIN dynamic_runs dynamic ON dynamic.agent_id=ready.agent_id
             LEFT JOIN queued_runs q ON q.agent_id = ready.agent_id
             ORDER BY ready.agent_id",
         )?;
@@ -275,6 +286,14 @@ impl WorkspaceStore {
             } else {
                 None
             };
+            let dynamic = if let Some(json) = row.get::<_, Option<String>>(7)? {
+                Some(Box::new(DynamicRun {
+                    settings: serde_json::from_str(&json)?,
+                    parent_agent_id: row.get(8)?,
+                }))
+            } else {
+                None
+            };
             ready.push(ReadyRun {
                 run: ScheduledRun {
                     agent_id: row.get(0)?,
@@ -282,6 +301,7 @@ impl WorkspaceStore {
                     run_key: row.get(2)?,
                     delegation,
                     agent_name: row.get(6)?,
+                    dynamic,
                 },
                 prompt,
             });

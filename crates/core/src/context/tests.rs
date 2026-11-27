@@ -155,7 +155,12 @@ fn repeated_compaction_preserves_loaded_schemas_and_mixed_call_turns() -> Result
         )),
         Message::Tool(ToolResult::new("write", json!("saved"))),
     ];
-    let mut messages = vec![Message::User("Keep the notes.".into())];
+    let startup = [
+        Message::Developer("Instructions and catalog".into()),
+        Message::User("Keep the notes.".into()),
+        Message::Developer("Start date: 2026-11-27".into()),
+    ];
+    let mut messages = startup.to_vec();
     messages.extend(loader.clone());
     messages.extend([
         Message::Assistant(ModelResponse::from(ToolCall::new(
@@ -192,8 +197,9 @@ fn repeated_compaction_preserves_loaded_schemas_and_mixed_call_turns() -> Result
             &mut messages,
             &mut context,
         )?;
-        assert_eq!(&messages[1..3], &loader);
-        assert_eq!(&messages[3..6], &mixed);
+        assert_eq!(&messages[..3], &startup);
+        assert_eq!(&messages[3..5], &loader);
+        assert_eq!(&messages[5..8], &mixed);
         assert_eq!(&context[..2], &[Some(json!("notes")), Some(json!("math"))]);
         let measured = messages.iter().map(message_bytes).sum::<u128>()
             + context.iter().flatten().map(json_bytes).sum::<u128>();

@@ -12,7 +12,8 @@ use crate::{CancellationToken, JsonValue, RunWorkspace, WaitOn};
 pub struct ToolCallId(String);
 
 impl ToolCallId {
-    pub(crate) fn as_str(&self) -> &str {
+    /// Borrow the provider-supplied identifier.
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -62,7 +63,10 @@ impl ToolRecovery {
 }
 
 /// How an agent may invoke a particular tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ToolGrant {
     /// The agent may dispatch the tool directly.
@@ -199,6 +203,13 @@ impl ToolContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ToolOutput {
+    /// Start a child and return its ID.
+    SpawnAgent(String),
+    /// Check for a matching message without waiting.
+    CheckMailbox {
+        from_agent_id: Option<i64>,
+        completion_only: bool,
+    },
     /// Deliver an immediate result to the model.
     Value(JsonValue),
     /// Publish an existing workspace file as an immutable artifact revision.

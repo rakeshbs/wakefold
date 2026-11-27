@@ -648,6 +648,20 @@ async fn drive(
                             source,
                         })?;
                 match execution {
+                    ToolExecution::SpawnAgent(task) => {
+                        run.commit_tool_effect(|tx, id, key, _| {
+                            crate::dynamic::spawn(tx, id, key, &task)
+                        })?
+                    }
+                    ToolExecution::CheckMailbox {
+                        from_agent_id: sender,
+                        completion_only,
+                    } => run.commit_tool_effect(|tx, id, _, seq| {
+                        Ok(
+                            crate::mailbox::take_message(tx, id, sender, completion_only, seq)?
+                                .unwrap_or(crate::JsonValue::Null),
+                        )
+                    })?,
                     ToolExecution::Completed(events) => run.commit(events)?,
                     ToolExecution::PublishArtifact(publication) => {
                         run.publish_artifact(publication, cancellation).await?;
@@ -744,7 +758,9 @@ fn next_action(messages: &[Message], remaining_turns: usize) -> Option<Action<'_
                 .get(completed_calls)
                 .map_or(Action::CallModel, Action::RunTool),
         ),
-        Message::User(_) | Message::Summary(_) | Message::Tool(_) => Some(Action::CallModel),
+        Message::Developer(_) | Message::User(_) | Message::Summary(_) | Message::Tool(_) => {
+            Some(Action::CallModel)
+        }
     }
 }
 

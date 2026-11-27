@@ -20,6 +20,7 @@ pub(crate) struct ContextSizes {
 pub(crate) struct Compaction<'a> {
     sizes: &'a mut ContextSizes,
     input: Vec<Message>,
+    prefix: usize,
     transcript_end: usize,
     assistant_turns: usize,
     retained_messages: Vec<usize>,
@@ -60,7 +61,7 @@ impl Compaction<'_> {
             .map(|&index| messages[index].clone())
             .chain([Message::Summary(summary.to_owned())])
             .collect::<Vec<_>>();
-        messages.splice(1..self.transcript_end, retained);
+        messages.splice(self.prefix..self.transcript_end, retained);
         let retained = self
             .retained_context
             .iter()
@@ -75,7 +76,7 @@ impl Compaction<'_> {
             .collect::<Vec<_>>();
         self.sizes
             .messages
-            .splice(1..self.transcript_end, retained_sizes);
+            .splice(self.prefix..self.transcript_end, retained_sizes);
         let retained_sizes = self
             .retained_context
             .iter()
@@ -114,7 +115,12 @@ impl ContextSizes {
         // At a model-call boundary all tool calls are answered. Only consider
         // prefixes ending before an assistant message to keep each exchange whole.
         let latest = assistant_replay_data.len().saturating_sub(1);
-        let mut input_bytes = self.messages.first().copied().unwrap_or(0);
+        let prefix = if matches!(messages.first(), Some(Message::Developer(_))) {
+            3
+        } else {
+            1
+        };
+        let mut input_bytes = self.messages[..prefix].iter().sum::<u128>();
         let mut retained_bytes = self.total;
         let mut assistant_turns = 0;
         let mut candidate = None;
@@ -122,7 +128,7 @@ impl ContextSizes {
         let mut keep_exchange = false;
         let mut retained_messages = Vec::new();
         let mut retained_context = Vec::new();
-        for (index, message) in messages.iter().enumerate().skip(1) {
+        for (index, message) in messages.iter().enumerate().skip(prefix) {
             if let Message::Assistant(response) = message {
                 if assistant_turns > 0 && retained_bytes < budget {
                     let instruction = summary_instruction(budget - retained_bytes);
@@ -188,6 +194,7 @@ impl ContextSizes {
         Ok(Some(Compaction {
             sizes: self,
             input,
+            prefix,
             transcript_end,
             assistant_turns,
             retained_messages,
@@ -206,7 +213,9 @@ fn summary_instruction(max_bytes: u128) -> String {
 
 fn message_bytes(message: &Message) -> u128 {
     match message {
-        Message::User(text) | Message::Summary(text) => text.len() as u128,
+        Message::Developer(text) | Message::User(text) | Message::Summary(text) => {
+            text.len() as u128
+        }
         Message::Assistant(response) => {
             let text_bytes = response.text().map_or(0, str::len) as u128;
             response

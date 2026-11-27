@@ -29,6 +29,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 struct AppState {
     store: Arc<Mutex<WorkspaceStore>>,
     agents: Arc<BTreeSet<String>>,
+    defaults: Option<Arc<wakefold::AgentSettings>>,
     stop: CancellationToken,
 }
 
@@ -69,6 +70,7 @@ impl IntoResponse for ApiError {
 pub(crate) fn router(
     store: WorkspaceStore,
     agents: BTreeSet<String>,
+    defaults: Option<wakefold::AgentSettings>,
     stop: CancellationToken,
 ) -> Router {
     Router::new()
@@ -76,7 +78,11 @@ pub(crate) fn router(
         .route("/chats", post(create_chat))
         .route("/runs", post(start_run))
         .route("/runs/{agent_id}/events", get(events))
-        .route("/runs/{agent_id}/messages", post(post_message))
+        .route(
+            "/runs/{agent_id}/messages",
+            post(post_message).get(messages),
+        )
+        .route("/chats/{chat_id}/runs", get(chat_runs))
         .route("/approvals", get(pending_approvals))
         .route("/approvals/{wait_id}", post(resolve_approval))
         .route("/artifacts", get(list_artifacts))
@@ -88,6 +94,7 @@ pub(crate) fn router(
         .with_state(AppState {
             store: Arc::new(Mutex::new(store)),
             agents: Arc::new(agents),
+            defaults: defaults.map(Arc::new),
             stop,
         })
 }
@@ -230,7 +237,8 @@ async fn require_local_origin(request: Request, next: Next) -> Result<Response, 
 struct StartRun {
     chat_id: ChatId,
     run_key: String,
-    agent: String,
+    agent: Option<String>,
+    time_zone: Option<String>,
     prompt: String,
 }
 
@@ -244,28 +252,72 @@ async fn start_run(
             "run_key and prompt must be nonempty",
         ));
     }
-    if !state.agents.contains(&request.agent) {
+    if request
+        .agent
+        .as_ref()
+        .is_some_and(|a| !state.agents.contains(a))
+    {
         return Err(ApiError(StatusCode::NOT_FOUND, "unknown agent"));
     }
+    let defaults = state.defaults.clone();
+    let zone = request
+        .time_zone
+        .as_deref()
+        .map(str::parse::<wakefold::ChatTimeZone>)
+        .transpose()
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "unknown time_zone"))?;
     let id = state
         .database(move |store| {
-            store
-                .queue_run(
+            match (&request.agent, defaults) {
+                (Some(name), _) => {
+                    store.queue_run(request.chat_id, &request.run_key, name, &request.prompt)
+                }
+                (None, Some(settings)) => store.queue_root(
                     request.chat_id,
                     &request.run_key,
-                    &request.agent,
                     &request.prompt,
-                )
-                .map_err(|error| match error {
-                    QueueRunError::Conflict => ApiError(
-                        StatusCode::CONFLICT,
-                        "chat ID and run key already identify a different request",
-                    ),
-                    _ => ApiError::internal(error),
-                })
+                    &settings,
+                    zone,
+                ),
+                _ => return Err(ApiError(StatusCode::BAD_REQUEST, "missing agent defaults")),
+            }
+            .map_err(|error| match error {
+                QueueRunError::Conflict => ApiError(
+                    StatusCode::CONFLICT,
+                    "chat ID and run key already identify a different request",
+                ),
+                _ => ApiError::internal(error),
+            })
         })
         .await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "agent_id": id }))))
+}
+
+async fn chat_runs(
+    State(state): State<AppState>,
+    Path(chat): Path<ChatId>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    state
+        .database(move |s| s.chat_runs(chat).map(Json).map_err(ApiError::internal))
+        .await
+}
+#[derive(Deserialize)]
+struct MessageCursor {
+    #[serde(default)]
+    after: i64,
+}
+async fn messages(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(cursor): Query<MessageCursor>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    state
+        .database(move |s| {
+            s.mailbox_messages(id, cursor.after)
+                .map(Json)
+                .map_err(ApiError::internal)
+        })
+        .await
 }
 
 #[derive(Serialize)]

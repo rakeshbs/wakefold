@@ -1,4 +1,5 @@
 mod artifacts;
+mod dynamic;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

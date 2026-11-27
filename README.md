@@ -17,6 +17,44 @@ folders to UUID paths and saves the previous keys and their UUIDs in
 `chat-id-migration.json` in the state directory. Use the mapped UUID as
 `chat_id` in requests for an existing chat.
 
+## Dynamic agents
+
+A daemon can run roots and subagents from one shared configuration. For example:
+
+```json
+{
+  "state_directory": "state",
+  "defaults": {
+    "model": "gpt-5.4",
+    "instructions": "Use the mailbox to coordinate research.",
+    "max_model_turns": 30,
+    "token_budget": 40000,
+    "tool_grants": { "artifacts.publish": "require_approval" }
+  }
+}
+```
+
+Send `chat_id`, `run_key`, and `prompt` to `POST /runs` to start a root.
+The first root can also send an IANA `time_zone` such as `Asia/Kolkata`.
+It defaults to UTC. Each run saves its start date, instructions, and skill
+descriptions. The root loads the `agents` skill and dispatches `agents.spawn`
+with a `task`. The result contains the child's `agent_id`. Each child starts
+with its own journal, workspace folder, and full per-agent token budget.
+
+Shared defaults expose installed skills on demand. Tools allow execution by
+default, and `tool_grants` can require approval for individual tools. Only
+roots can load the spawning skill. Agents can load `mailbox` and use:
+
+- `mailbox.send` with `to_agent_id` and a JSON `payload`.
+- `mailbox.receive` with optional `from_agent_id`. It waits by default.
+  Use `wait: false` to check immediately. An empty check returns `null`.
+- `completion_only: true` on a receive to select a child's final answer or
+  failure. Progress messages stay available for a later receive.
+
+`GET /chats/{chat_id}/runs` lists the run tree. `GET /runs/{agent_id}/messages`
+returns up to 128 incoming messages. Pass the last `arrival_order` as `after`
+for the next page. The existing events WebSocket streams each run's journal.
+
 ## Artifacts
 
 Enable the built-in `artifacts` skill for an agent and grant `artifacts.publish` with `allow` or `require_approval`. The tool publishes an existing file by title and chat-relative `path`. Pass its returned `artifact_id` with a later publication to add a revision.

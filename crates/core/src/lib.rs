@@ -4,6 +4,9 @@ mod agent;
 mod artifact;
 mod context;
 mod delegation;
+mod dynamic;
+pub use chrono_tz::Tz as ChatTimeZone;
+pub use dynamic::{AgentSettings, SpawnAgent};
 mod journal;
 mod mailbox;
 mod provider;
@@ -41,7 +44,7 @@ pub use provider::{
 pub use providers::openai::{OpenAiProvider, ReasoningEffort};
 pub use queued_run::QueueRunError;
 pub use retry::ModelRetryPolicy;
-pub use scheduler::{ScheduledRun, ScheduledRunConfig, SchedulerError};
+pub use scheduler::{DynamicRun, ScheduledRun, ScheduledRunConfig, SchedulerError};
 pub use serde_json::Value as JsonValue;
 pub use skill::Skill;
 pub use tokio_util::sync::CancellationToken;

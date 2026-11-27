@@ -79,11 +79,13 @@ pub(crate) fn record_transition(
         RunEvent::RunFinished(answer) => {
             sql.execute("DELETE FROM run_waits WHERE agent_id = ?1", [agent_id])?;
             crate::queued_run::clear_ready(sql, agent_id)?;
+            crate::dynamic::finish(tx, agent_id, Ok(answer))?;
             crate::delegation::finish_worker(tx, agent_id, Ok(answer))?;
         }
         RunEvent::RunFailed(error) => {
             sql.execute("DELETE FROM run_waits WHERE agent_id = ?1", [agent_id])?;
             crate::queued_run::clear_ready(sql, agent_id)?;
+            crate::dynamic::finish(tx, agent_id, Err(error))?;
             crate::delegation::finish_worker(tx, agent_id, Err(error))?;
         }
         _ => {}

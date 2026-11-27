@@ -118,7 +118,12 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         let original_prompt = match &first.event {
             RunEvent::RunStarted(original) => original,
             RunEvent::TranscriptCompacted(snapshot) => {
-                let Some(Message::User(original)) = snapshot.state.messages.first() else {
+                let Some(Message::User(original)) = snapshot
+                    .state
+                    .messages
+                    .iter()
+                    .find(|m| matches!(m, Message::User(_)))
+                else {
                     return Err(RunError::InvalidJournal(
                         "checkpoint is missing the initial user prompt",
                     ));
@@ -247,6 +252,35 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         Ok(())
     }
 
+    pub fn commit_tool_effect(
+        &mut self,
+        effect: impl FnOnce(
+            &crate::journal::JournalTransaction<'_>,
+            i64,
+            &str,
+            u64,
+        ) -> Result<JsonValue, crate::JournalError>,
+    ) -> Result<(), RunError> {
+        let RunPhase::ToolPrepared {
+            call,
+            tool_call_key,
+            ..
+        } = &self.phase
+        else {
+            return Err(RunError::InvalidJournal("expected prepared tool"));
+        };
+        let journal = self
+            .journal
+            .as_mut()
+            .ok_or(RunError::InvalidJournal("tool requires a durable journal"))?;
+        let (sequence, event) =
+            journal.commit_tool_result(self.tail, call.id.clone(), |tx, id| {
+                effect(tx, id, tool_call_key, self.tail + 1)
+            })?;
+        self.tail = sequence;
+        self.apply(event)
+    }
+
     pub fn commit(
         &mut self,
         events: impl AsRef<[RunEvent]> + IntoIterator<Item = RunEvent>,
@@ -269,6 +303,19 @@ impl<'a, 'db, 'skills> RunDriver<'a, 'db, 'skills> {
         self.phase = match (&self.phase, event) {
             (RunPhase::Ready, RunEvent::RunStarted(prompt)) if self.state.messages.is_empty() => {
                 self.state.messages.push(Message::User(prompt));
+                RunPhase::Ready
+            }
+            (
+                RunPhase::Ready,
+                RunEvent::StartupContext {
+                    instructions,
+                    run_details,
+                },
+            ) if matches!(self.state.messages.as_slice(), [Message::User(_)]) => {
+                self.state
+                    .messages
+                    .insert(0, Message::Developer(instructions));
+                self.state.messages.push(Message::Developer(run_details));
                 RunPhase::Ready
             }
             (RunPhase::Ready, RunEvent::TranscriptCompacted(snapshot)) => {

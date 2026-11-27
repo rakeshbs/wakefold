@@ -25,6 +25,7 @@ pub(crate) async fn serve(
     let app = api::router(
         store,
         runtime.agents.keys().cloned().collect(),
+        runtime.defaults.clone(),
         stop.clone(),
     );
     let http = async {
@@ -78,6 +79,27 @@ async fn drive(runtime: &Runtime, stop: &CancellationToken) -> Result<(), Daemon
             (name.as_str(), skills)
         })
         .collect();
+    let shared_skills: BTreeMap<_, _> = runtime
+        .profiles
+        .keys()
+        .map(|settings| {
+            let root: Vec<_> = settings
+                .catalog
+                .iter()
+                .filter_map(|(name, description)| {
+                    tools
+                        .get(name.as_str())
+                        .map(|handlers| Skill::new(name, description, handlers))
+                })
+                .collect();
+            let child: Vec<_> = root
+                .iter()
+                .copied()
+                .filter(|s| s.name() != "agents")
+                .collect();
+            (settings, (root, child))
+        })
+        .collect();
     while !stop.is_cancelled() {
         let scheduler = WorkspaceStore::open(&runtime.state_directory)?;
         let result = scheduler
@@ -85,6 +107,19 @@ async fn drive(runtime: &Runtime, stop: &CancellationToken) -> Result<(), Daemon
                 runtime.max_concurrent,
                 stop,
                 |run| {
+                    if let Some(dynamic) = &run.dynamic {
+                        let profile = runtime.profiles.get(&dynamic.settings)?;
+                        let (root, child) = shared_skills.get(&dynamic.settings)?;
+                        return Some(ScheduledRunConfig::new(
+                            profile.provider.as_ref(),
+                            if dynamic.parent_agent_id.is_some() {
+                                child
+                            } else {
+                                root
+                            },
+                            profile.options.clone(),
+                        ));
+                    }
                     let name = run.agent_name.as_deref()?;
                     let agent = runtime.agents.get(name)?;
                     tracing::info!(

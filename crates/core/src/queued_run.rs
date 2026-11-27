@@ -55,8 +55,9 @@ impl WorkspaceStore {
             .sql()
             .query_row(
                 "SELECT event_json, agent_name FROM run_events
-             LEFT JOIN queued_runs USING (agent_id)
-             WHERE agent_id = ?1 AND sequence = 1",
+             LEFT JOIN queued_runs ON queued_runs.agent_id = run_events.agent_id
+             AND NOT EXISTS (SELECT 1 FROM dynamic_runs d WHERE d.agent_id = ?1)
+             WHERE run_events.agent_id = ?1 AND sequence = 1",
                 [agent_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )

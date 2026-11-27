@@ -12,6 +12,8 @@ test-util = []
 
 [dependencies]
 async-openai = { version = "0.43", default-features = false, features = ["middleware", "responses", "rustls"], optional = true }
+chrono = "0.4"
+chrono-tz = "0.10"
 cap-std = "4"
 futures-channel = "0.3"
 futures-timer = "3"

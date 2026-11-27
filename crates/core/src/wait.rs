@@ -27,6 +27,8 @@ pub enum WaitOn {
         /// Restrict the wait to this sender. With no filter, accept any sender.
         from_agent_id: Option<i64>,
     },
+    /// Wait for a runtime-authored child outcome.
+    ChildOutcome { from_agent_id: Option<i64> },
     /// Resume with an external event delivered by the host.
     Webhook,
     /// Resume with a human decision delivered by the host.
@@ -52,7 +54,7 @@ impl WaitOn {
         match self {
             Self::Timer { .. } => "timer",
             Self::Message => "message",
-            Self::MailboxMessage { .. } => "mailbox_message",
+            Self::MailboxMessage { .. } | Self::ChildOutcome { .. } => "mailbox_message",
             Self::Webhook => "webhook",
             Self::Approval => "approval",
             Self::ToolApproval { .. } => "tool_approval",

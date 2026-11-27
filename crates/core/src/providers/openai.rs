@@ -221,6 +221,7 @@ fn input_items(request: ModelRequest<'_>) -> Result<Vec<InputItem>, ProviderErro
     let mut replay_data = request.assistant_replay_data.iter();
     for message in request.messages {
         match message {
+            Message::Developer(text) => items.push(text_message(Role::Developer, text)),
             Message::User(prompt) => items.push(text_message(Role::User, prompt)),
             Message::Summary(summary) => items.push(text_message(Role::Assistant, summary)),
             Message::Assistant(response) => {

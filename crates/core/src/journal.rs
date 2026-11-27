@@ -37,6 +37,11 @@ pub(crate) const SCHEMA: &str = "
 pub enum RunEvent {
     /// The initial user prompt.
     RunStarted(String),
+    /// Saved instructions and host date surrounding the original task.
+    StartupContext {
+        instructions: String,
+        run_details: String,
+    },
     /// The run is about to request its next ordinary agent turn.
     /// Provider retries share this event. Compaction summary requests have no request event.
     ModelCallRequested,
@@ -227,7 +232,7 @@ impl<'a> RunJournal<'a> {
         let sequence = tx.append(self.workspace.agent_id(), expected_last_sequence, events)?;
         let wake = match events.last() {
             Some(RunEvent::WaitStarted(PendingWait {
-                on: crate::WaitOn::MailboxMessage { .. },
+                on: crate::WaitOn::MailboxMessage { .. } | crate::WaitOn::ChildOutcome { .. },
                 ..
             })) => mailbox::deliver_waiting_message(&tx, self.workspace.agent_id())?,
             _ => None,
@@ -269,6 +274,25 @@ impl<'a> RunJournal<'a> {
         publication: &ArtifactPublication,
     ) -> Result<(), crate::ArtifactError> {
         publication.validate_target(self.connection, self.workspace.agent_id())
+    }
+
+    // Store the effect and the result together so replay cannot repeat a spawn
+    // or consume another mailbox message for the same prepared call.
+    pub(crate) fn commit_tool_result(
+        &mut self,
+        expected: u64,
+        call_id: ToolCallId,
+        effect: impl FnOnce(&JournalTransaction<'_>, i64) -> Result<JsonValue, JournalError>,
+    ) -> Result<(u64, RunEvent), JournalError> {
+        let tx = JournalTransaction::begin(self.connection)?;
+        let id = self.workspace.agent_id();
+        let event = RunEvent::ToolCallCompleted(ToolResult::new(call_id, effect(&tx, id)?));
+        let sequence = tx.append(id, expected, std::slice::from_ref(&event))?;
+        tx.commit()?;
+        if let Some(hook) = self.commit_hook {
+            hook(sequence, std::slice::from_ref(&event));
+        }
+        Ok((sequence, event))
     }
 
     pub(crate) fn commit_artifact(

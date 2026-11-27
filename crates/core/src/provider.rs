@@ -12,6 +12,8 @@ use crate::{JsonValue, ToolCall, ToolRecovery, ToolResult, ToolSpec};
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Message {
+    /// Host-supplied instructions or run metadata.
+    Developer(String),
     /// A user message, including the prompt that starts the run.
     User(String),
     /// A completed model turn.

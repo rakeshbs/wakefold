@@ -222,6 +222,9 @@ pub struct WaitForMessage;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiveArguments {
+    wait: Option<bool>,
+    #[serde(default)]
+    completion_only: bool,
     from_agent_id: Option<i64>,
 }
 
@@ -230,10 +233,10 @@ impl Tool for WaitForMessage {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "receive",
-            "Receive the oldest matching message. Omit from_agent_id to include client messages. Pause the run if none is available.",
+            "Receive the oldest matching message. Omit from_agent_id to include client messages. Set wait=false to return null if none is available. Set completion_only=true for a child completion or failure.",
             json!({
                 "type": "object",
-                "properties": { "from_agent_id": { "type": ["integer", "null"], "minimum": 1 } },
+                "properties": { "wait":{"type":"boolean"}, "completion_only":{"type":"boolean"}, "from_agent_id": { "type": ["integer", "null"], "minimum": 1 } },
                 "additionalProperties": false
             }),
         )
@@ -251,12 +254,26 @@ impl Tool for WaitForMessage {
         _: ToolContext,
         arguments: &JsonValue,
     ) -> Result<ToolOutput, ToolError> {
-        let ReceiveArguments { from_agent_id } = ReceiveArguments::deserialize(arguments)
+        let ReceiveArguments {
+            from_agent_id,
+            wait,
+            completion_only,
+        } = ReceiveArguments::deserialize(arguments)
             .map_err(|error| ToolError::with_source("invalid mailbox receive arguments", error))?;
         if from_agent_id.is_some_and(|id| id <= 0) {
             return Err(ToolError::new("from_agent_id must be a positive integer"));
         }
-        Ok(ToolOutput::Wait(WaitOn::MailboxMessage { from_agent_id }))
+        if wait == Some(false) {
+            return Ok(ToolOutput::CheckMailbox {
+                from_agent_id,
+                completion_only,
+            });
+        }
+        Ok(ToolOutput::Wait(if completion_only {
+            WaitOn::ChildOutcome { from_agent_id }
+        } else {
+            WaitOn::MailboxMessage { from_agent_id }
+        }))
     }
 }
 
@@ -306,21 +323,40 @@ pub(crate) fn deliver_waiting_message(
     let Some((wait_sequence, wait_json)) = pending else {
         return Ok(None);
     };
-    let RunEvent::WaitStarted(PendingWait {
-        id,
-        on: WaitOn::MailboxMessage { from_agent_id },
-    }) = serde_json::from_str(&wait_json)?
-    else {
+    let RunEvent::WaitStarted(PendingWait { id, on }) = serde_json::from_str(&wait_json)? else {
         return Err(JournalError::InvalidWait("expected a saved mailbox wait"));
     };
+    let (sender, only) = match on {
+        WaitOn::MailboxMessage { from_agent_id } => (from_agent_id, false),
+        WaitOn::ChildOutcome { from_agent_id } => (from_agent_id, true),
+        _ => return Err(JournalError::InvalidWait("expected mailbox wait")),
+    };
+    let Some(payload) = take_message(tx, to_agent_id, sender, only, wait_sequence + 1)? else {
+        return Ok(None);
+    };
+    let event = RunEvent::Woken {
+        wait_id: id,
+        payload,
+    };
+    let sequence = tx.append(to_agent_id, wait_sequence, std::slice::from_ref(&event))?;
+    Ok(Some(JournalEntry { sequence, event }))
+}
+
+pub(crate) fn take_message(
+    tx: &JournalTransaction<'_>,
+    to_agent_id: i64,
+    from_agent_id: Option<i64>,
+    completion_only: bool,
+    sequence: u64,
+) -> Result<Option<JsonValue>, JournalError> {
     let message = tx
         .sql()
         .query_row(
             "SELECT message_id, from_agent_id, payload_json FROM mailbox
          WHERE to_agent_id = ?1 AND consumed_sequence IS NULL
-           AND (?2 IS NULL OR from_agent_id = ?2)
+           AND (?2 IS NULL OR from_agent_id = ?2) AND (NOT ?3 OR message_id = 'outcome-' || from_agent_id)
          ORDER BY arrival_order LIMIT 1",
-            params![to_agent_id, from_agent_id],
+            params![to_agent_id, from_agent_id,completion_only],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -334,14 +370,34 @@ pub(crate) fn deliver_waiting_message(
         return Ok(None);
     };
     let payload: JsonValue = serde_json::from_str(&payload)?;
-    let event = RunEvent::Woken {
-        wait_id: id,
-        payload: json!({ "message_id": message_id, "from_agent_id": sender, "payload": payload }),
-    };
-    let sequence = tx.append(to_agent_id, wait_sequence, std::slice::from_ref(&event))?;
     tx.sql().execute(
         "UPDATE mailbox SET consumed_sequence = ?1 WHERE message_id = ?2",
         params![sequence, message_id],
     )?;
-    Ok(Some(JournalEntry { sequence, event }))
+    Ok(Some(
+        json!({"message_id":message_id,"from_agent_id":sender,"payload":payload}),
+    ))
+}
+
+impl WorkspaceStore {
+    /// Read a page of mailbox history without consuming messages.
+    pub fn mailbox_messages(&self, agent: i64, after: i64) -> Result<Vec<JsonValue>, JournalError> {
+        let mut query = self.connection.prepare(
+            "SELECT arrival_order, message_id, from_agent_id, payload_json, consumed_sequence
+             FROM mailbox WHERE to_agent_id = ?1 AND arrival_order > ?2
+             ORDER BY arrival_order LIMIT 128",
+        )?;
+        let mut rows = query.query(params![agent, after])?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            messages.push(json!({
+                "arrival_order": row.get::<_, i64>(0)?,
+                "message_id": row.get::<_, String>(1)?,
+                "from_agent_id": row.get::<_, Option<i64>>(2)?,
+                "payload": serde_json::from_str::<JsonValue>(&row.get::<_, String>(3)?)?,
+                "consumed_sequence": row.get::<_, Option<i64>>(4)?,
+            }));
+        }
+        Ok(messages)
+    }
 }

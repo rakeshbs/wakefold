@@ -100,6 +100,16 @@ pub(crate) fn start_worker(
     worker: &str,
     prompt: &str,
 ) -> Result<(), JournalError> {
+    let dynamic: bool = tx.sql().query_row(
+        "SELECT EXISTS(SELECT 1 FROM dynamic_runs WHERE agent_id = ?1)",
+        [parent],
+        |row| row.get(0),
+    )?;
+    if dynamic {
+        return Err(JournalError::InvalidWait(
+            "dynamic agents delegate through agents.spawn",
+        ));
+    }
     // The parent's durable call key also identifies the child within the chat.
     let child = tx.sql().query_row(
         "INSERT INTO workspace_runs(chat_id, run_key)
