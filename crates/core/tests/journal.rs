@@ -152,29 +152,68 @@ fn interrupted_batch_rolls_back_all_its_entries() {
 }
 
 #[test]
-fn existing_run_gains_an_empty_journal_without_changing_its_workspace() {
+fn fresh_schema_has_seven_tables_and_reopens_reserved_workspaces() {
     let state = tempfile::tempdir().unwrap();
     let run = WorkspaceStore::open(state.path())
         .unwrap()
-        .open_run_workspace(CHAT, "old")
+        .open_run_workspace(CHAT, "job")
         .unwrap();
     let file = run.chat_root().join("note");
     std::fs::write(&file, "existing data").unwrap();
-    // Reproduce the schema before journal support, preserving its real run metadata.
-    rusqlite::Connection::open(state.path().join("wakefold.sqlite3"))
-        .unwrap()
-        .execute_batch("DROP TABLE run_events")
+    let db = rusqlite::Connection::open(state.path().join("wakefold.sqlite3")).unwrap();
+    let mut stmt = db
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
         .unwrap();
-
-    let mut store = WorkspaceStore::open(state.path()).unwrap();
-    assert_eq!(store.open_run_workspace(CHAT, "old").unwrap(), run);
-    let mut journal = store.open_journal(CHAT, "old").unwrap();
-    assert!(journal.load_after(0).unwrap().is_empty());
+    let tables = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(
-        journal
-            .append(0, &[RunEvent::RunStarted("resume".into())])
+        tables,
+        [
+            "agent_runs",
+            "artifact_revisions",
+            "artifacts",
+            "chats",
+            "mailbox_messages",
+            "run_events",
+            "run_waits"
+        ]
+    );
+    let status = || {
+        db.query_row(
+            "SELECT status FROM agent_runs WHERE agent_id=?1",
+            [run.agent_id()],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(status(), "reserved");
+    let mut store = WorkspaceStore::open(state.path()).unwrap();
+    assert_eq!(store.open_run_workspace(CHAT, "job").unwrap(), run);
+    let mut journal = store.open_journal(CHAT, "job").unwrap();
+    assert!(journal.load_after(0).unwrap().is_empty());
+    journal
+        .append(0, &[RunEvent::RunStarted("resume".into())])
+        .unwrap();
+    assert_eq!(status(), "runnable");
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "existing data");
+}
+
+#[test]
+fn opening_an_old_database_requires_a_fresh_directory() {
+    let state = tempfile::tempdir().unwrap();
+    let db = rusqlite::Connection::open(state.path().join("wakefold.sqlite3")).unwrap();
+    db.execute_batch("CREATE TABLE workspace_runs(agent_id INTEGER PRIMARY KEY); INSERT INTO workspace_runs VALUES(1)").unwrap();
+    assert!(matches!(
+        WorkspaceStore::open(state.path()),
+        Err(wakefold::WorkspaceError::IncompatibleDatabase(_))
+    ));
+    assert_eq!(
+        db.query_row("SELECT agent_id FROM workspace_runs", [], |r| r
+            .get::<_, i64>(0))
             .unwrap(),
         1
     );
-    assert_eq!(std::fs::read_to_string(file).unwrap(), "existing data");
 }

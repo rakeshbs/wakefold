@@ -16,8 +16,8 @@ use thiserror::Error;
 
 use crate::wait::current_millis;
 use crate::{
-    CancellationToken, ChatId, DelegatedRun, JournalError, Provider, RunError, RunOptions,
-    RunOutcome, Skill, WorkspaceError, WorkspaceStore,
+    CancellationToken, ChatId, JournalError, Provider, RunError, RunOptions, RunOutcome, Skill,
+    WorkspaceError, WorkspaceStore,
 };
 
 // Independent store handles and wall-clock adjustments can change the next wake time.
@@ -34,20 +34,10 @@ pub struct ScheduledRun {
     pub chat_id: ChatId,
     /// Run key used to open the journal.
     pub run_key: String,
-    /// Parent and worker configuration for a delegated run.
-    pub delegation: Option<DelegatedRun>,
-    /// The saved agent definition for an admitted run or delegated worker.
-    pub agent_name: Option<String>,
-    /// Saved shared configuration for dynamic runs.
-    pub dynamic: Option<Box<DynamicRun>>,
-}
-
-/// Shared settings and parentage saved at admission.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DynamicRun {
-    pub settings: crate::AgentSettings,
-    /// Parent of a dynamically spawned child.
+    /// The root that spawned this child, if any.
     pub parent_agent_id: Option<i64>,
+    /// Settings saved at admission. Direct SDK runs supply their configuration through the host.
+    pub settings: Option<Box<crate::AgentSettings>>,
 }
 
 /// Configuration the host supplies when the scheduler resumes a run.
@@ -152,14 +142,43 @@ impl WorkspaceStore {
         .await
     }
 
-    /// Drive ready runs using a host lookup that may lack a saved agent definition.
+    /// Drive runnable SDK and daemon runs, looking up each provider in the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchedulerError::MissingAgent`] for an unknown run configuration.
+    pub async fn run_scheduler_with_agent_lookup<'a>(
+        self,
+        max_concurrent: NonZeroUsize,
+        cancellation: &CancellationToken,
+        configure: impl FnMut(&ScheduledRun) -> Option<ScheduledRunConfig<'a>>,
+        on_outcome: impl FnMut(&ScheduledRun, &RunOutcome),
+    ) -> Result<(), SchedulerError> {
+        self.drive_scheduler(false, max_concurrent, cancellation, configure, on_outcome)
+            .await
+    }
+
+    /// Drive admitted agents using their saved settings and the host's provider lookup.
+    /// Direct SDK runs use the host-supplied configuration in [`Self::run_scheduler`].
     ///
     /// # Errors
     ///
     /// Returns [`SchedulerError::MissingAgent`] when the lookup returns `None`, or
     /// any failure reported by [`Self::run_scheduler`].
-    pub async fn run_scheduler_with_agent_lookup<'a>(
+    pub async fn run_admitted_agents<'a>(
         self,
+        max_concurrent: NonZeroUsize,
+        cancellation: &CancellationToken,
+        configure: impl FnMut(&ScheduledRun) -> Option<ScheduledRunConfig<'a>>,
+        on_outcome: impl FnMut(&ScheduledRun, &RunOutcome),
+    ) -> Result<(), SchedulerError> {
+        self.drive_scheduler(true, max_concurrent, cancellation, configure, on_outcome)
+            .await
+    }
+
+    async fn drive_scheduler<'a>(
+        self,
+        admitted_only: bool,
         max_concurrent: NonZeroUsize,
         cancellation: &CancellationToken,
         mut configure: impl FnMut(&ScheduledRun) -> Option<ScheduledRunConfig<'a>>,
@@ -173,7 +192,7 @@ impl WorkspaceStore {
             .name("wakefold-scheduler-db".into())
             .spawn(move || {
                 while let Ok(reply) = commands.recv() {
-                    let _ = reply.send(store.read_schedule(max_concurrent));
+                    let _ = reply.send(store.read_schedule(max_concurrent, admitted_only));
                 }
             })
             .map_err(SchedulerError::StartWorker)?;
@@ -233,12 +252,16 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    fn read_schedule(&mut self, limit: NonZeroUsize) -> Result<Schedule, JournalError> {
+    fn read_schedule(
+        &mut self,
+        limit: NonZeroUsize,
+        admitted_only: bool,
+    ) -> Result<Schedule, JournalError> {
         let now = SystemTime::now();
         let now_millis = current_millis(now);
         let next_timer: Option<i64> = self.connection.query_row(
             "SELECT MIN(wake_at_ms) FROM run_waits
-             WHERE resolved = 0 AND wake_at_ms IS NOT NULL",
+             WHERE wake_at_ms IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
@@ -250,26 +273,13 @@ impl WorkspaceStore {
             self.wake_due_timers(now, limit)?;
         }
         let mut query = self.connection.prepare_cached(
-            "WITH ready(agent_id) AS (
-                SELECT agent_id FROM run_waits WHERE resolved = 1
-                UNION ALL
-                SELECT child_agent_id FROM delegated_runs WHERE needs_start = 1
-                UNION ALL
-                SELECT agent_id FROM queued_runs WHERE ready = 1
-                ORDER BY 1 LIMIT ?1
-            )
-            SELECT ready.agent_id, wr.chat_id, wr.run_key, e.event_json,
-                   d.parent_agent_id, d.worker, COALESCE(q.agent_name, d.worker), dynamic.settings, dynamic.parent_agent_id
-            FROM ready
-            JOIN workspace_runs wr USING (agent_id)
-            JOIN run_events e ON e.agent_id = ready.agent_id AND e.sequence = 1
-            LEFT JOIN delegated_runs d ON d.child_agent_id = ready.agent_id
-            LEFT JOIN dynamic_runs dynamic ON dynamic.agent_id=ready.agent_id
-            LEFT JOIN queued_runs q ON q.agent_id = ready.agent_id
-            ORDER BY ready.agent_id",
+            "SELECT r.agent_id, r.chat_id, r.run_key, e.event_json, r.settings_json, r.parent_agent_id
+             FROM agent_runs r JOIN run_events e ON e.agent_id=r.agent_id AND e.sequence=1
+             WHERE r.status='runnable' AND (NOT ?2 OR r.settings_json IS NOT NULL)
+             ORDER BY r.agent_id LIMIT ?1",
         )?;
         let limit = i64::try_from(limit.get()).unwrap_or(i64::MAX);
-        let mut rows = query.query([limit])?;
+        let mut rows = query.query(rusqlite::params![limit, admitted_only])?;
         let mut ready = Vec::new();
         while let Some(row) = rows.next()? {
             let first: String = row.get(3)?;
@@ -278,30 +288,16 @@ impl WorkspaceStore {
                     "scheduled run is missing its original prompt",
                 ));
             };
-            let delegation = if let Some(parent_agent_id) = row.get(4)? {
-                Some(DelegatedRun {
-                    parent_agent_id,
-                    worker: row.get(5)?,
-                })
-            } else {
-                None
-            };
-            let dynamic = if let Some(json) = row.get::<_, Option<String>>(7)? {
-                Some(Box::new(DynamicRun {
-                    settings: serde_json::from_str(&json)?,
-                    parent_agent_id: row.get(8)?,
-                }))
-            } else {
-                None
-            };
             ready.push(ReadyRun {
                 run: ScheduledRun {
                     agent_id: row.get(0)?,
                     chat_id: row.get(1)?,
                     run_key: row.get(2)?,
-                    delegation,
-                    agent_name: row.get(6)?,
-                    dynamic,
+                    parent_agent_id: row.get(5)?,
+                    settings: row
+                        .get::<_, Option<String>>(4)?
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()?,
                 },
                 prompt,
             });

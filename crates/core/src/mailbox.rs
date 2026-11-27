@@ -1,7 +1,7 @@
 //! Messages from agents and host clients.
 
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
@@ -11,65 +11,6 @@ use crate::{
     JournalEntry, JournalError, JsonValue, PendingWait, RunEvent, Tool, ToolContext, ToolError,
     ToolOutput, ToolRecovery, ToolSpec, WaitOn, WorkspaceStore,
 };
-
-const SCHEMA: &str = "
-    CREATE TABLE mailbox (
-        arrival_order INTEGER PRIMARY KEY,
-        message_id TEXT NOT NULL UNIQUE,
-        from_agent_id INTEGER REFERENCES workspace_runs(agent_id),
-        to_agent_id INTEGER NOT NULL REFERENCES workspace_runs(agent_id),
-        payload_json TEXT NOT NULL,
-        consumed_sequence INTEGER,
-        client_message_key TEXT,
-        CHECK ((from_agent_id IS NULL) = (client_message_key IS NOT NULL))
-    );
-    CREATE INDEX unread_mailbox ON mailbox(to_agent_id, arrival_order)
-    WHERE consumed_sequence IS NULL;
-    CREATE UNIQUE INDEX client_message_keys ON mailbox(to_agent_id, client_message_key)
-    WHERE client_message_key IS NOT NULL;";
-
-pub(crate) fn initialize_schema(connection: &mut Connection) -> Result<(), rusqlite::Error> {
-    if has_client_messages(connection)? {
-        return Ok(());
-    }
-    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // Another connection may have upgraded the schema while this one waited.
-    if has_client_messages(&tx)? {
-        return Ok(());
-    }
-    let mailbox_exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'mailbox')",
-        [],
-        |row| row.get(0),
-    )?;
-    if mailbox_exists {
-        tx.execute_batch(
-            "ALTER TABLE mailbox RENAME TO mailbox_before_client_messages;
-             DROP INDEX IF EXISTS unread_mailbox;",
-        )?;
-    }
-    tx.execute_batch(SCHEMA)?;
-    if mailbox_exists {
-        // Arrival order and consumption are part of the mailbox state.
-        tx.execute_batch(
-            "INSERT INTO mailbox(arrival_order, message_id, from_agent_id, to_agent_id,
-                                 payload_json, consumed_sequence)
-             SELECT arrival_order, message_id, from_agent_id, to_agent_id, payload_json,
-                    consumed_sequence FROM mailbox_before_client_messages;
-             DROP TABLE mailbox_before_client_messages;",
-        )?;
-    }
-    tx.commit()
-}
-
-fn has_client_messages(connection: &Connection) -> Result<bool, rusqlite::Error> {
-    connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mailbox')
-                       WHERE name = 'client_message_key')",
-        [],
-        |row| row.get(0),
-    )
-}
 
 /// A failure to post a client message to a run's mailbox.
 #[derive(Debug, Error)]
@@ -122,7 +63,7 @@ impl WorkspaceStore {
         let previous = tx
             .sql()
             .query_row(
-                "SELECT message_id, payload_json FROM mailbox
+                "SELECT message_id, payload_json FROM mailbox_messages
              WHERE to_agent_id = ?1 AND client_message_key = ?2",
                 params![agent_id, message_key],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -144,8 +85,8 @@ impl WorkspaceStore {
         }
         let id = format!("client-{:032x}", rand::random::<u128>());
         tx.sql().execute(
-            "INSERT INTO mailbox(message_id, to_agent_id, payload_json, client_message_key)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO mailbox_messages(message_id, chat_id, to_agent_id, message_kind, payload_json, client_message_key)
+             SELECT ?1, chat_id, agent_id, 'message', ?3, ?4 FROM agent_runs WHERE agent_id=?2",
             params![
                 id,
                 agent_id,
@@ -277,23 +218,30 @@ impl Tool for WaitForMessage {
     }
 }
 
+pub(crate) enum MessageKind {
+    Message,
+    ChildOutcome,
+}
+
 pub(crate) fn record_sent_message(
     tx: &JournalTransaction<'_>,
     message_id: &str,
     from_agent_id: i64,
     to_agent_id: i64,
+    kind: MessageKind,
     payload: &JsonValue,
 ) -> Result<(), JournalError> {
     let inserted = tx.sql().execute(
-        "INSERT INTO mailbox(message_id, from_agent_id, to_agent_id, payload_json)
-         SELECT ?1, sender.agent_id, recipient.agent_id, ?4
-         FROM workspace_runs sender JOIN workspace_runs recipient USING (chat_id)
+        "INSERT INTO mailbox_messages(message_id, chat_id, from_agent_id, to_agent_id, payload_json, message_kind)
+         SELECT ?1, sender.chat_id, sender.agent_id, recipient.agent_id, ?4, ?5
+         FROM agent_runs sender JOIN agent_runs recipient USING (chat_id)
          WHERE sender.agent_id = ?2 AND recipient.agent_id = ?3",
         params![
             message_id,
             from_agent_id,
             to_agent_id,
-            serde_json::to_string(payload)?
+            serde_json::to_string(payload)?,
+            match kind { MessageKind::Message => "message", MessageKind::ChildOutcome => "child_outcome" }
         ],
     )?;
     if inserted == 0 {
@@ -312,10 +260,10 @@ pub(crate) fn deliver_waiting_message(
     let pending = tx
         .sql()
         .query_row(
-            "SELECT rw.started_sequence, e.event_json
+            "SELECT rw.start_event_sequence, e.event_json
          FROM run_waits rw
-         JOIN run_events e ON e.agent_id = rw.agent_id AND e.sequence = rw.started_sequence
-         WHERE rw.agent_id = ?1 AND rw.source = 'mailbox_message' AND rw.resolved = 0",
+         JOIN run_events e ON e.agent_id = rw.agent_id AND e.sequence = rw.start_event_sequence
+         WHERE rw.agent_id = ?1 AND rw.wait_kind = 'mailbox_message'",
             [to_agent_id],
             |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
         )
@@ -352,11 +300,11 @@ pub(crate) fn take_message(
     let message = tx
         .sql()
         .query_row(
-            "SELECT message_id, from_agent_id, payload_json FROM mailbox
-         WHERE to_agent_id = ?1 AND consumed_sequence IS NULL
-           AND (?2 IS NULL OR from_agent_id = ?2) AND (NOT ?3 OR message_id = 'outcome-' || from_agent_id)
+            "SELECT message_id, from_agent_id, payload_json FROM mailbox_messages
+         WHERE to_agent_id = ?1 AND received_event_sequence IS NULL
+           AND (?2 IS NULL OR from_agent_id = ?2) AND (NOT ?3 OR message_kind = 'child_outcome')
          ORDER BY arrival_order LIMIT 1",
-            params![to_agent_id, from_agent_id,completion_only],
+            params![to_agent_id, from_agent_id, completion_only],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -371,7 +319,7 @@ pub(crate) fn take_message(
     };
     let payload: JsonValue = serde_json::from_str(&payload)?;
     tx.sql().execute(
-        "UPDATE mailbox SET consumed_sequence = ?1 WHERE message_id = ?2",
+        "UPDATE mailbox_messages SET received_event_sequence = ?1 WHERE message_id = ?2",
         params![sequence, message_id],
     )?;
     Ok(Some(
@@ -383,8 +331,8 @@ impl WorkspaceStore {
     /// Read a page of mailbox history without consuming messages.
     pub fn mailbox_messages(&self, agent: i64, after: i64) -> Result<Vec<JsonValue>, JournalError> {
         let mut query = self.connection.prepare(
-            "SELECT arrival_order, message_id, from_agent_id, payload_json, consumed_sequence
-             FROM mailbox WHERE to_agent_id = ?1 AND arrival_order > ?2
+            "SELECT arrival_order, message_id, from_agent_id, payload_json, received_event_sequence, message_kind
+             FROM mailbox_messages WHERE to_agent_id = ?1 AND arrival_order > ?2
              ORDER BY arrival_order LIMIT 128",
         )?;
         let mut rows = query.query(params![agent, after])?;
@@ -395,7 +343,9 @@ impl WorkspaceStore {
                 "message_id": row.get::<_, String>(1)?,
                 "from_agent_id": row.get::<_, Option<i64>>(2)?,
                 "payload": serde_json::from_str::<JsonValue>(&row.get::<_, String>(3)?)?,
+                "message_kind": row.get::<_, String>(5)?,
                 "consumed_sequence": row.get::<_, Option<i64>>(4)?,
+                "received_event_sequence": row.get::<_, Option<i64>>(4)?,
             }));
         }
         Ok(messages)

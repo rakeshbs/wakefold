@@ -7,12 +7,19 @@ use wakefold::{
 
 const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
 
+fn settings() -> wakefold::AgentSettings {
+    serde_json::from_value(
+        serde_json::json!({"model":"scripted","max_model_turns":12,"token_budget":200}),
+    )
+    .unwrap()
+}
+
 #[test]
 fn journal_replay_keeps_a_snapshot_while_the_run_advances() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
     let id = store
-        .queue_run(CHAT, "job", "agent", "Inspect an order.")
+        .queue_root(CHAT, "job", "Inspect an order.", &settings(), None)
         .unwrap();
     let replay = JournalReplay::open(state.path()).unwrap();
     let first = replay
@@ -30,14 +37,14 @@ fn journal_replay_keeps_a_snapshot_while_the_run_advances() {
             .unwrap()
     );
     let old = replay
-        .run_event_page(id, 1, NonZeroUsize::MIN)
+        .run_event_page(id, 2, NonZeroUsize::MIN)
         .unwrap()
         .unwrap();
     assert!(old.entries.is_empty());
     assert!(!old.complete);
     let fresh = JournalReplay::open(state.path())
         .unwrap()
-        .run_event_page(id, 1, NonZeroUsize::MIN)
+        .run_event_page(id, 2, NonZeroUsize::MIN)
         .unwrap()
         .unwrap();
     assert!(fresh.complete);
@@ -49,20 +56,26 @@ fn queued_run_retains_its_identity_and_terminal_failure_after_reopening() {
     let state = tempfile::tempdir().unwrap();
     let mut store = WorkspaceStore::open(state.path()).unwrap();
     let id = store
-        .queue_run(CHAT, "job", "coordinator", "Review this order.")
+        .queue_root(CHAT, "job", "Review this order.", &settings(), None)
         .unwrap();
     assert_eq!(
         store
-            .queue_run(CHAT, "job", "coordinator", "Review this order.")
+            .queue_root(CHAT, "job", "Review this order.", &settings(), None)
             .unwrap(),
         id
     );
     assert!(matches!(
-        store.queue_run(CHAT, "job", "worker", "Review this order."),
+        store.queue_root(
+            CHAT,
+            "job",
+            "Review this order.",
+            &settings(),
+            Some(chrono_tz::Asia::Kolkata)
+        ),
         Err(QueueRunError::Conflict)
     ));
     assert!(matches!(
-        store.queue_run(CHAT, "job", "coordinator", "Another prompt"),
+        store.queue_root(CHAT, "job", "Another prompt", &settings(), None),
         Err(QueueRunError::Conflict)
     ));
     drop(store);
@@ -81,7 +94,7 @@ fn queued_run_retains_its_identity_and_terminal_failure_after_reopening() {
         panic!("unexpected result {result:?}")
     };
     assert_eq!(run.agent_id, id);
-    assert_eq!(run.agent_name.as_deref(), Some("coordinator"));
+    assert_eq!(run.settings.as_deref(), Some(&settings()));
 
     let mut store = WorkspaceStore::open(state.path()).unwrap();
     let mut journal = store.open_journal(run.chat_id, &run.run_key).unwrap();
@@ -99,7 +112,7 @@ fn queued_run_retains_its_identity_and_terminal_failure_after_reopening() {
         matches!(&first.entries[0].event, RunEvent::RunStarted(prompt) if prompt == "Review this order.")
     );
     let second = store
-        .run_event_page(id, first.entries[0].sequence, NonZeroUsize::MIN)
+        .run_event_page(id, 2, NonZeroUsize::MIN)
         .unwrap()
         .unwrap();
     assert!(second.complete);

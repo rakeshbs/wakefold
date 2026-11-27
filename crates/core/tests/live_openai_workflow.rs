@@ -12,9 +12,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use wakefold::{
-    CancellationToken, DelegateTool, JournalEntry, JsonValue, ModelRequest, ModelResponse,
-    ModelRetryPolicy, OpenAiProvider, Provider, ProviderError, ReasoningEffort, RunError, RunEvent,
-    RunOptions, RunOutcome, ScheduledRunConfig, Skill, Tool, ToolError, ToolGrant, ToolSpec,
+    CancellationToken, JsonValue, ModelRequest, ModelResponse, ModelRetryPolicy, OpenAiProvider,
+    Provider, ProviderError, ReasoningEffort, RunError, RunEvent, RunOptions, RunOutcome,
+    ScheduledRunConfig, Skill, SpawnAgent, Tool, ToolError, ToolGrant, ToolSpec, WaitForMessage,
     WaitOn, WakeEvent, WorkspaceStore,
 };
 
@@ -25,13 +25,19 @@ const COORDINATOR: &str = "coordinator";
 const CATALOG: &str = "catalog";
 const REVIEW: &str = "review";
 const SKU: &str = "WF-318";
-const COORDINATOR_BUDGET: u64 = 12_000;
-const CATALOG_BUDGET: u64 = 4_000;
-const REVIEW_BUDGET: u64 = 6_000;
-const PROMPT: &str = "+Process order WF-318. Use the tools to get a catalog price and an approved review receipt.
-First call load_skill with name delegate. Then call delegate.catalog with a task asking the worker +to load the orders skill, call orders.lookup_price for sku WF-318, and return the price in cents +as digits only. Wait for its result.
-Next call delegate.review with a task asking the worker to load the orders skill, call +orders.record_review for sku WF-318, and return the receipt ID only. Wait for its result.
-After both worker results, reply with one JSON object with an integer price_cents and a string +receipt. Use the actual returned values and omit Markdown fences.";
+const COORDINATOR_BUDGET: u64 = 36_000;
+const CATALOG_BUDGET: u64 = 12_000;
+const REVIEW_BUDGET: u64 = 12_000;
+const PRICE_TASK: &str =
+    "Load orders and call orders.lookup_price for WF-318. Return only the price in cents.";
+const REVIEW_TASK: &str =
+    "Load orders and call orders.record_review for WF-318. Return only the receipt ID.";
+
+fn prompt() -> String {
+    format!(
+        "Process order WF-318. Load agents. Spawn two children, first with this exact task: {PRICE_TASK} Then with this exact task: {REVIEW_TASK} Load mailbox and receive their child outcomes using completion_only=true. Reply with one JSON object with the integer price_cents and string receipt, without Markdown."
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
@@ -105,28 +111,6 @@ impl Tool for OrderTool<'_> {
     }
 }
 
-struct Delegates {
-    catalog: DelegateTool,
-    review: DelegateTool,
-}
-
-impl Delegates {
-    fn new() -> Self {
-        Self {
-            catalog: DelegateTool::new(
-                CATALOG,
-                "Ask the catalog worker for the item's price.",
-                CATALOG,
-            ),
-            review: DelegateTool::new(
-                REVIEW,
-                "Ask the reviewer to record an approved review.",
-                REVIEW,
-            ),
-        }
-    }
-}
-
 fn live_provider() -> Result<OpenAiProvider, Box<dyn Error>> {
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
     Ok(
@@ -136,13 +120,14 @@ fn live_provider() -> Result<OpenAiProvider, Box<dyn Error>> {
 }
 
 fn options(role: &str) -> RunOptions {
-    let base = RunOptions::new(6).with_model_retry_policy(ModelRetryPolicy::new(0, Duration::ZERO));
+    let base =
+        RunOptions::new(14).with_model_retry_policy(ModelRetryPolicy::new(0, Duration::ZERO));
     match role {
         COORDINATOR => base
             .with_token_budget(COORDINATOR_BUDGET)
             .with_tool_grants([
-                ("delegate.catalog", ToolGrant::Allow),
-                ("delegate.review", ToolGrant::Allow),
+                ("agents.spawn", ToolGrant::Allow),
+                ("mailbox.receive", ToolGrant::Allow),
             ]),
         CATALOG => base
             .with_token_budget(CATALOG_BUDGET)
@@ -156,7 +141,6 @@ fn options(role: &str) -> RunOptions {
 
 async fn schedule(state: &Path, stage: Stage) -> Result<String, Box<dyn Error>> {
     let provider = live_provider()?;
-    let delegates = Delegates::new();
     let lookup = OrderTool {
         state,
         action: Action::LookUpPrice,
@@ -165,18 +149,29 @@ async fn schedule(state: &Path, stage: Stage) -> Result<String, Box<dyn Error>> 
         state,
         action: Action::RecordReview,
     };
-    let delegate_tools: [&dyn Tool; 2] = [&delegates.catalog, &delegates.review];
     let worker_tools: [&dyn Tool; 2] = [&lookup, &record];
-    let parent_skills = [Skill::new(
-        "delegate",
-        "Delegate order work",
-        &delegate_tools,
-    )];
+    let parent_skills = [
+        Skill::new("agents", "Spawn", &[&SpawnAgent]),
+        Skill::new("mailbox", "Receive", &[&WaitForMessage]),
+    ];
     let worker_skills = [Skill::new(
         "orders",
         "Read catalog or record a review",
         &worker_tools,
     )];
+    let tree = WorkspaceStore::open(state)?.chat_runs(CHAT)?;
+    let worker = |id| {
+        tree.iter()
+            .find(|r| r["agent_id"] == id && r["parent_agent_id"].is_number())
+            .map(|r| {
+                if r["task"] == PRICE_TASK {
+                    CATALOG
+                } else {
+                    assert_eq!(r["task"], REVIEW_TASK);
+                    REVIEW
+                }
+            })
+    };
     let cancel = CancellationToken::new();
     let mut answer = None;
     let store = WorkspaceStore::open(state)?;
@@ -184,18 +179,18 @@ async fn schedule(state: &Path, stage: Stage) -> Result<String, Box<dyn Error>> 
         NonZeroUsize::MIN,
         &cancel,
         |run| {
-            let worker = run.delegation.as_ref().map(|delegation| delegation.worker.as_str());
+            let worker = worker(run.agent_id);
             let role = match (stage, worker) {
                 (Stage::AwaitingApproval, Some(CATALOG)) => CATALOG,
                 (Stage::AwaitingApproval | Stage::ReviewFinished, Some(REVIEW)) => REVIEW,
                 (Stage::AwaitingApproval | Stage::FinishOrder, None) => COORDINATOR,
                 _ => panic!("unexpected ready run {run:?} in {stage:?}"),
             };
-            let skills = if worker.is_some() { &worker_skills } else { &parent_skills };
+            let skills: &[Skill<'_>] = if worker.is_some() { &worker_skills } else { &parent_skills };
             ScheduledRunConfig::new(&provider, skills, options(role))
         },
         |run, outcome| {
-            let worker = run.delegation.as_ref().map(|delegation| delegation.worker.as_str());
+            let worker = worker(run.agent_id);
             match (stage, worker, outcome) {
                 (Stage::AwaitingApproval, Some(CATALOG), RunOutcome::Finished(report)) => {
                     let count = report.usage.reported_tokens.total_tokens();
@@ -203,7 +198,7 @@ async fn schedule(state: &Path, stage: Stage) -> Result<String, Box<dyn Error>> 
                     eprintln!("Catalog worker used {count}/{CATALOG_BUDGET} tokens");
                 }
                 (Stage::AwaitingApproval, None, RunOutcome::Suspended(wait)) => {
-                    assert!(matches!(&wait.on, WaitOn::Delegation { worker, .. } if worker == REVIEW));
+                    assert!(matches!(&wait.on, WaitOn::ChildOutcome { .. }));
                 }
                 (Stage::AwaitingApproval, Some(REVIEW), RunOutcome::Suspended(wait)) => {
                     assert!(matches!(&wait.on, WaitOn::ToolApproval { tool_name, .. } if tool_name == "orders.record_review"));
@@ -246,21 +241,6 @@ fn stop_child(state: &Path, stage: &str, exit_code: i32) -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn delegated_run<'a>(entries: &'a [JournalEntry], worker_name: &str) -> (&'a str, &'a str) {
-    entries
-        .iter()
-        .find_map(|entry| match &entry.event {
-            RunEvent::WaitStarted(wait) => match &wait.on {
-                WaitOn::Delegation { worker, prompt } if worker == worker_name => {
-                    Some((wait.id.as_str(), prompt.as_str()))
-                }
-                _ => None,
-            },
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("no saved delegation for {worker_name}"))
-}
-
 struct ForbidModelCall;
 
 #[async_trait]
@@ -290,14 +270,20 @@ async fn live_order_workflow_survives_two_restarts() -> Result<(), Box<dyn Error
         json!({ "sku": SKU, "price_cents": price }).to_string(),
     )?;
     let provider = live_provider()?;
-    let delegates = Delegates::new();
-    let tools: [&dyn Tool; 2] = [&delegates.catalog, &delegates.review];
-    let skills = [Skill::new("delegate", "Delegate order work", &tools)];
+    let skills = [
+        Skill::new("agents", "Spawn", &[&SpawnAgent]),
+        Skill::new("mailbox", "Receive", &[&WaitForMessage]),
+    ];
     let mut store = WorkspaceStore::open(path)?;
+    let prompt = prompt();
+    let settings = serde_json::from_value(
+        json!({"model":"openai","max_model_turns":14,"token_budget":COORDINATOR_BUDGET}),
+    )?;
+    store.queue_root(CHAT, COORDINATOR, &prompt, &settings, None)?;
     let outcome = tokio::time::timeout(
         Duration::from_secs(45),
         store.open_journal(CHAT, COORDINATOR)?.run_until_blocked(
-            PROMPT,
+            prompt,
             &provider,
             &skills,
             options(COORDINATOR),
@@ -305,7 +291,7 @@ async fn live_order_workflow_survives_two_restarts() -> Result<(), Box<dyn Error
     )
     .await??;
     assert!(
-        matches!(outcome, RunOutcome::Suspended(wait) if matches!(&wait.on, WaitOn::Delegation { worker, .. } if worker == CATALOG))
+        matches!(outcome, RunOutcome::Suspended(wait) if matches!(&wait.on, WaitOn::ChildOutcome { .. }))
     );
     drop(store);
 
@@ -324,8 +310,13 @@ async fn live_order_workflow_survives_two_restarts() -> Result<(), Box<dyn Error
         matches!(&approval.on, WaitOn::ToolApproval { tool_name, arguments }
         if tool_name == "orders.record_review" && arguments == &json!({ "sku": SKU }))
     );
-    let parent = store.open_journal(CHAT, COORDINATOR)?.load_after(0)?;
-    let (review_key, review_prompt) = delegated_run(&parent, REVIEW);
+    let tree = store.chat_runs(CHAT)?;
+    let review = tree
+        .iter()
+        .find(|r| r["agent_id"] == *review_id)
+        .expect("saved reviewer");
+    let review_key = review["run_key"].as_str().unwrap();
+    let review_prompt = review["task"].as_str().unwrap();
     assert_eq!(
         store.open_run_workspace(CHAT, review_key)?.agent_id(),
         *review_id

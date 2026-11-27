@@ -22,12 +22,7 @@ pub(crate) async fn serve(
     }
     let store = WorkspaceStore::open(&runtime.state_directory)?;
     tracing::info!(address = %listener.local_addr()?, "daemon started");
-    let app = api::router(
-        store,
-        runtime.agents.keys().cloned().collect(),
-        runtime.defaults.clone(),
-        stop.clone(),
-    );
+    let app = api::router(store, runtime.defaults.clone(), stop.clone());
     let http = async {
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(stop.clone().cancelled_owned())
@@ -61,24 +56,6 @@ async fn drive(runtime: &Runtime, stop: &CancellationToken) -> Result<(), Daemon
         .iter()
         .map(|(name, skill)| (name.as_str(), skill.tools.iter().map(Box::as_ref).collect()))
         .collect();
-    let agent_skills: BTreeMap<_, Vec<Skill<'_>>> = runtime
-        .agents
-        .iter()
-        .map(|(name, agent)| {
-            let skills = agent
-                .skills
-                .iter()
-                .map(|skill| {
-                    Skill::new(
-                        skill,
-                        &runtime.skills[skill].description,
-                        &tools[skill.as_str()],
-                    )
-                })
-                .collect();
-            (name.as_str(), skills)
-        })
-        .collect();
     let shared_skills: BTreeMap<_, _> = runtime
         .profiles
         .keys()
@@ -103,38 +80,23 @@ async fn drive(runtime: &Runtime, stop: &CancellationToken) -> Result<(), Daemon
     while !stop.is_cancelled() {
         let scheduler = WorkspaceStore::open(&runtime.state_directory)?;
         let result = scheduler
-            .run_scheduler_with_agent_lookup(
+            .run_admitted_agents(
                 runtime.max_concurrent,
                 stop,
                 |run| {
-                    if let Some(dynamic) = &run.dynamic {
-                        let profile = runtime.profiles.get(&dynamic.settings)?;
-                        let (root, child) = shared_skills.get(&dynamic.settings)?;
-                        return Some(ScheduledRunConfig::new(
-                            profile.provider.as_ref(),
-                            if dynamic.parent_agent_id.is_some() {
-                                child
-                            } else {
-                                root
-                            },
-                            profile.options.clone(),
-                        ));
-                    }
-                    let name = run.agent_name.as_deref()?;
-                    let agent = runtime.agents.get(name)?;
-                    tracing::info!(
-                        agent_id = run.agent_id,
-                        parent_agent_id =
-                            run.delegation.as_ref().map(|worker| worker.parent_agent_id),
-                        agent = name,
-                        chat_id = %run.chat_id,
-                        run_key = run.run_key.as_str(),
-                        "dispatching ready run"
-                    );
+                    tracing::info!(agent_id = run.agent_id, parent_agent_id = run.parent_agent_id,
+                        chat_id = %run.chat_id, "dispatching ready run");
+                    let settings = run.settings.as_deref()?;
+                    let profile = runtime.profiles.get(settings)?;
+                    let (root, child) = shared_skills.get(settings)?;
                     Some(ScheduledRunConfig::new(
-                        agent.provider.as_ref(),
-                        &agent_skills[name],
-                        agent.options.clone(),
+                        profile.provider.as_ref(),
+                        if run.parent_agent_id.is_some() {
+                            child
+                        } else {
+                            root
+                        },
+                        profile.options.clone(),
                     ))
                 },
                 |_, _| {},

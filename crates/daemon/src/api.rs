@@ -1,6 +1,5 @@
 //! Local HTTP endpoints and resumable journal streams.
 
-use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,8 +27,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<WorkspaceStore>>,
-    agents: Arc<BTreeSet<String>>,
-    defaults: Option<Arc<wakefold::AgentSettings>>,
+    defaults: Arc<wakefold::AgentSettings>,
     stop: CancellationToken,
 }
 
@@ -69,8 +67,7 @@ impl IntoResponse for ApiError {
 
 pub(crate) fn router(
     store: WorkspaceStore,
-    agents: BTreeSet<String>,
-    defaults: Option<wakefold::AgentSettings>,
+    defaults: wakefold::AgentSettings,
     stop: CancellationToken,
 ) -> Router {
     Router::new()
@@ -93,8 +90,7 @@ pub(crate) fn router(
         .layer(middleware::from_fn(require_local_origin))
         .with_state(AppState {
             store: Arc::new(Mutex::new(store)),
-            agents: Arc::new(agents),
-            defaults: defaults.map(Arc::new),
+            defaults: Arc::new(defaults),
             stop,
         })
 }
@@ -237,7 +233,6 @@ async fn require_local_origin(request: Request, next: Next) -> Result<Response, 
 struct StartRun {
     chat_id: ChatId,
     run_key: String,
-    agent: Option<String>,
     time_zone: Option<String>,
     prompt: String,
 }
@@ -252,13 +247,6 @@ async fn start_run(
             "run_key and prompt must be nonempty",
         ));
     }
-    if request
-        .agent
-        .as_ref()
-        .is_some_and(|a| !state.agents.contains(a))
-    {
-        return Err(ApiError(StatusCode::NOT_FOUND, "unknown agent"));
-    }
     let defaults = state.defaults.clone();
     let zone = request
         .time_zone
@@ -268,26 +256,21 @@ async fn start_run(
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "unknown time_zone"))?;
     let id = state
         .database(move |store| {
-            match (&request.agent, defaults) {
-                (Some(name), _) => {
-                    store.queue_run(request.chat_id, &request.run_key, name, &request.prompt)
-                }
-                (None, Some(settings)) => store.queue_root(
+            store
+                .queue_root(
                     request.chat_id,
                     &request.run_key,
                     &request.prompt,
-                    &settings,
+                    &defaults,
                     zone,
-                ),
-                _ => return Err(ApiError(StatusCode::BAD_REQUEST, "missing agent defaults")),
-            }
-            .map_err(|error| match error {
-                QueueRunError::Conflict => ApiError(
-                    StatusCode::CONFLICT,
-                    "chat ID and run key already identify a different request",
-                ),
-                _ => ApiError::internal(error),
-            })
+                )
+                .map_err(|error| match error {
+                    QueueRunError::Conflict => ApiError(
+                        StatusCode::CONFLICT,
+                        "chat ID and run key already identify a different request",
+                    ),
+                    _ => ApiError::internal(error),
+                })
         })
         .await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "agent_id": id }))))

@@ -184,12 +184,17 @@ async fn parent_and_children_resume_after_restart() {
         .as_i64()
         .unwrap();
     let tree = wait_for_tree(&client, address, chat, "wait_started").await;
+    assert!(tree.iter().all(|r| r["status"] == "waiting"));
     assert!(tree.iter().skip(1).all(|r| r["parent_agent_id"] == root));
     assert!(state.path().join("lookup").is_file());
     drop(process);
     config["defaults"]["model"] = json!("updated");
     std::fs::write(&path, config.to_string()).unwrap();
     let (_process, address) = launch(&path, TEST).await;
+    assert_eq!(
+        wait_for_tree(&client, address, chat, "wait_started").await,
+        tree
+    );
     let retry = client
         .post(format!("http://{address}/runs"))
         .json(&request)
@@ -226,7 +231,38 @@ async fn parent_and_children_resume_after_restart() {
         .await
         .unwrap();
     assert_eq!(messages.len(), 3);
-    assert!(messages.iter().all(|m| m["consumed_sequence"].is_number()));
+    assert!(
+        messages
+            .iter()
+            .all(|m| m["received_event_sequence"].is_number())
+    );
+    let history = saved_replay(&state.path().join("state"), root);
+    for child in &after[1..] {
+        let outcomes: Vec<_> = messages
+            .iter()
+            .filter(|message| {
+                message["from_agent_id"] == child["agent_id"]
+                    && message["message_kind"] == "child_outcome"
+            })
+            .collect();
+        let [outcome] = outcomes.as_slice() else {
+            panic!("expected one outcome for {child}")
+        };
+        let receipts: Vec<_> = history
+            .iter()
+            .filter(|frame| {
+                let event = &frame["event"];
+                let delivered = match event["kind"].as_str() {
+                    Some("woken") => &event["data"]["payload"],
+                    Some("tool_call_completed") => &event["data"]["value"],
+                    _ => return false,
+                };
+                frame["agent_id"] == root && delivered["message_id"] == outcome["message_id"]
+            })
+            .map(|frame| &frame["sequence"])
+            .collect();
+        assert_eq!(receipts, [&outcome["received_event_sequence"]]);
+    }
 }
 
 async fn wait_for_tree(

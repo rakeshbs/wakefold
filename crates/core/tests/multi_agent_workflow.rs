@@ -6,9 +6,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::json;
 use wakefold::{
-    CancellationToken, DelegateTool, JsonValue, Message, ModelRequest, ModelResponse, ModelTurn,
-    Provider, ProviderError, RunError, RunEvent, RunOptions, RunOutcome, ScheduledRunConfig, Skill,
-    TokenUsage, Tool, ToolCall, ToolError, ToolGrant, ToolSpec, WaitOn, WakeEvent, WorkspaceStore,
+    CancellationToken, JsonValue, Message, ModelRequest, ModelResponse, ModelTurn, Provider,
+    ProviderError, RunError, RunEvent, RunOptions, RunOutcome, ScheduledRunConfig, Skill,
+    SpawnAgent, TokenUsage, Tool, ToolCall, ToolError, ToolGrant, ToolSpec, WaitForMessage, WaitOn,
+    WakeEvent, WorkspaceStore,
 };
 
 const CHAT: wakefold::ChatId = wakefold::ChatId::from_u128(1);
@@ -16,24 +17,23 @@ const COORDINATOR: &str = "coordinator";
 const PROMPT: &str = "Find the notebook price and obtain a review.";
 const CATALOG: &str = "catalog";
 const REVIEW: &str = "review";
-const TASK: &str = "Handle the notebook order.";
 const CATALOG_ANSWER: &str = "350 cents";
 const REVIEW_ANSWER: &str = "order reviewed";
 const FINAL_ANSWER: &str = "Notebook costs 350 cents and the order was reviewed.";
 const CHILD_STATE: &str = "WAKEFOLD_WORKFLOW_TEST_STATE";
 const CHILD_STOP: &str = "WAKEFOLD_WORKFLOW_TEST_STOP";
 
-const COORDINATOR_LIMIT: u64 = 19;
+const COORDINATOR_LIMIT: u64 = 30;
 const CATALOG_LIMIT: u64 = 9;
 const REVIEW_LIMIT: u64 = 13;
 const REVIEW_BEFORE_APPROVAL: u64 = 9;
 
 fn coordinator_options() -> RunOptions {
-    RunOptions::new(5)
+    RunOptions::new(9)
         .with_token_budget(COORDINATOR_LIMIT)
         .with_tool_grants([
-            ("delegate.catalog", ToolGrant::Allow),
-            ("delegate.review", ToolGrant::Allow),
+            ("agents.spawn", ToolGrant::Allow),
+            ("mailbox.receive", ToolGrant::Allow),
         ])
 }
 
@@ -82,36 +82,50 @@ impl Provider for Coordinator {
         _: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelTurn, ProviderError> {
         let (response, usage) = match request.messages.last().unwrap() {
-            Message::User(prompt) => {
-                assert_eq!(prompt, PROMPT);
-                (load("delegate"), TokenUsage::new(4, 1))
-            }
-            Message::Tool(result) if result.call_id == "load".into() => (
-                ModelResponse::ToolCalls {
-                    text: None,
-                    calls: vec![
-                        dispatch(CATALOG, "delegate.catalog", json!({ "task": TASK })),
-                        dispatch(REVIEW, "delegate.review", json!({ "task": TASK })),
-                    ],
-                },
-                TokenUsage::new(6, 2),
-            ),
-            Message::Tool(_) => {
-                let count = request.messages.len();
-                assert_result(
-                    &request.messages[count - 2],
-                    CATALOG,
-                    json!({ "worker": CATALOG, "answer": CATALOG_ANSWER }),
-                );
-                assert_result(
-                    &request.messages[count - 1],
-                    REVIEW,
-                    json!({ "worker": REVIEW, "answer": REVIEW_ANSWER }),
-                );
-                (
-                    ModelResponse::Final(FINAL_ANSWER.into()),
-                    TokenUsage::new(4, 1),
-                )
+            Message::Developer(_) => (load("agents"), TokenUsage::new(4, 1)),
+            Message::Tool(result) => {
+                let response = match result.call_id.as_str() {
+                    "load" => ModelResponse::ToolCalls {
+                        text: None,
+                        calls: vec![
+                            dispatch("catalog", "agents.spawn", json!({"task": CATALOG})),
+                            dispatch("review", "agents.spawn", json!({"task": REVIEW})),
+                        ],
+                    },
+                    "review" => {
+                        ToolCall::new("mail", "load_skill", json!({"name":"mailbox"})).into()
+                    }
+                    "mail" | "catalog_result" => {
+                        let (spawn, call) = if result.call_id.as_str() == "mail" {
+                            (CATALOG, "catalog_result")
+                        } else {
+                            assert_eq!(result.value["payload"]["answer"], CATALOG_ANSWER);
+                            (REVIEW, "review_result")
+                        };
+                        let child = request
+                            .messages
+                            .iter()
+                            .find_map(|message| match message {
+                                Message::Tool(r) if r.call_id.as_str() == spawn => {
+                                    r.value["agent_id"].as_i64()
+                                }
+                                _ => None,
+                            })
+                            .unwrap();
+                        dispatch(
+                            call,
+                            "mailbox.receive",
+                            json!({"from_agent_id":child,"completion_only":true}),
+                        )
+                        .into()
+                    }
+                    "review_result" => {
+                        assert_eq!(result.value["payload"]["answer"], REVIEW_ANSWER);
+                        ModelResponse::Final(FINAL_ANSWER.into())
+                    }
+                    other => panic!("unexpected result {other}"),
+                };
+                (response, TokenUsage::new(2, 1))
             }
             other => panic!("unexpected coordinator boundary {other:?}"),
         };
@@ -148,10 +162,7 @@ impl Provider for Worker {
         _: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelTurn, ProviderError> {
         let (response, index) = match request.messages.last().unwrap() {
-            Message::User(prompt) => {
-                assert_eq!(prompt, TASK);
-                (load("order"), 0)
-            }
+            Message::Developer(_) => (load("order"), 0),
             Message::Tool(result) if result.call_id == "load".into() => {
                 let name = format!("order.{}", self.name);
                 let tools = result.value["tools"].as_array().unwrap();
@@ -200,8 +211,6 @@ impl Tool for RecordWork<'_> {
 }
 
 struct Workflow<'a> {
-    delegate_catalog: DelegateTool,
-    delegate_review: DelegateTool,
     catalog: RecordWork<'a>,
     review: RecordWork<'a>,
 }
@@ -209,8 +218,6 @@ struct Workflow<'a> {
 impl<'a> Workflow<'a> {
     fn new(state: &'a Path) -> Self {
         Self {
-            delegate_catalog: DelegateTool::new(CATALOG, "Look up the price", CATALOG),
-            delegate_review: DelegateTool::new(REVIEW, "Review the order", REVIEW),
             catalog: RecordWork {
                 state,
                 worker: &CATALOG_WORKER,
@@ -232,12 +239,19 @@ enum StopAt {
 
 async fn drive_scheduler(state: &Path, stop: StopAt) {
     let workflow = Workflow::new(state);
-    let delegation_tools: [&dyn Tool; 2] = [&workflow.delegate_catalog, &workflow.delegate_review];
     let order_tools: [&dyn Tool; 2] = [&workflow.catalog, &workflow.review];
-    let delegation_skills = [Skill::new("delegate", "Delegate work", &delegation_tools)];
-    // Both worker definitions are registered. The per-worker grant filters the advertised tools.
+    let delegation_skills = [
+        Skill::new("agents", "Spawn", &[&SpawnAgent]),
+        Skill::new("mailbox", "Receive", &[&WaitForMessage]),
+    ];
     let worker_skills = [Skill::new("order", "Handle an order", &order_tools)];
     let store = WorkspaceStore::open(state).unwrap();
+    let tree = store.chat_runs(CHAT).unwrap();
+    let worker = |agent_id| {
+        tree.iter()
+            .find(|r| r["agent_id"] == agent_id && r["parent_agent_id"].is_number())
+            .and_then(|r| r["task"].as_str())
+    };
     let cancellation = CancellationToken::new();
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -245,7 +259,7 @@ async fn drive_scheduler(state: &Path, stop: StopAt) {
             NonZeroUsize::MIN,
             &cancellation,
             |run| {
-                let worker = run.delegation.as_ref().map(|delegation| delegation.worker.as_str());
+                let worker = worker(run.agent_id);
                 match worker {
                     Some(CATALOG) if stop == StopAt::PendingApproval =>
                         ScheduledRunConfig::new(&CATALOG_WORKER, &worker_skills, worker_options(CATALOG)),
@@ -256,14 +270,14 @@ async fn drive_scheduler(state: &Path, stop: StopAt) {
                 }
             },
             |run, outcome| {
-                let worker = run.delegation.as_ref().map(|delegation| delegation.worker.as_str());
+                let worker = worker(run.agent_id);
                 match (stop, worker, outcome) {
                     (StopAt::PendingApproval, Some(CATALOG), RunOutcome::Finished(report)) => {
                         assert_eq!(report.answer, CATALOG_ANSWER);
                         assert_eq!(report.usage.reported_tokens, TokenUsage::new(5, 3));
                     }
                     (StopAt::PendingApproval, None, RunOutcome::Suspended(wait)) => {
-                        assert!(matches!(&wait.on, WaitOn::Delegation { worker, .. } if worker == REVIEW));
+                        assert!(matches!(&wait.on, WaitOn::ChildOutcome { .. }));
                     }
                     (StopAt::PendingApproval, Some(REVIEW), RunOutcome::Suspended(wait)) => {
                         assert!(matches!(&wait.on, WaitOn::ToolApproval { tool_name, .. } if tool_name == "order.review"));
@@ -276,7 +290,7 @@ async fn drive_scheduler(state: &Path, stop: StopAt) {
                     }
                     (StopAt::CoordinatorCompleted, None, RunOutcome::Finished(report)) => {
                         assert_eq!(report.answer, FINAL_ANSWER);
-                        assert_eq!(report.usage.reported_tokens, TokenUsage::new(14, 4));
+                        assert_eq!(report.usage.reported_tokens, TokenUsage::new(14, 6));
                         cancellation.cancel();
                     }
                     _ => panic!("unexpected outcome for {run:?} at {stop:?}: {outcome:?}"),
@@ -318,9 +332,17 @@ async fn coordinator_and_two_workers_survive_restarts_with_separate_token_budget
     let state = tempfile::tempdir().unwrap();
     let path = state.path();
     let workflow = Workflow::new(path);
-    let tools: [&dyn Tool; 2] = [&workflow.delegate_catalog, &workflow.delegate_review];
-    let skills = [Skill::new("delegate", "Delegate work", &tools)];
+    let skills = [
+        Skill::new("agents", "Spawn", &[&SpawnAgent]),
+        Skill::new("mailbox", "Receive", &[&WaitForMessage]),
+    ];
     let mut store = WorkspaceStore::open(path).unwrap();
+    let settings =
+        serde_json::from_value(json!({"model":"scripted","max_model_turns":9,"token_budget":30}))
+            .unwrap();
+    store
+        .queue_root(CHAT, COORDINATOR, PROMPT, &settings, None)
+        .unwrap();
     let outcome = store
         .open_journal(CHAT, COORDINATOR)
         .unwrap()
@@ -330,7 +352,7 @@ async fn coordinator_and_two_workers_survive_restarts_with_separate_token_budget
     let RunOutcome::Suspended(first_wait) = outcome else {
         panic!("expected the catalog worker")
     };
-    assert!(matches!(&first_wait.on, WaitOn::Delegation { worker, .. } if worker == CATALOG));
+    assert!(matches!(&first_wait.on, WaitOn::ChildOutcome { .. }));
     drop(store);
 
     crash_at(path, "approval", 81);
@@ -349,15 +371,15 @@ async fn coordinator_and_two_workers_survive_restarts_with_separate_token_budget
         matches!(&approval.on, WaitOn::ToolApproval { tool_name, arguments }
         if tool_name == "order.review" && *arguments == json!({ "item": "notebook" }))
     );
-    let parent_events = store
-        .open_journal(CHAT, COORDINATOR)
-        .unwrap()
-        .load_after(0)
-        .unwrap();
-    let review_key = parent_events.iter().find_map(|entry| match &entry.event {
-        RunEvent::WaitStarted(wait) if matches!(&wait.on, WaitOn::Delegation { worker, .. } if worker == REVIEW) => Some(wait.id.as_str()),
-        _ => None,
-    }).expect("coordinator must be waiting for the reviewer");
+    let tree = store.chat_runs(CHAT).unwrap();
+    let run_key = |task| {
+        tree.iter()
+            .find(|r| r["task"].as_str() == Some(task))
+            .unwrap()["run_key"]
+            .as_str()
+            .unwrap()
+    };
+    let review_key = run_key(REVIEW);
     let review_workspace = store.open_run_workspace(CHAT, review_key).unwrap();
     assert_eq!(*review_id, review_workspace.agent_id());
     assert!(
@@ -378,7 +400,7 @@ async fn coordinator_and_two_workers_survive_restarts_with_separate_token_budget
         .open_journal(CHAT, review_key)
         .unwrap()
         .run_until_blocked(
-            TASK,
+            REVIEW,
             &REVIEW_WORKER,
             &worker_skills,
             worker_options(REVIEW).with_token_budget(REVIEW_BEFORE_APPROVAL),
@@ -396,7 +418,7 @@ async fn coordinator_and_two_workers_survive_restarts_with_separate_token_budget
     drive_scheduler(path, StopAt::CoordinatorCompleted).await;
 
     let mut store = WorkspaceStore::open(path).unwrap();
-    for key in [COORDINATOR, first_wait.id.as_str(), review_key] {
+    for key in [COORDINATOR, run_key(CATALOG), review_key] {
         let history = store
             .open_journal(CHAT, key)
             .unwrap()
@@ -407,7 +429,7 @@ async fn coordinator_and_two_workers_survive_restarts_with_separate_token_budget
                 .iter()
                 .filter(|entry| matches!(entry.event, RunEvent::ModelCallCompleted(_)))
                 .count(),
-            3,
+            if key == COORDINATOR { 6 } else { 3 },
             "{key}"
         );
         assert_eq!(

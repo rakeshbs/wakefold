@@ -3,15 +3,13 @@
 mod agent;
 mod artifact;
 mod context;
-mod delegation;
 mod dynamic;
 pub use chrono_tz::Tz as ChatTimeZone;
-pub use dynamic::{AgentSettings, SpawnAgent};
+pub use dynamic::{AgentSettings, QueueRunError, SpawnAgent};
 mod journal;
 mod mailbox;
 mod provider;
 mod providers;
-mod queued_run;
 mod retry;
 mod scheduler;
 mod skill;
@@ -33,7 +31,6 @@ pub use agent::{
     run_streaming_with_options, run_with_options,
 };
 pub use artifact::{ArtifactError, ArtifactPublication, ArtifactRevision, PublishArtifact};
-pub use delegation::{DelegateTool, DelegatedRun};
 pub use journal::{JournalEntry, JournalError, JournalReplay, RunEvent, RunEventPage, RunJournal};
 pub use mailbox::{ClientMessageError, SendMessage, WaitForMessage};
 pub use provider::{
@@ -42,9 +39,8 @@ pub use provider::{
 };
 #[cfg(feature = "openai")]
 pub use providers::openai::{OpenAiProvider, ReasoningEffort};
-pub use queued_run::QueueRunError;
 pub use retry::ModelRetryPolicy;
-pub use scheduler::{DynamicRun, ScheduledRun, ScheduledRunConfig, SchedulerError};
+pub use scheduler::{ScheduledRun, ScheduledRunConfig, SchedulerError};
 pub use serde_json::Value as JsonValue;
 pub use skill::Skill;
 pub use tokio_util::sync::CancellationToken;

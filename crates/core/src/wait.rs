@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::{JsonValue, Tool, ToolContext, ToolError, ToolOutput, ToolRecovery, ToolSpec};
 
 mod store;
-pub(crate) use store::{SCHEMA, record_transition};
+pub(crate) use store::record_transition;
 
 /// What must happen before a suspended tool call can return its result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,13 +40,6 @@ pub enum WaitOn {
         /// Actual tool arguments the host reviews.
         arguments: JsonValue,
     },
-    /// Start a worker in this chat and resume with its saved answer.
-    Delegation {
-        /// Worker name registered by the host.
-        worker: String,
-        /// Task prompt sent to the worker.
-        prompt: String,
-    },
 }
 
 impl WaitOn {
@@ -58,7 +51,6 @@ impl WaitOn {
             Self::Webhook => "webhook",
             Self::Approval => "approval",
             Self::ToolApproval { .. } => "tool_approval",
-            Self::Delegation { .. } => "delegation",
         }
     }
 }

@@ -9,12 +9,7 @@ use thiserror::Error;
 
 use crate::ChatId;
 
-mod migration;
-
-pub(crate) const CHAT_SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS chats (
-        chat_id BLOB NOT NULL PRIMARY KEY CHECK(length(chat_id) = 16)
-    ) WITHOUT ROWID;";
+const SCHEMA_VERSION: i64 = 1;
 
 /// A failure to open workspace metadata or materialize a directory.
 #[derive(Debug, Error)]
@@ -22,6 +17,9 @@ pub enum WorkspaceError {
     /// SQLite could not read or persist the workspace mapping.
     #[error("workspace metadata: {0}")]
     Database(#[from] rusqlite::Error),
+    /// The database was created by an incompatible version of Wakefold.
+    #[error("incompatible Wakefold database in {0}; start with an empty state directory")]
+    IncompatibleDatabase(PathBuf),
     /// A workspace directory could not be accessed.
     #[error("workspace filesystem: {0}")]
     Filesystem(#[from] std::io::Error),
@@ -86,26 +84,24 @@ impl WorkspaceStore {
                 }
             }
         }
-        connection.execute_batch("PRAGMA synchronous = FULL;")?;
-        migration::upgrade(&mut connection, &state)?;
-        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-        connection.execute_batch(CHAT_SCHEMA)?;
-        connection.execute_batch(
-            "
-             CREATE TABLE IF NOT EXISTS workspace_runs (
-                 agent_id INTEGER PRIMARY KEY,
-                 chat_id BLOB NOT NULL REFERENCES chats(chat_id),
-                 run_key TEXT NOT NULL,
-                 UNIQUE(chat_id, run_key)
-             );",
-        )?;
-        connection.execute_batch(crate::journal::SCHEMA)?;
-        connection.execute_batch(crate::wait::SCHEMA)?;
-        connection.execute_batch(crate::delegation::SCHEMA)?;
-        crate::mailbox::initialize_schema(&mut connection)?;
-        connection.execute_batch(crate::queued_run::SCHEMA)?;
-        connection.execute_batch(crate::dynamic::SCHEMA)?;
-        connection.execute_batch(crate::artifact::SCHEMA)?;
+        connection.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")?;
+        if schema_version(&connection)? != SCHEMA_VERSION {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Another opener may have initialized this database while we waited.
+            let version = schema_version(&tx)?;
+            if version != SCHEMA_VERSION {
+                let empty = tx.query_row(
+                    "SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*')",
+                    [], |row| row.get::<_, bool>(0),
+                )?;
+                if !empty || version != 0 {
+                    return Err(WorkspaceError::IncompatibleDatabase(state));
+                }
+                tx.execute_batch(include_str!("workspace/schema.sql"))?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            tx.commit()?;
+        }
         Ok(Self { connection, state })
     }
 
@@ -179,6 +175,10 @@ impl WorkspaceStore {
     }
 }
 
+fn schema_version(db: &Connection) -> rusqlite::Result<i64> {
+    db.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
 fn chat_directory(state: &Path, chat_id: ChatId) -> PathBuf {
     state.join("workspaces").join(chat_id.to_string())
 }
@@ -194,12 +194,12 @@ pub(crate) fn reserve_run(
     )?;
     let keys = params![chat_id, run_key];
     tx.execute(
-        "INSERT INTO workspace_runs(chat_id, run_key) VALUES (?1, ?2)
+        "INSERT INTO agent_runs(chat_id, run_key) VALUES (?1, ?2)
          ON CONFLICT(chat_id, run_key) DO NOTHING",
         keys,
     )?;
     tx.query_row(
-        "SELECT agent_id FROM workspace_runs WHERE chat_id = ?1 AND run_key = ?2",
+        "SELECT agent_id FROM agent_runs WHERE chat_id = ?1 AND run_key = ?2",
         keys,
         |row| row.get(0),
     )

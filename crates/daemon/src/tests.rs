@@ -52,7 +52,7 @@ impl Provider for WorkflowProvider {
         request: ModelRequest<'_>,
         _: &mut (dyn for<'chunk> FnMut(&'chunk str) + Send),
     ) -> Result<ModelTurn, ProviderError> {
-        let Some(Message::User(prompt)) = request.messages.first() else {
+        let Some(Message::User(prompt)) = request.messages.get(1) else {
             panic!("the original prompt must survive");
         };
         if prompt == MAILBOX_PROMPT {
@@ -75,13 +75,9 @@ impl Provider for WorkflowProvider {
                 Some(TokenUsage::new(2, 1)),
             ));
         }
-        let skill = if prompt == PROMPT {
-            "delegate"
-        } else {
-            "orders"
-        };
+        let skill = if prompt == PROMPT { "agents" } else { "orders" };
         let response = match request.messages.last().unwrap() {
-            Message::User(_) => {
+            Message::Developer(_) => {
                 ToolCall::new("load", "load_skill", json!({ "name": skill })).into()
             }
             Message::Tool(result) if result.call_id == "load".into() => match prompt.as_str() {
@@ -90,12 +86,12 @@ impl Provider for WorkflowProvider {
                     calls: vec![
                         dispatch(
                             "catalog",
-                            "delegate.catalog",
+                            "agents.spawn",
                             json!({ "task": "Read the price." }),
                         ),
                         dispatch(
                             "review",
-                            "delegate.review",
+                            "agents.spawn",
                             json!({ "task": "Record the review." }),
                         ),
                     ],
@@ -109,19 +105,43 @@ impl Provider for WorkflowProvider {
                 other => panic!("unexpected prompt {other}"),
             },
             Message::Tool(result) if prompt == PROMPT => {
-                assert_eq!(result.call_id, "review".into());
-                assert_eq!(
-                    result.value,
-                    json!({ "worker": "reviewer", "answer": "reviewed" })
-                );
-                let Message::Tool(catalog) = &request.messages[request.messages.len() - 2] else {
-                    panic!("the catalog result must survive");
+                let child = |call: &str| {
+                    request
+                        .messages
+                        .iter()
+                        .find_map(|m| match m {
+                            Message::Tool(r) if r.call_id.as_str() == call => {
+                                r.value["agent_id"].as_i64()
+                            }
+                            _ => None,
+                        })
+                        .unwrap()
                 };
-                assert_eq!(
-                    catalog.value,
-                    json!({ "worker": "catalog", "answer": "350 cents" })
-                );
-                ModelResponse::Final(FINAL_ANSWER.into())
+                match result.call_id.as_str() {
+                    "review" => {
+                        ToolCall::new("mail", "load_skill", json!({"name":"mailbox"})).into()
+                    }
+                    "mail" => dispatch(
+                        "price",
+                        "mailbox.receive",
+                        json!({"completion_only":true,"from_agent_id":child("catalog")}),
+                    )
+                    .into(),
+                    "price" => {
+                        assert_eq!(result.value["payload"]["answer"], "350 cents");
+                        dispatch(
+                            "receipt",
+                            "mailbox.receive",
+                            json!({"completion_only":true,"from_agent_id":child("review")}),
+                        )
+                        .into()
+                    }
+                    "receipt" => {
+                        assert_eq!(result.value["payload"]["answer"], "reviewed");
+                        ModelResponse::Final(FINAL_ANSWER.into())
+                    }
+                    other => panic!("unexpected coordinator result {other}"),
+                }
             }
             Message::Tool(result) => {
                 assert_eq!(result.call_id, "work".into());
@@ -135,14 +155,14 @@ impl Provider for WorkflowProvider {
 
 fn mailbox_response(message: &Message) -> ModelResponse {
     match message {
-        Message::User(_) => {
-            ToolCall::new("load", "load_skill", json!({ "name": "mailbox" })).into()
+        Message::Developer(_) => {
+            ToolCall::new("load", "load_skill", json!({ "name": "notices" })).into()
         }
         Message::Tool(result) if result.call_id == "load".into() => {
-            dispatch("timer", "mailbox.wait", json!({ "seconds": 0 })).into()
+            dispatch("timer", "notices.wait", json!({ "seconds": 0 })).into()
         }
         Message::Tool(result) if result.call_id == "timer".into() => {
-            dispatch("first", "mailbox.receive", json!({})).into()
+            dispatch("first", "notices.receive", json!({})).into()
         }
         Message::Tool(result) if result.call_id == "first".into() => {
             assert_eq!(
@@ -150,7 +170,7 @@ fn mailbox_response(message: &Message) -> ModelResponse {
                 json!({"status": "queued before waiting"})
             );
             assert_eq!(result.value.get("from_agent_id"), Some(&Value::Null));
-            dispatch("second", "mailbox.receive", json!({})).into()
+            dispatch("second", "notices.receive", json!({})).into()
         }
         Message::Tool(result) => {
             assert_eq!(result.call_id, "second".into());
@@ -167,12 +187,16 @@ fn mailbox_response(message: &Message) -> ModelResponse {
 
 fn mcp_response(message: &Message) -> ModelResponse {
     match message {
-        Message::User(_) => {
+        Message::Developer(_) => {
             ToolCall::new("load", "load_skill", json!({ "name": "catalog" })).into()
         }
         Message::Tool(result) if result.call_id == "load".into() => {
             let tools = result.value["tools"].as_array().unwrap();
-            assert_eq!(tools.len(), 1, "grants must hide private MCP tools");
+            assert_eq!(
+                tools.len(),
+                1,
+                "only configured MCP tools should be exposed"
+            );
             assert_eq!(tools[0]["name"], "catalog.lookup_price");
             assert_eq!(
                 tools[0]["description"],
@@ -357,34 +381,12 @@ async fn http_workflow_survives_daemon_restart() {
             "state_directory": "state",
             "bind": "127.0.0.1:0",
             "max_concurrent": 1,
-            "skills": {
-                "delegate": {
-                    "description": "Delegate work",
-                    "tools": [
-                        { "kind": "delegate", "name": "catalog", "description": "Read price", "agent": "catalog" },
-                        { "kind": "delegate", "name": "review", "description": "Review order", "agent": "reviewer" }
-                    ]
-                }
-            },
-            "agents": {
-                "coordinator": {
-                    "model": "scripted-workflow-provider", "max_model_turns": 5, "token_budget": 19,
-                    "skills": ["delegate"], "tool_grants": { "delegate.catalog": "allow", "delegate.review": "allow" }
-                },
-                "catalog": {
-                    "model": "scripted-workflow-provider", "max_model_turns": 4, "token_budget": 10,
-                    "skills": ["orders"], "tool_grants": { "orders.lookup": "allow" }
-                },
-                "reviewer": {
-                    "model": "scripted-workflow-provider", "max_model_turns": 4, "token_budget": 13,
-                    "skills": ["orders"], "tool_grants": { "orders.review": "require_approval" }
-                },
-                "no_budget": { "model": "scripted-workflow-provider", "max_model_turns": 1, "token_budget": 0 }
-            }
+            "defaults": {"model":"scripted-workflow-provider","max_model_turns":12,"token_budget":40,
+                "tool_grants":{"orders.review":"require_approval"}}
         }).to_string()).unwrap();
 
         let client = Client::builder().no_proxy().build().unwrap();
-        let request = json!({ "chat_id": wakefold::ChatId::from_u128(1), "run_key": "check", "agent": "coordinator", "prompt": PROMPT });
+        let request = json!({ "chat_id": wakefold::ChatId::from_u128(1), "run_key": "check", "prompt": PROMPT });
         let (daemon, address) = launch(&config, ORDER_TEST).await;
         let response = client.post(format!("http://{address}/runs")).json(&request).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -397,7 +399,7 @@ async fn http_workflow_survives_daemon_restart() {
             assert_eq!(event["sequence"], after + 1);
             after += 1;
             if event["event"]["kind"] == "wait_started"
-                && event["event"]["data"]["on"]["Delegation"]["worker"] == "reviewer"
+                && event["event"]["data"]["on"].get("ChildOutcome").is_some()
             {
                 break;
             }
@@ -425,7 +427,7 @@ async fn http_workflow_survives_daemon_restart() {
         // Kill the serving process with a WebSocket open and the review still pending.
         drop(daemon);
         drop(socket);
-        let (_daemon, address) = launch(&config, ORDER_TEST).await;
+        let (daemon, address) = launch(&config, ORDER_TEST).await;
         assert_eq!(approvals(&client, address).await, pending);
         let retry = client.post(format!("http://{address}/runs")).json(&request).send().await.unwrap();
         assert_eq!(retry.status(), StatusCode::ACCEPTED);
@@ -455,12 +457,11 @@ async fn http_workflow_survives_daemon_restart() {
         let worker_finished = events.iter().position(|frame| frame["agent_id"] == review_id
             && frame["event"]["kind"] == "run_finished" && frame["event"]["data"] == "reviewed").unwrap();
         let worker_result = events.iter().position(|frame| frame["agent_id"] == id
-            && frame["event"]["kind"] == "woken" && frame["event"]["data"]["payload"]
-                == json!({ "worker": "reviewer", "answer": "reviewed" })).unwrap();
+            && frame["event"]["kind"] == "woken" && frame["event"]["data"]["payload"]["payload"]["answer"] == "reviewed").unwrap();
         let coordinator_finished = events.iter().position(|frame| frame["agent_id"] == id
             && frame["event"]["kind"] == "run_finished" && frame["event"]["data"] == FINAL_ANSWER).unwrap();
         assert!(approval_requested < approval_granted && approval_granted < worker_finished
-            && worker_finished < worker_result && worker_result < coordinator_finished);
+            && worker_result < coordinator_finished);
         let log = std::fs::read_to_string(directory.path().join("daemon.jsonl")).unwrap();
         let logs: Vec<Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         for frame in &events {
@@ -479,12 +480,18 @@ async fn http_workflow_survives_daemon_restart() {
             .json(&json!({"approved": true})).send().await.unwrap();
         assert_eq!(repeated.status(), StatusCode::NOT_FOUND);
 
+        drop(daemon);
+        let mut settings: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        settings["defaults"]["token_budget"] = json!(0);
+        std::fs::write(&config, settings.to_string()).unwrap();
+        let (_daemon, address) = launch(&config, ORDER_TEST).await;
         let no_budget: Value = client.post(format!("http://{address}/runs"))
-            .json(&json!({"chat_id": wakefold::ChatId::from_u128(1), "run_key": "blocked", "agent": "no_budget", "prompt": "Must not start"}))
+            .json(&json!({"chat_id": wakefold::ChatId::from_u128(1), "run_key": "blocked", "prompt": "Must not start"}))
             .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
         let id = no_budget["agent_id"].as_i64().unwrap();
         let (mut socket, _) = connect_async(format!("ws://{address}/runs/{id}/events")).await.unwrap();
         assert_eq!(next_event(&mut socket).await["event"]["kind"], "run_started");
+        assert_eq!(next_event(&mut socket).await["event"]["kind"], "startup_context");
         let failure = next_event(&mut socket).await;
         assert_eq!(failure["event"]["kind"], "run_failed");
         assert!(failure["event"]["data"].as_str().unwrap().contains("token budget"));
@@ -504,27 +511,16 @@ async fn http_messages_survive_daemon_restart() {
             "state_directory": "state",
             "bind": "127.0.0.1:0",
             "skills": {
-                "mailbox": {
-                    "description": "Receive a message after approval",
-                    "tools": [
-                        { "kind": "timer_wait" },
-                        { "kind": "wait_for_message" }
-                    ]
-                }
+                "notices": {"description":"Wait for a notice", "tools":[{"kind":"timer_wait"},{"kind":"wait_for_message"}]}
             },
-            "agents": {
-                "receiver": {
-                    "model": "scripted-workflow-provider", "max_model_turns": 6, "token_budget": 30,
-                    "skills": ["mailbox"],
-                    "tool_grants": { "mailbox.wait": "require_approval", "mailbox.receive": "allow" }
-                }
-            }
+            "defaults": {"model":"scripted-workflow-provider","max_model_turns":6,"token_budget":30,
+                "tool_grants":{"notices.wait":"require_approval"}}
         }).to_string()).unwrap();
 
         let client = Client::builder().no_proxy().build().unwrap();
         let (daemon, address) = launch(&config, MAILBOX_TEST).await;
         let response = client.post(format!("http://{address}/runs")).json(&json!({
-            "chat_id": wakefold::ChatId::from_u128(2), "run_key": "mailbox-check", "agent": "receiver", "prompt": MAILBOX_PROMPT
+            "chat_id": wakefold::ChatId::from_u128(2), "run_key": "mailbox-check", "prompt": MAILBOX_PROMPT
         })).send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
         let agent_id = response["agent_id"].as_i64().unwrap();
         let pending = loop {
@@ -536,7 +532,7 @@ async fn http_messages_survive_daemon_restart() {
         };
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["agent_id"], agent_id);
-        assert_eq!(pending[0]["wait"]["on"]["ToolApproval"]["tool_name"], "mailbox.wait");
+        assert_eq!(pending[0]["wait"]["on"]["ToolApproval"]["tool_name"], "notices.wait");
         let wait = pending[0]["wait"]["id"].as_str().unwrap();
 
         // The approval guarantees there is no mailbox wait yet.
@@ -637,23 +633,18 @@ async fn mcp_tool_works_after_daemon_restart() {
                 "catalog": {
                     "description": "Read the catalog",
                     "tools": [
-                        { "kind": "mcp", "server": "inventory", "tool": "lookup.price", "name": "lookup_price" },
-                        { "kind": "mcp", "server": "inventory", "tool": "private_notes" }
+                        { "kind": "mcp", "server": "inventory", "tool": "lookup.price", "name": "lookup_price" }
                     ]
                 }
             },
-            "agents": {
-                "assistant": {
-                    "model": "scripted-workflow-provider", "max_model_turns": 5, "token_budget": 30,
-                    "skills": ["catalog"], "tool_grants": { "catalog.lookup_price": "require_approval" }
-                }
-            }
+            "defaults": {"model":"scripted-workflow-provider","max_model_turns":5,"token_budget":30,
+                "tool_grants":{"catalog.lookup_price":"require_approval"}}
         }).to_string()).unwrap();
         let calls_path = directory.path().join("catalog-calls.jsonl");
         let client = Client::builder().no_proxy().build().unwrap();
         let (daemon, address) = launch(&config, MCP_TEST).await;
         let response = client.post(format!("http://{address}/runs")).json(&json!({
-            "chat_id": wakefold::ChatId::from_u128(3), "run_key": "prices", "agent": "assistant", "prompt": MCP_PROMPT
+            "chat_id": wakefold::ChatId::from_u128(3), "run_key": "prices", "prompt": MCP_PROMPT
         })).send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
         let agent_id = response["agent_id"].as_i64().unwrap();
         let first = next_approval(&client, address, "").await;

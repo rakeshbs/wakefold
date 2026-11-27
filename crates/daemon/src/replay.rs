@@ -1,12 +1,11 @@
-//! Inspection of saved run journals in causal order.
+//! Inspection of saved run journals grouped by agent.
 
-use std::collections::HashSet;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
 use serde::Serialize;
-use wakefold::{JournalReplay, RunEvent, WaitOn};
+use wakefold::{JournalReplay, RunEvent};
 
 use crate::DaemonError;
 
@@ -25,44 +24,30 @@ pub(crate) fn write(
     mut output: impl Write,
 ) -> Result<(), DaemonError> {
     let journal = JournalReplay::open(state)?;
-    let mut runs = vec![(agent_id, 0)];
-    let mut seen = HashSet::from([agent_id]);
-    while let Some((agent_id, after)) = runs.pop() {
-        let page = journal
-            .run_event_page(agent_id, after, PAGE_SIZE)?
-            .ok_or_else(|| format!("unknown run {agent_id}"))?;
-        let mut next_page = page
-            .entries
-            .last()
-            .filter(|_| page.entries.len() == PAGE_SIZE.get())
-            .map(|entry| entry.sequence);
-        for entry in page.entries {
-            serde_json::to_writer(
-                &mut output,
-                &ReplayEvent {
-                    agent_id,
-                    sequence: entry.sequence,
-                    event: &entry.event,
-                },
-            )?;
-            output.write_all(b"\n")?;
-            if let RunEvent::WaitStarted(wait) = &entry.event
-                && matches!(wait.on, WaitOn::Delegation { .. })
-            {
-                let child = journal
-                    .worker_id(agent_id, &wait.id)?
-                    .filter(|&child| seen.insert(child))
-                    .ok_or_else(|| format!("invalid worker link for delegation {}", wait.id))?;
-                // The parent's result depends on this worker. Read the
-                // worker before continuing at the parent's next event.
-                runs.push((agent_id, entry.sequence));
-                runs.push((child, 0));
-                next_page = None;
+    let mut runs = vec![agent_id];
+    runs.extend(journal.child_ids(agent_id)?);
+    for agent_id in runs {
+        let mut after = 0;
+        loop {
+            let page = journal
+                .run_event_page(agent_id, after, PAGE_SIZE)?
+                .ok_or_else(|| format!("unknown run {agent_id}"))?;
+            let count = page.entries.len();
+            for entry in page.entries {
+                serde_json::to_writer(
+                    &mut output,
+                    &ReplayEvent {
+                        agent_id,
+                        sequence: entry.sequence,
+                        event: &entry.event,
+                    },
+                )?;
+                output.write_all(b"\n")?;
+                after = entry.sequence;
+            }
+            if count < PAGE_SIZE.get() {
                 break;
             }
-        }
-        if let Some(after) = next_page {
-            runs.push((agent_id, after));
         }
     }
     Ok(())

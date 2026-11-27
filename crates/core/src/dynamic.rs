@@ -7,22 +7,31 @@ use async_trait::async_trait;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use thiserror::Error;
 
 use crate::journal::JournalTransaction;
 use crate::{
-    ChatId, JournalError, JsonValue, QueueRunError, RunEvent, Tool, ToolContext, ToolError,
-    ToolGrant, ToolOutput, ToolRecovery, ToolSpec, WorkspaceStore,
+    ChatId, JournalError, JsonValue, RunEvent, Tool, ToolContext, ToolError, ToolGrant, ToolOutput,
+    ToolRecovery, ToolSpec, WorkspaceStore,
 };
 
-pub(crate) const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS chat_time_zones (
-        chat_id BLOB PRIMARY KEY REFERENCES chats(chat_id), zone TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS dynamic_runs (
-        agent_id INTEGER PRIMARY KEY REFERENCES workspace_runs(agent_id),
-        parent_agent_id INTEGER REFERENCES workspace_runs(agent_id),
-        settings TEXT NOT NULL
-    );";
+/// A failure to admit a run to the scheduler.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum QueueRunError {
+    /// The chat ID and run key belong to a different request.
+    #[error("this chat ID and run key already belong to a different request")]
+    Conflict,
+    /// The journal could not save or verify the request.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+}
+
+impl From<rusqlite::Error> for QueueRunError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Journal(error.into())
+    }
+}
 
 /// Resolved configuration saved when admitting a root and inherited by its children.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -54,13 +63,17 @@ impl WorkspaceStore {
     ) -> Result<i64, QueueRunError> {
         let tx = JournalTransaction::begin(&mut self.connection)?;
         let id = crate::workspace::reserve_run(tx.sql(), chat_id, run_key)?;
-        let previous: Option<(String, bool)> = tx.sql().query_row(
-            "SELECT event_json, EXISTS(SELECT 1 FROM dynamic_runs WHERE agent_id = ?1 AND parent_agent_id IS NULL)
-             FROM run_events WHERE agent_id = ?1 AND sequence = 1",
-            [id], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
+        let previous: Option<(String, bool)> = tx
+            .sql()
+            .query_row(
+                "SELECT event_json, parent_agent_id IS NULL AND settings_json IS NOT NULL
+             FROM agent_runs JOIN run_events USING(agent_id) WHERE agent_id = ?1 AND sequence = 1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         tx.sql().execute(
-            "INSERT OR IGNORE INTO chat_time_zones VALUES (?1, ?2)",
+            "UPDATE chats SET time_zone = ?2 WHERE chat_id = ?1 AND time_zone IS NULL",
             params![chat_id, time_zone.unwrap_or(chrono_tz::UTC).name()],
         )?;
         let zone = zone_for_run(&tx, id)?;
@@ -83,10 +96,8 @@ impl WorkspaceStore {
     /// Settings for dynamic runs that may still need a provider after restart.
     pub fn active_agent_settings(&self) -> Result<Vec<AgentSettings>, JournalError> {
         let mut stmt = self.connection.prepare(
-            "SELECT DISTINCT settings FROM dynamic_runs d WHERE NOT EXISTS (
-                SELECT 1 FROM run_events e WHERE e.agent_id = d.agent_id
-                AND json_extract(event_json, '$.kind') IN ('run_finished', 'run_failed')
-            )",
+            "SELECT DISTINCT settings_json FROM agent_runs WHERE settings_json IS NOT NULL
+             AND status IN ('runnable','waiting')",
         )?;
         stmt.query_map([], |r| r.get::<_, String>(0))?
             .map(|s| Ok(serde_json::from_str(&s?)?))
@@ -96,14 +107,12 @@ impl WorkspaceStore {
     /// List run identities, their parents, tasks and latest journal event in a chat.
     pub fn chat_runs(&self, chat: ChatId) -> Result<Vec<JsonValue>, JournalError> {
         let mut query = self.connection.prepare(
-            "SELECT wr.agent_id, COALESCE(s.parent_agent_id, d.parent_agent_id), wr.run_key,
+            "SELECT wr.agent_id, wr.parent_agent_id, wr.run_key, wr.status,
                     json_extract(first.event_json, '$.data'),
                     (SELECT json_extract(event_json, '$.kind') FROM run_events e
                      WHERE e.agent_id = wr.agent_id ORDER BY sequence DESC LIMIT 1)
-             FROM workspace_runs wr
+             FROM agent_runs wr
              JOIN run_events first ON first.agent_id = wr.agent_id AND first.sequence = 1
-             LEFT JOIN dynamic_runs s ON s.agent_id = wr.agent_id
-             LEFT JOIN delegated_runs d ON d.child_agent_id = wr.agent_id
              WHERE chat_id = ?1 ORDER BY wr.agent_id",
         )?;
         let rows = query.query_map([chat], |row| {
@@ -111,8 +120,9 @@ impl WorkspaceStore {
                 "agent_id": row.get::<_, i64>(0)?,
                 "parent_agent_id": row.get::<_, Option<i64>>(1)?,
                 "run_key": row.get::<_, String>(2)?,
-                "task": row.get::<_, String>(3)?,
-                "latest_event": row.get::<_, String>(4)?,
+                "status": row.get::<_, String>(3)?,
+                "task": row.get::<_, String>(4)?,
+                "latest_event": row.get::<_, String>(5)?,
             }))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -121,7 +131,7 @@ impl WorkspaceStore {
 
 fn zone_for_run(tx: &JournalTransaction<'_>, id: i64) -> Result<chrono_tz::Tz, JournalError> {
     let zone: String = tx.sql().query_row(
-        "SELECT zone FROM chat_time_zones JOIN workspace_runs USING(chat_id) WHERE agent_id=?1",
+        "SELECT time_zone FROM chats JOIN agent_runs USING(chat_id) WHERE agent_id=?1",
         [id],
         |r| r.get(0),
     )?;
@@ -138,12 +148,8 @@ fn admit(
     zone: chrono_tz::Tz,
 ) -> Result<(), JournalError> {
     tx.sql().execute(
-        "INSERT INTO dynamic_runs VALUES (?1,?2,?3)",
+        "UPDATE agent_runs SET parent_agent_id=?2, settings_json=?3 WHERE agent_id=?1",
         params![id, parent, serde_json::to_string(settings)?],
-    )?;
-    tx.sql().execute(
-        "INSERT INTO queued_runs(agent_id,agent_name) VALUES (?1,'shared')",
-        [id],
     )?;
     let mut instructions = settings.instructions.clone();
     instructions.push_str("\nAvailable skills:");
@@ -180,15 +186,15 @@ pub(crate) fn spawn(
     let saved: String = tx
         .sql()
         .query_row(
-            "SELECT settings FROM dynamic_runs WHERE agent_id=?1 AND parent_agent_id IS NULL",
+            "SELECT settings_json FROM agent_runs WHERE agent_id=?1 AND settings_json IS NOT NULL AND parent_agent_id IS NULL",
             [parent],
             |r| r.get(0),
         )
         .optional()?
         .ok_or(JournalError::InvalidWait("only a root agent can spawn"))?;
     let child = tx.sql().query_row(
-        "INSERT INTO workspace_runs(chat_id, run_key)
-         SELECT chat_id, ?2 FROM workspace_runs WHERE agent_id = ?1 RETURNING agent_id",
+        "INSERT INTO agent_runs(chat_id, run_key)
+         SELECT chat_id, ?2 FROM agent_runs WHERE agent_id = ?1 RETURNING agent_id",
         params![parent, key],
         |row| row.get(0),
     )?;
@@ -209,7 +215,7 @@ pub(crate) fn finish(
     result: Result<&str, &str>,
 ) -> Result<(), JournalError> {
     let parent: Option<i64> = tx.sql().query_row(
-        "SELECT parent_agent_id FROM dynamic_runs WHERE agent_id = ?1 AND parent_agent_id IS NOT NULL",
+        "SELECT parent_agent_id FROM agent_runs WHERE agent_id = ?1 AND parent_agent_id IS NOT NULL",
         [child], |row| row.get(0),
     ).optional()?;
     if let Some(parent) = parent {
@@ -222,6 +228,7 @@ pub(crate) fn finish(
             &format!("outcome-{child}"),
             child,
             parent,
+            crate::mailbox::MessageKind::ChildOutcome,
             &payload,
         )?;
     }

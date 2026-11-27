@@ -20,25 +20,6 @@ use crate::{
 
 const FILE_DIRECTORY: &str = "artifact-files";
 
-pub(crate) const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS artifacts (
-        id INTEGER PRIMARY KEY,
-        chat_id BLOB NOT NULL REFERENCES chats(chat_id)
-    );
-    CREATE INDEX IF NOT EXISTS artifacts_by_chat ON artifacts(chat_id, id);
-    CREATE TABLE IF NOT EXISTS artifact_revisions (
-        artifact_id INTEGER NOT NULL REFERENCES artifacts(id),
-        revision INTEGER NOT NULL CHECK(revision > 0),
-        title TEXT NOT NULL,
-        filename TEXT NOT NULL,
-        media_type TEXT NOT NULL,
-        size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
-        agent_id INTEGER NOT NULL REFERENCES workspace_runs(agent_id),
-        tool_call_key TEXT NOT NULL,
-        PRIMARY KEY (artifact_id, revision),
-        UNIQUE (agent_id, tool_call_key)
-    ) WITHOUT ROWID;";
-
 /// The metadata of a single published revision.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
@@ -182,8 +163,8 @@ impl ArtifactPublication {
         if let Some(artifact_id) = self.artifact_id {
             let exists: bool = connection.query_row(
                 "SELECT EXISTS(
-                    SELECT 1 FROM artifacts a JOIN workspace_runs r USING (chat_id)
-                    WHERE a.id = ?1 AND r.agent_id = ?2
+                    SELECT 1 FROM artifacts a JOIN agent_runs r USING (chat_id)
+                    WHERE a.artifact_id = ?1 AND r.agent_id = ?2
                  )",
                 params![artifact_id, agent_id],
                 |row| row.get(0),
@@ -316,7 +297,7 @@ impl SavedArtifact {
             }
             None => connection.query_row(
                 "INSERT INTO artifacts(chat_id)
-                 SELECT chat_id FROM workspace_runs WHERE agent_id = ?1 RETURNING id",
+                 SELECT chat_id FROM agent_runs WHERE agent_id = ?1 RETURNING artifact_id",
                 [agent_id],
                 |row| row.get(0),
             )?,
@@ -327,10 +308,10 @@ impl SavedArtifact {
             .to_owned();
         let revision = connection.query_row(
             "INSERT INTO artifact_revisions
-                (artifact_id, revision, title, filename, media_type, size_bytes, agent_id, tool_call_key)
+                (artifact_id, revision, title, filename, media_type, size_bytes, published_by_agent_id, tool_call_key, chat_id)
              VALUES (
                 ?1, (SELECT COALESCE(MAX(revision), 0) + 1 FROM artifact_revisions WHERE artifact_id = ?1),
-                ?2, ?3, ?4, ?5, ?6, ?7
+                ?2, ?3, ?4, ?5, ?6, ?7, (SELECT chat_id FROM agent_runs WHERE agent_id=?6)
              ) RETURNING revision",
             params![
                 artifact_id, publication.title, filename, media_type, size_bytes, agent_id, tool_call_key
@@ -370,13 +351,13 @@ impl WorkspaceStore {
     /// Returns an error if the artifact catalog could not be read.
     pub fn artifacts(&self, chat_id: ChatId) -> Result<Vec<ArtifactRevision>, ArtifactError> {
         let mut statement = self.connection.prepare_cached(
-            "SELECT a.id, r.revision, r.title, r.filename, r.media_type, r.size_bytes, r.agent_id
+            "SELECT a.artifact_id, r.revision, r.title, r.filename, r.media_type, r.size_bytes, r.published_by_agent_id
              FROM artifacts a
-             JOIN artifact_revisions r ON r.artifact_id = a.id
+             JOIN artifact_revisions r ON r.artifact_id = a.artifact_id
              WHERE a.chat_id = ?1 AND r.revision = (
-                SELECT MAX(revision) FROM artifact_revisions WHERE artifact_id = a.id
+                SELECT MAX(revision) FROM artifact_revisions WHERE artifact_id = a.artifact_id
              )
-             ORDER BY a.id",
+             ORDER BY a.artifact_id",
         )?;
         let rows = statement.query_map([chat_id], read_revision)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -398,10 +379,10 @@ impl WorkspaceStore {
             return Ok(None);
         };
         let publication = self.connection.query_row(
-            "SELECT a.id, r.revision, r.title, r.filename, r.media_type, r.size_bytes, r.agent_id,
+            "SELECT a.artifact_id, r.revision, r.title, r.filename, r.media_type, r.size_bytes, r.published_by_agent_id,
                     r.tool_call_key
-             FROM artifact_revisions r JOIN artifacts a ON a.id = r.artifact_id
-             WHERE a.chat_id = ?1 AND a.id = ?2 AND r.revision = ?3",
+             FROM artifact_revisions r JOIN artifacts a ON a.artifact_id = r.artifact_id
+             WHERE a.chat_id = ?1 AND a.artifact_id = ?2 AND r.revision = ?3",
             params![chat_id, artifact_id, revision],
             |row| Ok((read_revision(row)?, row.get::<_, String>(7)?)),
         ).optional()?;

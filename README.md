@@ -12,10 +12,10 @@ use it in their first run request. Wakefold stores the chat's working files in
 `workspaces/<chat_id>/agents/<agent_id>/` under the daemon's state directory.
 The same IDs reopen the workspace after a restart.
 
-On upgrade from the numeric workspace layout, Wakefold moves existing chat
-folders to UUID paths and saves the previous keys and their UUIDs in
-`chat-id-migration.json` in the state directory. Use the mapped UUID as
-`chat_id` in requests for an existing chat.
+The runtime uses the [seven-table SQLite schema](crates/core/src/workspace/schema.sql).
+When upgrading from the previous schema, start with an empty state directory.
+Replace named worker definitions with shared `defaults` and use `agents.spawn`
+for delegation.
 
 ## Dynamic agents
 
@@ -57,7 +57,7 @@ for the next page. The existing events WebSocket streams each run's journal.
 
 ## Artifacts
 
-Enable the built-in `artifacts` skill for an agent and grant `artifacts.publish` with `allow` or `require_approval`. The tool publishes an existing file by title and chat-relative `path`. Pass its returned `artifact_id` with a later publication to add a revision.
+Agents can load the built-in `artifacts` skill. Set `artifacts.publish` to `require_approval` in the shared tool grants if publication needs approval. The tool publishes an existing file by title and chat-relative `path`. Pass its returned `artifact_id` with a later publication to add a revision.
 
 - `GET /artifacts?chat_id=…` lists each artifact's latest revision.
 - `GET /artifacts/{artifact_id}/revisions/{revision}?chat_id=…` downloads that exact revision.
@@ -96,8 +96,8 @@ On Linux, use `"backend": { "kind": "bubblewrap" }`. The Apple backend also
 accepts an `executable` path and a `vm_memory_mib` cap for the entire chat VM.
 The defaults are `container` on PATH and 1024 MiB.
 
-Add a `sandbox_command` tool to a skill using the same agent skill list and
-tool grants as other tools. The daemon sends the model's JSON arguments on
+Add a `sandbox_command` tool to a configured skill. Its approval rule goes
+in `defaults.tool_grants`. The daemon sends the model's JSON arguments on
 stdin and expects one JSON value on stdout. Tool commands run with their
 agent's folder as the working directory.
 

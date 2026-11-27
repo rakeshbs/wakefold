@@ -20,16 +20,6 @@ use crate::{
 mod write;
 pub(crate) use write::JournalTransaction;
 
-pub(crate) const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS run_events (
-        agent_id INTEGER NOT NULL REFERENCES workspace_runs(agent_id),
-        sequence INTEGER NOT NULL CHECK(sequence > 0),
-        event_json TEXT NOT NULL,
-        PRIMARY KEY (agent_id, sequence)
-    ) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS run_compactions ON run_events(agent_id, sequence)
-    WHERE json_extract(event_json, '$.kind') = 'compacted';";
-
 /// A completed storage boundary in the life of one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
@@ -343,7 +333,7 @@ impl<'a> RunJournal<'a> {
             return Ok(false);
         };
         let suspended: bool = tx.sql().query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_waits WHERE agent_id = ?1 AND resolved = 0)",
+            "SELECT EXISTS(SELECT 1 FROM run_waits WHERE agent_id = ?1)",
             [id],
             |row| row.get(0),
         )?;
@@ -416,25 +406,14 @@ impl JournalReplay {
         read_run_page(&self.connection, agent_id, after, limit)
     }
 
-    /// Find the worker run linked to a parent's delegation wait.
-    ///
-    /// # Errors
-    ///
-    /// Returns a journal error if the relationship cannot be read.
-    pub fn worker_id(
-        &self,
-        parent_agent_id: i64,
-        wait_id: &str,
-    ) -> Result<Option<i64>, JournalError> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT child_agent_id FROM delegated_runs
-             WHERE parent_agent_id = ?1 AND parent_wait_id = ?2",
-                params![parent_agent_id, wait_id],
-                |row| row.get(0),
-            )
-            .optional()?)
+    /// List children in creation order in this replay snapshot.
+    pub fn child_ids(&self, parent: i64) -> Result<Vec<i64>, JournalError> {
+        let mut stmt = self.connection.prepare(
+            "SELECT agent_id FROM agent_runs WHERE parent_agent_id=?1 ORDER BY agent_id",
+        )?;
+        Ok(stmt
+            .query_map([parent], |r| r.get(0))?
+            .collect::<Result<_, _>>()?)
     }
 }
 

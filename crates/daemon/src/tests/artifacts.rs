@@ -73,15 +73,15 @@ impl Provider for ArtifactProvider {
         &self,
         request: ModelRequest<'_>,
     ) -> Result<ModelResponse, ProviderError> {
-        let Message::User(prompt) = &request.messages[0] else {
+        let Message::User(prompt) = &request.messages[1] else {
             panic!("expected a user prompt");
         };
         let draft = matches!(prompt.as_str(), FIRST_TASK | SECOND_TASK);
         let load = |name: &str| ToolCall::new("load", "load_skill", json!({ "name": name }));
         let response = match request.messages.last().unwrap() {
-            Message::User(_) => load(if draft { "drafts" } else { "delegate" }).into(),
+            Message::Developer(_) => load(if draft { "drafts" } else { "agents" }).into(),
             Message::Tool(result) => {
-                let work = |id, task| dispatch(id, "delegate.report", json!({ "task": task }));
+                let work = |id, task| dispatch(id, "agents.spawn", json!({ "task": task }));
                 match result.call_id.to_string().as_str() {
                     "load" if draft => dispatch(
                         "write",
@@ -91,7 +91,16 @@ impl Provider for ArtifactProvider {
                     .into(),
                     "write" => ModelResponse::Final(result.value.as_str().unwrap().into()),
                     "load" => work("first_draft", FIRST_TASK).into(),
-                    "first_draft" => ToolCall::new(
+                    "first_draft" => {
+                        ToolCall::new("mail", "load_skill", json!({"name":"mailbox"})).into()
+                    }
+                    "mail" => dispatch(
+                        "first_result",
+                        "mailbox.receive",
+                        json!({"completion_only":true}),
+                    )
+                    .into(),
+                    "first_result" => ToolCall::new(
                         "load_artifacts",
                         "load_skill",
                         json!({ "name": "artifacts" }),
@@ -104,7 +113,7 @@ impl Provider for ArtifactProvider {
                             "artifacts.publish",
                             json!({
                                 "title": "Weekly inventory",
-                                "path": tool_result(&request, "first_draft")["answer"],
+                                "path": tool_result(&request, "first_result")["payload"]["answer"],
                             }),
                         )
                         .into()
@@ -114,11 +123,17 @@ impl Provider for ArtifactProvider {
                         work("second_draft", SECOND_TASK).into()
                     }
                     "second_draft" => dispatch(
+                        "second_result",
+                        "mailbox.receive",
+                        json!({"completion_only":true}),
+                    )
+                    .into(),
+                    "second_result" => dispatch(
                         "second_publish",
                         "artifacts.publish",
                         json!({
                             "title": "Weekly inventory",
-                            "path": result.value["answer"],
+                            "path": result.value["payload"]["answer"],
                             "artifact_id": tool_result(&request, "first_publish")["artifact_id"],
                         }),
                     )
@@ -250,51 +265,55 @@ async fn artifact_publication_survives_daemon_crash() {
         let root = directory.path();
         let config = root.join("wakefold.json");
         fs::write(root.join(STOP_AFTER_COPY), "").unwrap();
-        fs::write(&config, json!({
-            "state_directory": "state",
-            "bind": "127.0.0.1:0",
-            "skills": {
-                "delegate": {
-                    "description": "Ask the analyst to write a report",
-                    "tools": [{"kind": "delegate", "name": "report", "description": "Write a report", "agent": "analyst"}]
-                }
-            },
-            "agents": {
-                "coordinator": {
-                    "model": "scripted", "max_model_turns": 10, "token_budget": 100,
-                    "skills": ["delegate", "artifacts"],
-                    "tool_grants": {"delegate.report": "allow", "artifacts.publish": "require_approval"}
-                },
-                "analyst": {
-                    "model": "scripted", "max_model_turns": 4, "token_budget": 100,
-                    "skills": ["drafts"], "tool_grants": {"drafts.write": "allow"}
-                }
-            }
-        }).to_string()).unwrap();
+        fs::write(
+            &config,
+            json!({
+                "state_directory": "state",
+                "bind": "127.0.0.1:0",
+                "defaults": {"model":"scripted","max_model_turns":16,"token_budget":100,
+                    "tool_grants":{"artifacts.publish":"require_approval"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let client = Client::builder().no_proxy().build().unwrap();
         let (child, address) = launch(&config, TEST).await;
-        let created = client.post(format!("http://{address}/chats"))
-            .send().await.unwrap();
+        let created = client
+            .post(format!("http://{address}/chats"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
         let created: Value = created.json().await.unwrap();
         let chat_id: wakefold::ChatId = serde_json::from_value(created["chat_id"].clone()).unwrap();
         let other_chat = wakefold::ChatId::new_v4();
 
-        let invalid = client.post(format!("http://{address}/runs"))
+        let invalid = client
+            .post(format!("http://{address}/runs"))
             .json(&json!({
-                "chat_id": "../inventory", "run_key": "report", "agent": "coordinator",
+                "chat_id": "../inventory", "run_key": "report",
                 "prompt": "Publish two revisions of the inventory report."
             }))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-        let start: Value = client.post(format!("http://{address}/runs"))
+        let start: Value = client
+            .post(format!("http://{address}/runs"))
             .json(&json!({
-                "chat_id": chat_id, "run_key": "report", "agent": "coordinator",
+                "chat_id": chat_id, "run_key": "report",
                 "prompt": "Publish two revisions of the inventory report."
             }))
-            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         let run = start["agent_id"].as_i64().unwrap();
 
         let approval = next_approval(&client, address, "").await;
@@ -311,7 +330,10 @@ async fn artifact_publication_survives_daemon_crash() {
         while !root.join(COPY_READY).exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(catalog(&client, address, chat_id).await.is_empty(), "a saved file is visible only after publication commits");
+        assert!(
+            catalog(&client, address, chat_id).await.is_empty(),
+            "a saved file is visible only after publication commits"
+        );
         let workspace = root.join("state/workspaces").join(chat_id.to_string());
         assert_eq!(fs::read_to_string(workspace.join(path)).unwrap(), ORIGINAL);
         drop(child);
@@ -330,14 +352,27 @@ async fn artifact_publication_survives_daemon_crash() {
         let original = download(&client, address, chat_id, artifact_id, 1).await;
         assert_eq!(original.status(), StatusCode::OK);
         assert_eq!(original.headers()[header::CONTENT_TYPE], "text/csv");
-        assert_eq!(original.headers()[header::CONTENT_DISPOSITION], "attachment; filename*=UTF-8''inventory%20report%2Ecsv");
+        assert_eq!(
+            original.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename*=UTF-8''inventory%20report%2Ecsv"
+        );
         assert_eq!(original.text().await.unwrap(), ORIGINAL);
-        assert_eq!(download(&client, address, other_chat, artifact_id, 1).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            download(&client, address, other_chat, artifact_id, 1)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
         assert!(catalog(&client, address, other_chat).await.is_empty());
 
         let wait = &second["wait"];
-        assert_eq!(wait["on"]["ToolApproval"]["arguments"]["artifact_id"], artifact_id);
-        let (mut socket, _) = connect_async(format!("ws://{address}/runs/{run}/events")).await.unwrap();
+        assert_eq!(
+            wait["on"]["ToolApproval"]["arguments"]["artifact_id"],
+            artifact_id
+        );
+        let (mut socket, _) = connect_async(format!("ws://{address}/runs/{run}/events"))
+            .await
+            .unwrap();
         approve(&client, address, wait["id"].as_str().unwrap()).await;
         let mut revisions = Vec::new();
         let mut results = Vec::new();
@@ -346,7 +381,9 @@ async fn artifact_publication_survives_daemon_crash() {
             let event = &frame["event"];
             match event["kind"].as_str() {
                 Some("artifact_published") => revisions.push(event["data"].clone()),
-                Some("tool_call_completed") if event["data"]["value"]["artifact_id"] == artifact_id => {
+                Some("tool_call_completed")
+                    if event["data"]["value"]["artifact_id"] == artifact_id =>
+                {
                     results.push(event["data"]["value"].clone());
                 }
                 Some("run_finished") => {
@@ -358,14 +395,23 @@ async fn artifact_publication_survives_daemon_crash() {
             }
         }
         assert_eq!(revisions, results);
-        assert_eq!(revisions.len(), 2, "recovery must publish exactly one revision");
+        assert_eq!(
+            revisions.len(),
+            2,
+            "recovery must publish exactly one revision"
+        );
         assert_eq!(revisions[0], published[0]);
         assert_eq!(revisions[1]["artifact_id"], artifact_id);
         assert_eq!(revisions[1]["revision"], 2);
         assert_eq!(catalog(&client, address, chat_id).await, revisions[1..]);
         for (revision, expected) in [(1, ORIGINAL), (2, UPDATED)] {
             let response = download(&client, address, chat_id, artifact_id, revision).await;
-            assert_eq!(response.error_for_status().unwrap().text().await.unwrap(), expected);
+            assert_eq!(
+                response.error_for_status().unwrap().text().await.unwrap(),
+                expected
+            );
         }
-    }).await.expect("the artifact workflow must finish");
+    })
+    .await
+    .expect("the artifact workflow must finish");
 }
