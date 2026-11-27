@@ -25,12 +25,18 @@ try:
     can_unlink = True
 except OSError:
     can_unlink = False
+try:
+    (agents / "unexpected").mkdir()
+    can_create_peer = True
+except OSError:
+    can_create_peer = False
 print(json.dumps({
     "uid": os.getuid(),
     "cwd": os.getcwd(),
     "peer": peer.read_text(),
     "can_write": can_write,
     "can_unlink": can_unlink,
+    "can_create_peer": can_create_peer,
     "hidden": hidden.exists(),
     "other": other.exists(),
     "host_database": pathlib.Path(args["database"]).exists(),
@@ -53,6 +59,7 @@ async fn workspace_permissions_and_limits_survive_reuse() {
     let caller = store.open_run_workspace("chat", "caller").unwrap();
     let peer = store.open_run_workspace("chat", "shared").unwrap();
     let hidden = store.open_run_workspace("chat", "unshared").unwrap();
+    let restricted = store.open_run_workspace("chat", "restricted").unwrap();
     let other = store.open_run_workspace("other", "outside").unwrap();
     for (workspace, name) in [
         (&peer, "shared.txt"),
@@ -80,13 +87,13 @@ async fn workspace_permissions_and_limits_survive_reuse() {
     let config: Config = serde_json::from_value(json!({
         "backend": backend, "memory_mib": 96, "call_timeout_seconds": 2,
         "idle_seconds": 1,
-        "read_peers": {caller.agent_id().to_string(): [peer.agent_id()]},
+        "read_peers": {restricted.agent_id().to_string(): [peer.agent_id()]},
     }))
     .unwrap();
     let sandbox = Sandbox::new(config, state.path()).await.unwrap();
-    let probe_input = |output: &str| {
+    let probe_input = |output: &str, peer_id| {
         json!({
-            "peer": peer.agent_id(),
+            "peer": peer_id,
             "hidden": hidden.agent_id(),
             "other": other.agent_id(),
             "database": state.path().join("wakefold.sqlite3"),
@@ -94,7 +101,11 @@ async fn workspace_permissions_and_limits_survive_reuse() {
         })
     };
     let report = sandbox
-        .run(&caller, &python(PROBE), &probe_input("first.csv"))
+        .run(
+            &caller,
+            &python(PROBE),
+            &probe_input("first.csv", peer.agent_id()),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -103,10 +114,14 @@ async fn workspace_permissions_and_limits_survive_reuse() {
     );
     assert!(report["uid"].as_u64().unwrap() > 0);
     assert_eq!(report["peer"], "original");
+    assert_eq!(
+        report["hidden"], true,
+        "a peer needs no explicit read grant"
+    );
     for key in [
         "can_write",
         "can_unlink",
-        "hidden",
+        "can_create_peer",
         "other",
         "host_database",
         "host_credentials",
@@ -116,22 +131,43 @@ async fn workspace_permissions_and_limits_survive_reuse() {
     assert_eq!(report["interfaces"], json!(["lo"]));
     let slot = sandbox.agents.lock().await[&caller.agent_id()].clone();
     let first_pid = slot.lock().await.as_ref().unwrap().child.id();
+    let newcomer = store.open_run_workspace("chat", "newcomer").unwrap();
+    fs::write(
+        newcomer
+            .chat_root()
+            .join(newcomer.agent_relative_directory())
+            .join("shared.txt"),
+        "new peer",
+    )
+    .unwrap();
     let second = sandbox
-        .run(&caller, &python(PROBE), &probe_input("second.csv"))
-        .await
-        .unwrap();
-    assert_eq!(second, report);
-    assert_eq!(slot.lock().await.as_ref().unwrap().child.id(), first_pid);
-    let peer_uid = sandbox
         .run(
-            &peer,
-            &python("import json,os; print(json.dumps(os.getuid()))"),
-            &Value::Null,
+            &caller,
+            &python(PROBE),
+            &probe_input("second.csv", newcomer.agent_id()),
         )
         .await
         .unwrap();
+    let mut expected = report.clone();
+    expected["peer"] = json!("new peer");
+    assert_eq!(second, expected);
+    assert_eq!(slot.lock().await.as_ref().unwrap().child.id(), first_pid);
+    let restricted_report = sandbox
+        .run(
+            &restricted,
+            &python(PROBE),
+            &probe_input("restricted.csv", peer.agent_id()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restricted_report["peer"], "original");
+    assert_eq!(
+        restricted_report["hidden"], false,
+        "an explicit allowlist limits peer access"
+    );
+    assert_eq!(restricted_report["can_write"], false);
     assert_ne!(
-        peer_uid, report["uid"],
+        restricted_report["uid"], report["uid"],
         "agent processes need separate identities"
     );
     if cfg!(target_os = "macos") {

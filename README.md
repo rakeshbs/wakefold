@@ -25,8 +25,10 @@ guest image:
 container build -t wakefold-sandbox -f crates/daemon/src/sandbox/Containerfile crates/daemon/src/sandbox
 ```
 
-Set the daemon's top-level `sandbox` configuration. This example grants
-agent ID 12 read-only access to agent ID 7's folder in the same chat:
+Set the daemon's top-level `sandbox` configuration. Agents can read peer
+folders in the same chat by default. An optional `read_peers` entry limits
+one agent to the listed peers. An empty list gives that agent access only to
+its own folder. This example limits agent 12 to peer 7:
 
 ```json
 {
@@ -65,11 +67,12 @@ agent's folder as the working directory.
 ```
 
 Each agent gets the same folder permissions across calls. Its own folder is
-writable, explicitly granted same-chat peer folders are read-only, and the
-sandbox has no external network. Apple `container` provides the per-chat VM
-and Bubblewrap applies the per-agent mounts inside it. Linux runs Bubblewrap
-directly. Existing in-process and configured MCP tools run as trusted host
-tools.
+writable, and the sandbox mounts its readable peer folders read-only. With
+the default shared mount, a running sandbox sees new peer folders as they
+appear. The sandbox has no external network. Apple `container` provides the
+per-chat VM and Bubblewrap applies the per-agent mounts inside it. Linux runs
+Bubblewrap directly. Existing in-process and configured MCP tools run as
+trusted host tools.
 
 Run the real backend acceptance test with
 `cargo test -p wakefold-daemon --features sandbox workspace_permissions_and_limits_survive_reuse -- --ignored`.

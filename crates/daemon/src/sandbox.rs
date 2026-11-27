@@ -92,16 +92,35 @@ fn agent_folder(id: i64) -> PathBuf {
     PathBuf::from("agents").join(id.to_string())
 }
 
-fn mounts(workspace: &RunWorkspace, peers: &[i64], guest: bool) -> Result<Vec<Mount>, DaemonError> {
-    let mut mounts = Vec::with_capacity(peers.len() + 1);
+fn mounts(
+    workspace: &RunWorkspace,
+    peers: Option<&[i64]>,
+    guest: bool,
+) -> Result<Vec<Mount>, DaemonError> {
     let root = workspace.chat_root();
     if !fs::symlink_metadata(root)?.is_dir() || !fs::symlink_metadata(root.join("agents"))?.is_dir()
     {
         return Err("sandbox workspace must contain a real agents directory".into());
     }
+    let source = if guest {
+        Path::new(GUEST_WORKSPACE)
+    } else {
+        root
+    };
+    let destination = Path::new("/workspace");
+    let mut mounts = Vec::new();
+    if peers.is_none() {
+        // Mount the live parent first so a warm sandbox sees agents created
+        // later. The caller's writable mount goes over its own folder only.
+        mounts.push(Mount(
+            source.join("agents"),
+            destination.join("agents"),
+            false,
+        ));
+    }
     let agent = workspace.agent_id();
-    for (id, writable) in
-        std::iter::once((agent, true)).chain(peers.iter().map(|&peer| (peer, false)))
+    for (id, writable) in std::iter::once((agent, true))
+        .chain(peers.unwrap_or_default().iter().map(|&peer| (peer, false)))
     {
         let folder = agent_folder(id);
         let host_path = root.join(&folder);
@@ -110,14 +129,9 @@ fn mounts(workspace: &RunWorkspace, peers: &[i64], guest: bool) -> Result<Vec<Mo
         if !fs::symlink_metadata(&host_path)?.is_dir() {
             return Err(format!("agent {id} does not have a real folder in this chat").into());
         }
-        let source = if guest {
-            Path::new(GUEST_WORKSPACE).join(&folder)
-        } else {
-            host_path
-        };
         mounts.push(Mount(
-            source,
-            Path::new("/workspace").join(folder),
+            source.join(&folder),
+            destination.join(folder),
             writable,
         ));
     }
@@ -244,11 +258,7 @@ impl Sandbox {
         if !(1..(i64::from(u32::MAX) - 10000)).contains(&agent) {
             return Err("agent ID cannot be mapped to a sandbox user".into());
         }
-        let peers = self
-            .config
-            .read_peers
-            .get(&agent)
-            .map_or(&[][..], Vec::as_slice);
+        let peers = self.config.read_peers.get(&agent).map(Vec::as_slice);
         let guest = matches!(self.config.backend, Backend::AppleContainer { .. });
         let profile = Profile {
             agent,
