@@ -39,7 +39,13 @@ pub(crate) async fn serve(
         stop.cancel();
         result
     };
-    let (http, scheduler) = tokio::join!(http, scheduler);
+    let sandbox_maintenance = async {
+        #[cfg(feature = "sandbox")]
+        if let Some(sandbox) = &runtime.sandbox {
+            sandbox.maintain(&stop).await;
+        }
+    };
+    let (http, scheduler, ()) = tokio::join!(http, scheduler, sandbox_maintenance);
     for (name, server) in &mut runtime.mcp_servers {
         server.close(name).await;
     }

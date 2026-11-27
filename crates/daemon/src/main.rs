@@ -4,6 +4,8 @@ mod api;
 mod config;
 mod mcp;
 mod replay;
+#[cfg(feature = "sandbox")]
+mod sandbox;
 mod server;
 
 #[cfg(test)]

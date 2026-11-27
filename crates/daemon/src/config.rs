@@ -14,6 +14,10 @@ use wakefold::{
 
 use crate::DaemonError;
 use crate::mcp::{McpServer, ServerConfig};
+#[cfg(feature = "sandbox")]
+use crate::sandbox::{self, Sandbox, SandboxedCommand};
+#[cfg(feature = "sandbox")]
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +33,9 @@ pub(crate) struct Config {
     skills: BTreeMap<String, SkillConfig>,
     #[serde(default)]
     mcp_servers: BTreeMap<String, ServerConfig>,
+    #[cfg(feature = "sandbox")]
+    #[serde(default)]
+    sandbox: Option<sandbox::Config>,
     agents: BTreeMap<String, AgentConfig>,
 }
 
@@ -108,6 +115,15 @@ enum ToolConfig {
         tool: String,
         name: Option<String>,
     },
+    #[cfg(feature = "sandbox")]
+    SandboxCommand {
+        name: String,
+        description: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        parameters: serde_json::Value,
+    },
 }
 
 pub(crate) struct RegisteredSkill {
@@ -128,6 +144,8 @@ pub(crate) struct Runtime {
     pub(crate) skills: BTreeMap<String, RegisteredSkill>,
     pub(crate) agents: BTreeMap<String, Agent>,
     pub(crate) mcp_servers: BTreeMap<String, McpServer>,
+    #[cfg(feature = "sandbox")]
+    pub(crate) sandbox: Option<Arc<Sandbox>>,
     _state_lock: File,
 }
 
@@ -154,6 +172,13 @@ impl Runtime {
         state_lock
             .try_lock()
             .map_err(|error| format!("could not lock Wakefold state directory: {error}"))?;
+        #[cfg(feature = "sandbox")]
+        let sandbox = match config.sandbox {
+            Some(settings) => Some(Arc::new(
+                Sandbox::new(settings, &config.state_directory).await?,
+            )),
+            None => None,
+        };
         let mut mcp_servers = BTreeMap::new();
         for (name, skill) in config.skills {
             let mut tools: Vec<Box<dyn Tool>> = Vec::new();
@@ -196,6 +221,26 @@ impl Runtime {
                             }
                         };
                         connection.tool(&server, tool, local_name)?
+                    }
+                    #[cfg(feature = "sandbox")]
+                    ToolConfig::SandboxCommand {
+                        name,
+                        description,
+                        command,
+                        args,
+                        parameters,
+                    } => {
+                        let sandbox = sandbox
+                            .clone()
+                            .ok_or("sandbox_command requires sandbox settings")?;
+                        Box::new(SandboxedCommand::new(
+                            name,
+                            description,
+                            command,
+                            args,
+                            parameters,
+                            sandbox,
+                        )?)
                     }
                 });
             }
@@ -268,6 +313,8 @@ impl Runtime {
             skills,
             agents,
             mcp_servers,
+            #[cfg(feature = "sandbox")]
+            sandbox,
             _state_lock: state_lock,
         })
     }
