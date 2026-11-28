@@ -123,6 +123,10 @@ pub struct Character {
     until: f32,
 }
 impl Character {
+    pub fn still(&self, width: f32, height: f32) -> impl IntoElement + use<> {
+        self.art.picture(2.05, width, height)
+    }
+
     pub fn new(art: Rc<Artwork>, size: (f32, f32)) -> Self {
         Self {
             art,

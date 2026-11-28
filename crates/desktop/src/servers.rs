@@ -1,14 +1,18 @@
 //! Server selection, saved chats and the currently watched run.
+mod conversation;
+#[cfg(test)]
+mod workflow_test;
 use crate::{
     avatar::{Artwork, Character},
     connection::{Approval, Daemon, Event, Run, SavedChat, Update},
     icons::Icon,
     input::TextInput,
-    profiles::{LOCAL, Profile, Profiles},
+    profiles::{ChatLocation, LOCAL, Profile, Profiles},
     style::*,
 };
 use anyhow::{Context as _, Result};
-use gpui::{Context, Div, Entity, Render, Task, Window, div, prelude::*, px, rgb};
+use conversation::Conversation;
+use gpui::{Context, Div, Entity, Focusable, Render, Task, Window, div, prelude::*, px, rgb};
 use std::{collections::VecDeque, path::PathBuf};
 use tokio::{runtime::Runtime, sync::mpsc};
 use uuid::Uuid;
@@ -56,6 +60,9 @@ pub(crate) struct Servers {
     run: Option<i64>,
     events: VecDeque<Event>,
     character: Entity<Character>,
+    portrait: Entity<Character>,
+    conversation: Conversation,
+    watch_version: u64,
 }
 impl Servers {
     pub(crate) fn new(runtime: Runtime, cx: &mut Context<Self>) -> Self {
@@ -81,10 +88,12 @@ impl Servers {
             .cloned()
             .unwrap_or_else(Profile::local);
         let art = Artwork::load();
-        let character = cx.new(|_| Character::new(art, (128., 105.)));
+        let portrait = cx.new(|_| Character::new(art.clone(), (54., 46.)));
+        let character = cx.new(|_| Character::new(art, (180., 140.)));
         let mut view = Self {
             runtime,
-            settings: path,
+            // Preserve a settings file that could not be read.
+            settings: path.filter(|_| config_error.is_none()),
             profiles,
             active,
             client: None,
@@ -102,14 +111,14 @@ impl Servers {
             run: None,
             events: VecDeque::new(),
             character,
+            portrait,
+            conversation: Conversation::default(),
+            watch_version: 0,
         };
         view.connect(view.active.clone(), cx);
         view
     }
     fn remember(&mut self, profile: Profile) -> Result<()> {
-        if let Some(e) = &self.config_error {
-            anyhow::bail!("{e}");
-        }
         if self.profiles.selected.as_deref() == Some(&profile.url)
             && (profile.url == LOCAL
                 || self
@@ -122,15 +131,20 @@ impl Servers {
         }
         let mut next = self.profiles.clone();
         next.remember(profile);
-        next.save(
-            self.settings
-                .as_deref()
-                .context("Could not locate the settings file.")?,
-        )?;
+        self.save_profiles(next)
+    }
+    fn save_profiles(&mut self, next: Profiles) -> Result<()> {
+        next.save(self.settings.as_deref().with_context(|| {
+            self.config_error
+                .clone()
+                .unwrap_or_else(|| "Could not locate the settings file.".into())
+        })?)?;
         self.profiles = next;
+        self.config_error = None;
         Ok(())
     }
     fn stop_reader(&mut self) {
+        self.watch_version += 1;
         self.reader = None;
         if let Some(worker) = self.worker.take() {
             worker.abort();
@@ -146,9 +160,11 @@ impl Servers {
         self.runs.clear();
         self.events.clear();
         self.approvals.clear();
-        self.chat = None;
+        self.chat = self.profiles.locations.get(&profile.url).map(|l| l.chat_id);
         self.run = None;
+        self.conversation.reset_view();
         self.active = profile.clone();
+        self.ensure_draft(cx);
         self.status = Status::Connecting;
         let credentials =
             (profile.url != LOCAL).then(|| cx.read_credentials(&profile.credential_key()));
@@ -191,6 +207,7 @@ impl Servers {
             return;
         };
         let (chat, run) = (self.chat, self.run);
+        let version = self.watch_version;
         let (tx, mut rx) = mpsc::channel(64);
         self.worker = Some(
             self.runtime
@@ -200,7 +217,10 @@ impl Servers {
             while let Some(update) = rx.recv().await {
                 if view
                     .update(cx, |s, cx| {
-                        s.apply(update);
+                        if s.watch_version != version {
+                            return;
+                        }
+                        s.apply(update, cx);
                         cx.notify()
                     })
                     .is_err()
@@ -210,7 +230,7 @@ impl Servers {
             }
         }));
     }
-    fn apply(&mut self, update: Update) {
+    fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
         match update {
             Update::Snapshot {
                 chats,
@@ -221,10 +241,34 @@ impl Servers {
                 self.runs = runs;
                 self.approvals = approvals;
                 self.status = Status::Connected;
+                self.sync_conversation(cx);
             }
             Update::Event(e) => {
+                // An explicit refresh can replay events already drawn for this run.
+                if self.run != Some(e.run_id)
+                    || self
+                        .events
+                        .back()
+                        .is_some_and(|last| e.sequence <= last.sequence)
+                {
+                    return;
+                }
                 if self.events.len() >= 200 {
                     self.events.pop_front();
+                }
+                if let Some(run) = self.runs.iter_mut().find(|r| r.run_id == e.run_id)
+                    && !run.finished()
+                {
+                    run.latest_event.clone_from(&e.event.kind);
+                    if matches!(e.event.kind.as_str(), "run_finished" | "run_failed") {
+                        run.status = if e.event.kind == "run_finished" {
+                            "completed"
+                        } else {
+                            "failed"
+                        }
+                        .into();
+                        run.outcome = e.event.data.as_str().map(str::to_owned);
+                    }
                 }
                 self.events.push_back(e);
             }
@@ -238,8 +282,11 @@ impl Servers {
             self.run = None;
             self.runs.clear();
             self.events.clear();
+            self.conversation.reset_view();
+            self.remember_chat(None);
             self.watch(cx);
         }
+        self.ensure_draft(cx);
         self.form = None;
         self.save = None;
         cx.notify();
@@ -349,7 +396,17 @@ impl Servers {
                 nav("add-server", Icon::New, "Add server", self.form.is_some())
                     .on_click(cx.listener(|s, _, _, cx| s.show_form(cx))),
             )
-            .child(label("Saved chats", 12., MUTED).mt_5().mb_1());
+            .child(
+                nav("new-chat", Icon::New, "New chat", false)
+                    .mt_3()
+                    .on_click(cx.listener(|s, _, w, cx| {
+                        s.select_chat(Uuid::new_v4(), cx);
+                        if let Some(d) = s.current_draft() {
+                            w.focus(&d.input.focus_handle(cx));
+                        }
+                    })),
+            )
+            .child(label("Saved chats", 12., MUTED).mt_3().mb_1());
         let mut chats = column()
             .id("saved-chats")
             .flex_1()
@@ -457,7 +514,7 @@ impl Servers {
                 ),
         )
     }
-    fn content(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+    fn content(&self, cx: &mut Context<Self>) -> Div {
         let mut body = column()
             .flex_1()
             .min_w_0()
@@ -467,109 +524,35 @@ impl Servers {
             .id("run-list")
             .overflow_y_scroll();
         if let Some(form) = &self.form {
-            return body.child(self.form(form, cx));
+            return column().flex_1().child(body.child(self.form(form, cx)));
         }
-        if let Some(e) = &self.config_error {
-            body = body.child(label(e.clone(), 13., AMBER));
+        if self.chat.is_some() {
+            return self.chat_view(cx);
         }
-        if let Status::Reconnecting(e) | Status::Attention(e) = &self.status {
-            body = body.child(label(e.clone(), 13., AMBER));
+        if let Some(error) = &self.config_error {
+            body = body.child(label(error.clone(), 13., AMBER));
         }
-        if self.chat.is_none() {
-            let msg = match self.status {
-                Status::Connected if self.chats.is_empty() => "No saved chats on this daemon.",
-                Status::Connected => "Choose a saved chat.",
-                Status::Connecting => "Connecting to the daemon…",
-                Status::Reconnecting(_) => "Waiting for the daemon",
-                Status::Attention(_) => "Check your server connection",
-            };
-            return body.child(
+        if let Status::Reconnecting(error) | Status::Attention(error) = &self.status {
+            body = body.child(label(error.clone(), 13., AMBER));
+        }
+        let message = match self.status {
+            Status::Connected if self.chats.is_empty() => "Start a new chat",
+            Status::Connected => "Choose a saved chat or start a new one",
+            Status::Connecting => "Connecting to the daemon…",
+            Status::Reconnecting(_) => "Waiting for the daemon",
+            Status::Attention(_) => "Check your server connection",
+        };
+        column().flex_1().child(
+            body.child(
                 column()
                     .flex_1()
                     .items_center()
                     .justify_center()
                     .gap_3()
                     .child(self.character.clone())
-                    .child(heading(msg, 20.)),
-            );
-        }
-        let title = self
-            .chats
-            .iter()
-            .find(|c| Some(c.chat_id) == self.chat)
-            .and_then(|c| c.title.clone())
-            .unwrap_or_else(|| "Saved chat".into());
-        body = body.child(heading(title, 20.));
-        if self.runs.is_empty() {
-            body = body.child(label("No runs to display.", 13., MUTED));
-        }
-        for run in &self.runs {
-            let id = run.run_id;
-            let role = if run.parent_agent_id.is_some() {
-                "Child"
-            } else {
-                "Root"
-            };
-            let pending = self
-                .approvals
-                .iter()
-                .filter(|a| a.agent_id == run.agent_id)
-                .count();
-            let status = if pending > 0 && run.status == "waiting" {
-                format!("{} · approval pending", run.status)
-            } else {
-                run.status.clone()
-            };
-            body = body.child(
-                hit(format!("run-{id}"))
-                    .gap_3()
-                    .p_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(if self.run == Some(id) { TINT } else { WHITE }))
-                    .hover(|s| s.bg(rgb(TINT)))
-                    .child(tile(Icon::Branch, TINT, GREEN))
-                    .child(
-                        column()
-                            .flex_1()
-                            .min_w_0()
-                            .child(heading(
-                                format!("{role} agent {} · Run {id}", run.agent_id),
-                                14.,
-                            ))
-                            .child(label(run.task.clone(), 13., MUTED).truncate()),
-                    )
-                    .child(label(status, 12., MUTED))
-                    .on_click(cx.listener(move |s, _, _, cx| {
-                        if s.run != Some(id) {
-                            s.run = Some(id);
-                            s.events.clear();
-                            s.watch(cx);
-                            cx.notify()
-                        }
-                    })),
-            );
-        }
-        if self.run.is_some() {
-            body = body.child(heading("Run activity", 16.).mt_3());
-            for e in self.events.iter().rev() {
-                let detail = match e.event.kind.as_str() {
-                    "run_started" | "run_finished" | "run_failed" => e.event.data.as_str(),
-                    _ => None,
-                };
-                let mut item = column().gap_1().py_1().child(label(
-                    format!("{}  ·  {}", e.sequence, e.event.kind.replace('_', " ")),
-                    12.,
-                    MUTED,
-                ));
-                if let Some(text) = detail {
-                    item = item.child(label(text.to_owned(), 14., INK));
-                }
-                body = body.child(item);
-            }
-        }
-        body
+                    .child(heading(message, 20.)),
+            ),
+        )
     }
 }
 impl Render for Servers {
@@ -598,6 +581,14 @@ impl Render for Servers {
                     .child(label(self.status.label().to_owned(), 12., MUTED)),
             );
         row()
+            .on_action(cx.listener(|s, _: &crate::SendMessage, w, cx| {
+                if s.form.is_none()
+                    && s.current_draft()
+                        .is_some_and(|d| d.input.focus_handle(cx).is_focused(w))
+                {
+                    s.send_prompt(cx);
+                }
+            }))
             .size_full()
             .bg(rgb(PAPER))
             .font_family("Inter")

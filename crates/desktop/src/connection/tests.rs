@@ -7,7 +7,7 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
-fn certificates(dir: &Path) -> Result<()> {
+pub(crate) fn certificates(dir: &Path) -> Result<()> {
     fn openssl(dir: &Path, args: &[&str]) -> Result<()> {
         let output = Command::new("openssl")
             .args(args)

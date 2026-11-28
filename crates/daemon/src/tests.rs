@@ -56,6 +56,16 @@ impl Provider for WorkflowProvider {
         let Some(Message::User(prompt)) = request.messages.get(1) else {
             panic!("the original prompt must survive");
         };
+        if prompt == PROMPT
+            && matches!(request.messages.last(), Some(Message::User(text)) if text == "What was the price?")
+        {
+            let first_answer = Message::Assistant(ModelResponse::Final(FINAL_ANSWER.into()));
+            assert!(request.messages.contains(&first_answer));
+            return Ok(ModelTurn::new(
+                ModelResponse::Final("350 cents.".into()),
+                Some(TokenUsage::new(2, 1)),
+            ));
+        }
         if prompt == MAILBOX_PROMPT {
             return Ok(ModelTurn::new(
                 mailbox_response(request.messages.last().unwrap()),
@@ -146,7 +156,11 @@ impl Provider for WorkflowProvider {
             }
             Message::Tool(result) => {
                 assert_eq!(result.call_id, "work".into());
-                ModelResponse::Final(result.value.as_str().unwrap().into())
+                if result.value == json!({"approved": false}) {
+                    ModelResponse::Final("Review declined.".into())
+                } else {
+                    ModelResponse::Final(result.value.as_str().unwrap().into())
+                }
             }
             other => panic!("unexpected message {other:?}"),
         };

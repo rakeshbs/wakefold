@@ -12,7 +12,7 @@ use rustls::{
 };
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
@@ -36,8 +36,21 @@ pub struct Run {
     pub run_id: i64,
     pub agent_id: i64,
     pub parent_agent_id: Option<i64>,
+    pub spawned_by_run_id: Option<i64>,
+    pub run_key: String,
+    pub latest_event: String,
+    pub outcome: Option<String>,
     pub task: String,
     pub status: String,
+}
+impl Run {
+    pub fn finished(&self) -> bool {
+        matches!(self.status.as_str(), "completed" | "failed")
+    }
+}
+#[derive(Deserialize)]
+struct AcceptedRun {
+    run_id: i64,
 }
 #[derive(Clone, Deserialize, PartialEq, Debug)]
 pub struct Approval {
@@ -124,12 +137,50 @@ impl Daemon {
             tls,
         })
     }
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+    pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let mut req = self.http.get(self.url.join(path)?);
         if let Some(auth) = &self.auth {
             req = req.header(AUTHORIZATION, auth);
         }
         Ok(req.send().await?.error_for_status()?.json().await?)
+    }
+    async fn post(&self, url: Url, body: Value) -> Result<reqwest::Response> {
+        let mut request = self.http.post(url).json(&body);
+        if let Some(auth) = &self.auth {
+            request = request.header(AUTHORIZATION, auth);
+        }
+        let response = request.send().await?;
+        if let Err(error) = response.error_for_status_ref() {
+            let message = response
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_owned));
+            return Err(match message {
+                Some(msg) => anyhow::Error::new(error).context(msg),
+                None => error.into(),
+            });
+        }
+        Ok(response)
+    }
+    pub async fn send_prompt(&self, chat: Uuid, key: Uuid, prompt: &str) -> Result<i64> {
+        Ok(self
+            .post(
+                self.url.join("runs")?,
+                json!({"chat_id":chat,"run_key":key,"prompt":prompt}),
+            )
+            .await?
+            .json::<AcceptedRun>()
+            .await?
+            .run_id)
+    }
+    pub async fn decide_approval(&self, id: &str, approved: bool) -> Result<()> {
+        let mut url = self.url.join("approvals")?;
+        url.path_segments_mut()
+            .expect("HTTP URL supports path segments")
+            .push(id);
+        self.post(url, json!({"approved":approved})).await?;
+        Ok(())
     }
     pub async fn chats(&self) -> Result<Vec<SavedChat>> {
         let mut path = "chats".to_string();
@@ -221,7 +272,12 @@ impl Daemon {
     ) -> Result<()> {
         let snapshot = self.snapshot(chat).await?;
         let mut socket = match run {
-            Some(id) if !*complete => Some(self.socket(id, *after).await?),
+            Some(id)
+                if !*complete
+                    && matches!(&snapshot, Update::Snapshot { runs, .. } if runs.iter().any(|r| r.run_id == id)) =>
+            {
+                Some(self.socket(id, *after).await?)
+            }
             _ => None,
         };
         updates.send(snapshot).await?;
@@ -280,4 +336,4 @@ fn rejected(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

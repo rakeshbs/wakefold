@@ -41,16 +41,22 @@ OS credential store (Keychain on macOS). Add the same URL again to replace
 its token. For a private CA, you can set `WAKEFOLD_CA_FILE` to its PEM file
 when launching the client.
 
-Select a saved chat and then a run to watch its activity. The client shows
-connection status and the latest 200 events. After an interruption it
-refreshes the run tree and pending approvals and replays missed events for
-the selected run. Launch with `--preview` for the interactive chat design
-with sample data.
+Choose **New chat** and send a message, or open a chat in the sidebar. Each
+follow-up goes to the same root agent. Expand **Activity** under a reply to
+see its child agents. Select a child to read its assignment and final result
+beside the conversation. A pending tool approval shows the tool name and
+arguments, with **Approve once** and **Decline** actions.
 
-From the repository root, run `crates/desktop/tests/remote-macos.sh` to test
-remote mode locally. It starts a separate daemon with a deterministic model
-provider, generates temporary TLS credentials, interrupts the connection
-during a run, and compares the desktop event stream with the saved journal.
+The app remembers the last chat and selected child for each server. When it
+reconnects, it fetches the saved answers and pending approvals and catches
+up on the selected run's events. Expand **Run events** to see up to 200 of
+them. Launch with `--preview` to explore the design with sample data.
+
+On macOS, run `crates/desktop/tests/remote-macos.sh` from the repository
+root to test with a separate daemon, temporary TLS credentials and a
+deterministic model. The tests replay events after a connection drop, reopen
+a chat with two children, restart the daemon during a pending approval, and
+send a follow-up to the original root.
 
 ## Chat workspaces
 

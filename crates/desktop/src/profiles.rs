@@ -2,7 +2,8 @@
 use anyhow::{Context, Result, ensure};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::{fs, io::ErrorKind, path::Path};
+use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
+use uuid::Uuid;
 
 pub const LOCAL: &str = "http://127.0.0.1:8700/";
 #[derive(Clone, Deserialize, Serialize)]
@@ -46,10 +47,21 @@ impl Profile {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ChatLocation {
+    pub chat_id: Uuid,
+    pub inspected_child: Option<i64>,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Profiles {
     pub servers: Vec<Profile>,
     pub selected: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub locations: BTreeMap<String, ChatLocation>,
+    // Only retry identities go to disk. Prompts and answers belong to the daemon.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pending_requests: BTreeMap<String, BTreeMap<Uuid, Uuid>>,
 }
 impl Profiles {
     pub fn load(path: &Path) -> Result<Self> {
