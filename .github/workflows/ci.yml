@@ -21,6 +21,24 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --exclude wakefold-desktop --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --locked --workspace --all-features
+        run: cargo test --locked --workspace --exclude wakefold-desktop --all-features
+
+  desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rust_version="$(awk '$1 == "rust" { print $2; exit }' .tool-versions)"
+          rustup toolchain install "$rust_version" --profile minimal --component clippy
+          rustup override set "$rust_version"
+      - name: Lint desktop
+        run: cargo clippy --locked -p wakefold-desktop --all-targets -- -D warnings
+      - name: Test desktop
+        run: cargo test --locked -p wakefold-desktop
+      - name: Test the remote connection and reconnect
+        run: crates/desktop/tests/remote-macos.sh

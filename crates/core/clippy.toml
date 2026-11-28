@@ -1,0 +1,4 @@
+# GPUI enables serde_json's ordered map in combined workspace builds. A public
+# RunError carrying an approval wait then occupies 128 bytes on 64-bit targets.
+# Keep that API usable in examples and tests under either dependency feature set.
+large-error-threshold = 129

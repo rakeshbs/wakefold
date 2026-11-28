@@ -29,6 +29,29 @@ and token file. Restart the daemon after changing either. Remote mode requires
 the same bearer token for every HTTPS request and WSS upgrade. Possession of
 the token grants access to that daemon's chats and management API.
 
+## Desktop client
+
+Start your configured daemon with `cargo run -p wakefold-daemon -- serve <config.json>`.
+Start the native app with `cargo run -p wakefold-desktop`. Select **This Mac**
+for the local daemon on port 8700. For a remote daemon, choose **Add server**,
+enter its name and HTTPS URL, copy its access token, and click **Paste token**
+and **Connect and save**. The app saves server names and addresses in
+`Wakefold/servers.json` under the OS configuration directory. Tokens go in the
+OS credential store (Keychain on macOS). Add the same URL again to replace
+its token. For a private CA, you can set `WAKEFOLD_CA_FILE` to its PEM file
+when launching the client.
+
+Select a saved chat and then a run to watch its activity. The client shows
+connection status and the latest 200 events. After an interruption it
+refreshes the run tree and pending approvals and replays missed events for
+the selected run. Launch with `--preview` for the interactive chat design
+with sample data.
+
+From the repository root, run `crates/desktop/tests/remote-macos.sh` to test
+remote mode locally. It starts a separate daemon with a deterministic model
+provider, generates temporary TLS credentials, interrupts the connection
+during a run, and compares the desktop event stream with the saved journal.
+
 ## Chat workspaces
 
 `POST /chats` creates a chat and returns its `chat_id` UUID. Send that UUID
