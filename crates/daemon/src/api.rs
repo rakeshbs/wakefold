@@ -81,6 +81,10 @@ pub(crate) fn router(
         .route("/chats/{chat_id}/history", get(chat_history))
         .route("/approvals", get(pending_approvals))
         .route("/approvals/{wait_id}", post(resolve_approval))
+        .route(
+            "/chats/{chat_id}/artifact-revisions",
+            get(artifact_revisions),
+        )
         .route("/artifacts", get(list_artifacts))
         .route(
             "/artifacts/{artifact_id}/revisions/{revision}",
@@ -117,6 +121,20 @@ async fn list_artifacts(
         .database(move |store| store.artifacts(chat.chat_id).map_err(ApiError::internal))
         .await
         .map(Json)
+}
+
+async fn artifact_revisions(
+    State(state): State<AppState>,
+    Path(chat): Path<ChatId>,
+) -> Result<Json<Vec<wakefold::PublishedArtifactRevision>>, ApiError> {
+    state
+        .database(move |store| {
+            store
+                .artifact_revisions(chat)
+                .map(Json)
+                .map_err(ApiError::internal)
+        })
+        .await
 }
 
 async fn download_artifact(

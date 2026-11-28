@@ -30,7 +30,10 @@ pub use agent::{
     RunCheckpoint, RunError, RunOptions, RunOutcome, RunReport, RunUsage, run, run_streaming,
     run_streaming_with_options, run_with_options,
 };
-pub use artifact::{ArtifactError, ArtifactPublication, ArtifactRevision, PublishArtifact};
+pub use artifact::{
+    ArtifactError, ArtifactPublication, ArtifactRevision, PublishArtifact,
+    PublishedArtifactRevision,
+};
 pub use journal::{JournalEntry, JournalError, JournalReplay, RunEvent, RunEventPage, RunJournal};
 pub use mailbox::{ClientMessageError, SendMessage, WaitForMessage};
 pub use provider::{

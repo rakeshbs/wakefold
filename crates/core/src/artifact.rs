@@ -36,8 +36,18 @@ pub struct ArtifactRevision {
     pub media_type: String,
     /// The length in bytes of the published copy.
     pub size_bytes: u64,
-    /// The run that published this revision.
+    /// The agent that published this revision.
     pub agent_id: i64,
+}
+
+/// An immutable revision and the specific run that published it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishedArtifactRevision {
+    /// The publishing run, including its identity within a multi-turn chat.
+    pub run_id: i64,
+    /// The metadata of the file at publication time.
+    #[serde(flatten)]
+    pub artifact: ArtifactRevision,
 }
 
 /// A request to publish an existing file from the run's chat workspace.
@@ -361,6 +371,28 @@ impl WorkspaceStore {
              ORDER BY a.artifact_id",
         )?;
         let rows = statement.query_map([chat_id], read_revision)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// List all revisions in a chat, ordered by artifact and newest revision first.
+    ///
+    /// # Errors
+    /// Returns an error if the catalog cannot be read.
+    pub fn artifact_revisions(
+        &self,
+        chat: ChatId,
+    ) -> Result<Vec<PublishedArtifactRevision>, ArtifactError> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT artifact_id, revision, title, filename, media_type, size_bytes,
+                    published_by_agent_id, published_in_run_id
+             FROM artifact_revisions WHERE chat_id = ?1 ORDER BY artifact_id, revision DESC",
+        )?;
+        let rows = statement.query_map([chat], |row| {
+            Ok(PublishedArtifactRevision {
+                run_id: row.get(7)?,
+                artifact: read_revision(row)?,
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 

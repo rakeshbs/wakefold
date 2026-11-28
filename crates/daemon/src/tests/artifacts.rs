@@ -404,6 +404,24 @@ async fn artifact_publication_survives_daemon_crash() {
         assert_eq!(revisions[1]["artifact_id"], artifact_id);
         assert_eq!(revisions[1]["revision"], 2);
         assert_eq!(catalog(&client, address, chat_id).await, revisions[1..]);
+        for (chat, expected_count) in [(chat_id, 2), (other_chat, 0)] {
+            let versions: Vec<Value> = client
+                .get(format!("http://{address}/chats/{chat}/artifact-revisions"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(versions.len(), expected_count);
+            for (version, published) in versions.into_iter().zip(revisions.iter().rev()) {
+                let mut expected = published.clone();
+                expected["run_id"] = json!(run);
+                assert_eq!(version, expected);
+            }
+        }
         for (revision, expected) in [(1, ORIGINAL), (2, UPDATED)] {
             let response = download(&client, address, chat_id, artifact_id, revision).await;
             assert_eq!(
