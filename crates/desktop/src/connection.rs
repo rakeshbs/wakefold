@@ -156,6 +156,56 @@ impl Daemon {
         }
         Ok(req)
     }
+    /// Only a refused connection means it is safe to launch on this address.
+    pub(crate) async fn local_daemon_ready(&self) -> Result<bool> {
+        let response = match self
+            .request("health")?
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let error = anyhow::Error::new(error);
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+                }) {
+                    return Ok(false);
+                }
+                return Err(error.context("Could not check the local daemon"));
+            }
+        };
+        let health: Value = response
+            .error_for_status()?
+            .json()
+            .await
+            .context("Unexpected response from the local daemon address")?;
+        ensure!(
+            health["status"] == "ok",
+            "The local daemon address is occupied by another service"
+        );
+        match health.get("service") {
+            Some(id) => ensure!(
+                id == "wakefold",
+                "The local daemon address is occupied by another service"
+            ),
+            None => {
+                // Earlier Wakefold versions returned just the status. Confirm their chat API.
+                let _: Vec<SavedChat> = self
+                    .request("chats")?
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await
+                    .context("The local address did not answer the Wakefold chat API")?;
+            }
+        }
+        Ok(true)
+    }
     pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         Ok(self
             .request(path)?

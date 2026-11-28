@@ -3,6 +3,7 @@ mod avatar;
 mod connection;
 mod icons;
 mod input;
+mod local_daemon;
 mod preview;
 mod profiles;
 mod servers;

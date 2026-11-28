@@ -9,6 +9,7 @@ use crate::{
     connection::{Approval, Daemon, Event, Run, SavedChat, Update},
     icons::Icon,
     input::TextInput,
+    local_daemon,
     profiles::{ChatLocation, LOCAL, Profile, Profiles},
     style::*,
 };
@@ -24,6 +25,7 @@ enum Status {
     Connected,
     Reconnecting(String),
     Attention(String),
+    NeedsLocalKey(String),
 }
 impl Status {
     fn label(&self) -> &str {
@@ -32,6 +34,7 @@ impl Status {
             Self::Connected => "Connected",
             Self::Reconnecting(_) => "Reconnecting",
             Self::Attention(_) => "Needs attention",
+            Self::NeedsLocalKey(_) => "Provider key needed",
         }
     }
 }
@@ -73,7 +76,7 @@ impl Servers {
     pub(crate) fn new(runtime: Runtime, cx: &mut Context<Self>) -> Self {
         Self::with_settings(
             runtime,
-            dirs::config_dir().map(|p| p.join("Wakefold/servers.json")),
+            local_daemon::config_dir().map(|p| p.join("servers.json")),
             cx,
         )
     }
@@ -176,36 +179,68 @@ impl Servers {
         self.active = profile.clone();
         self.ensure_draft(cx);
         self.status = Status::Connecting;
-        let credentials =
-            (profile.url != LOCAL).then(|| cx.read_credentials(&profile.credential_key()));
+        let directory = self
+            .settings
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|p| p.to_owned());
+        let runtime = self.runtime.handle().clone();
         self.load = Some(cx.spawn(async move |view, cx| {
             let result = async {
-                let token = match credentials {
-                    Some(task) => Some(String::from_utf8(
-                        task.await?
-                            .context("Add the server again to save its access token.")?
-                            .1,
-                    )?),
-                    None => None,
-                };
-                Self::client(&profile, token.as_deref())
+                if profile.url == LOCAL {
+                    return local_daemon::connect(runtime, directory.as_deref(), cx).await;
+                }
+                let (_, token) = cx
+                    .update(|app| app.read_credentials(&profile.credential_key()))?
+                    .await?
+                    .context("Add the server again to save its access token.")?;
+                Self::client(&profile, Some(std::str::from_utf8(&token)?)).map(Some)
             }
             .await;
             let _ = view.update(cx, |s, cx| {
                 match result {
-                    Ok(client) => {
+                    Ok(Some(client)) => {
                         s.client = Some(client);
                         s.watch(cx);
                         if let Err(e) = s.remember(profile) {
                             s.config_error = Some(format!("{e:#}"));
                         }
                     }
+                    Ok(None) => s.status = Status::NeedsLocalKey(String::new()),
                     Err(e) => s.status = Status::Attention(format!("{e:#}")),
                 }
                 cx.notify()
             });
         }));
         cx.notify()
+    }
+    fn save_local_key(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .map(|s| s.trim().to_owned())
+            .filter(|key| !key.is_empty() && key.bytes().all(|b| b.is_ascii_graphic()))
+        else {
+            self.status = Status::NeedsLocalKey("Copy your OpenAI API key and try again.".into());
+            cx.notify();
+            return;
+        };
+        let save =
+            cx.write_credentials(local_daemon::PROVIDER_CREDENTIAL, "OpenAI", key.as_bytes());
+        self.status = Status::Connecting;
+        self.load = Some(cx.spawn(async move |view, cx| {
+            let result = save.await;
+            let _ = view.update(cx, |s, cx| {
+                match result {
+                    Ok(()) => s.connect(Profile::local(), cx),
+                    Err(e) => {
+                        s.status = Status::NeedsLocalKey(format!("Could not save the key: {e}"))
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
     fn client(profile: &Profile, token: Option<&str>) -> Result<Daemon> {
         let ca = std::env::var_os("WAKEFOLD_CA_FILE").map(PathBuf::from);
@@ -550,6 +585,27 @@ impl Servers {
         if let Some(form) = &self.form {
             return column().flex_1().child(body.child(self.form(form, cx)));
         }
+        if let Status::NeedsLocalKey(error) = &self.status {
+            let mut setup = column()
+                .gap_3()
+                .max_w(px(480.))
+                .child(heading("Start the local daemon", 20.))
+                .child(label(
+                    "Copy your OpenAI API key, then save it to this computer’s credential store.",
+                    14.,
+                    INK,
+                ))
+                .child(
+                    row().child(
+                        action("local-provider-key", "Paste key and start", true)
+                            .on_click(cx.listener(|s, _, _, cx| s.save_local_key(cx))),
+                    ),
+                );
+            if !error.is_empty() {
+                setup = setup.child(label(error.clone(), 13., AMBER));
+            }
+            return column().flex_1().child(body.child(setup));
+        }
         if let Some(mcp) = &self.mcp {
             return self.mcp_view(mcp, cx);
         }
@@ -571,6 +627,7 @@ impl Servers {
             Status::Connecting => "Connecting to the daemon…",
             Status::Reconnecting(_) => "Waiting for the daemon",
             Status::Attention(_) => "Check your server connection",
+            Status::NeedsLocalKey(_) => "Start the local daemon",
         };
         column().flex_1().child(
             body.child(

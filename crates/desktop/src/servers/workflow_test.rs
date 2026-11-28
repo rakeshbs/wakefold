@@ -473,3 +473,32 @@ fn manage_mcp_and_download_revisions(cx: &mut TestAppContext) {
         );
     }
 }
+
+#[gpui::test]
+#[ignore = "uses the real local daemon; run local-daemon-macos.py"]
+fn select_local_computer(cx: &mut TestAppContext) {
+    let directory = PathBuf::from(
+        std::env::var_os("WAKEFOLD_CONFIG_DIR")
+            .expect("the macOS test supplies a temporary profile"),
+    );
+    let settings = directory.join("servers.json");
+    assert!(!settings.exists() && !directory.join("daemon.json").exists());
+    let mut profiles = Profiles::default();
+    let remote = Profile::remote("Remote fixture", "https://localhost:9999").unwrap();
+    profiles.remember(remote.clone());
+    profiles.save(&settings).unwrap();
+    let (view, cx) = cx.add_window_view(|_, cx| Servers::new(Runtime::new().unwrap(), cx));
+    cx.simulate_resize(size(px(1180.), px(745.)));
+    wait(&view, cx, "saved remote selection", |s| {
+        s.active.url == remote.url && matches!(s.status, Status::Attention(_))
+    });
+    assert!(!settings.with_file_name("daemon-start.lock").exists());
+    click(cx, "profile-0");
+    wait(&view, cx, "local daemon", |s| {
+        s.active.url == LOCAL && matches!(s.status, Status::Connected)
+    });
+    assert_eq!(
+        Profiles::load(&settings).unwrap().selected.as_deref(),
+        Some(LOCAL)
+    );
+}

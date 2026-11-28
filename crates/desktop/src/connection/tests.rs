@@ -283,3 +283,45 @@ async fn scenario() -> Result<()> {
     process.kill().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn identify_a_legacy_daemon_on_an_occupied_local_port() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    for (chat_response, compatible) in [("[]", true), ("{}", false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let mut daemon = Daemon::new(&Profile::local(), None, None)?;
+        daemon
+            .url
+            .set_port(Some(listener.local_addr()?.port()))
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            for (path, body) in [("/health", r#"{"status":"ok"}"#), ("/chats", chat_response)] {
+                let (socket, _) = listener.accept().await?;
+                let mut stream = BufReader::new(socket);
+                let mut line = String::new();
+                stream.read_line(&mut line).await?;
+                assert_eq!(line.trim(), format!("GET {path} HTTP/1.1"));
+                loop {
+                    line.clear();
+                    if stream.read_line(&mut line).await? == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.get_mut().write_all(response.as_bytes()).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        });
+        let ready = daemon.local_daemon_ready().await;
+        if compatible {
+            assert!(ready?);
+        } else {
+            assert!(ready.is_err());
+        }
+        responder.await??;
+    }
+    Ok(())
+}

@@ -77,7 +77,10 @@ pub(crate) fn router(
         .route("/mcp", get(mcp_inventory))
         .route("/mcp/discover", post(discover_mcp))
         .route("/mcp/servers/{name}", post(save_mcp))
-        .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
+        .route(
+            "/health",
+            get(|| async { Json(json!({ "service": "wakefold", "status": "ok" })) }),
+        )
         .route("/chats", post(create_chat).get(saved_chats))
         .route("/runs", post(start_run))
         .route("/runs/{run_id}/events", get(events))

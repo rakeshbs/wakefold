@@ -31,9 +31,27 @@ the token grants access to that daemon's chats and management API.
 
 ## Desktop client
 
-Start your configured daemon with `cargo run -p wakefold-daemon -- serve <config.json>`.
-Start the native app with `cargo run -p wakefold-desktop`. Select **This Mac**
-for the local daemon on port 8700. For a remote daemon, choose **Add server**,
+Build both executables with `cargo build -p wakefold-daemon -p wakefold-desktop`
+and open `target/debug/wakefold-desktop`. Keep `wakefold` (the daemon) beside
+the desktop executable when installing them.
+
+**This Mac** or **This computer** connects to an existing Wakefold daemon at
+`127.0.0.1:8700`, including one started from the command line. If the port is
+free, the app starts a background daemon. Closing the app leaves it running.
+
+On its first local start, the app creates `daemon.json` in the Wakefold
+configuration directory. On macOS this is `~/Library/Application Support/Wakefold`.
+The default state directory is `state` beside the file, and startup output goes
+to `daemon.log`. To reuse existing data, place your existing local configuration
+at `daemon.json` or symlink it there. A symlink preserves paths relative to the
+original configuration. Set `WAKEFOLD_CONFIG_DIR` to use a different directory
+for desktop settings and the local configuration.
+
+The daemon inherits `OPENAI_API_KEY` if available. Otherwise the app offers
+**Paste key and start** and saves the key in the OS credential store. Attaching
+to a running daemon only needs the local connection.
+
+For a remote daemon, choose **Add server**,
 enter its name and HTTPS URL, copy its access token, and click **Paste token**
 and **Connect and save**. The app saves server names and addresses in
 `Wakefold/servers.json` under the OS configuration directory. Tokens go in the
@@ -57,7 +75,9 @@ reconnects, it fetches the saved answers and pending approvals and catches
 up on the selected run's events. Expand **Run events** to see up to 200 of
 them. Launch with `--preview` to explore the design with sample data.
 
-On macOS, run `crates/desktop/tests/remote-macos.sh` from the repository
+On macOS, run `python3 crates/desktop/tests/local-daemon-macos.py` with port 8700 free
+to exercise first launch, daemon reuse and quitting the native app in temporary profiles.
+Run `crates/desktop/tests/remote-macos.sh` from the repository
 root to test with a separate daemon, temporary TLS credentials and a
 deterministic model. The tests replay events after a connection drop, reopen
 a chat with two children, restart the daemon during a pending approval, and
