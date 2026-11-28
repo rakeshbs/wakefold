@@ -1,6 +1,7 @@
 //! Server selection, saved chats and the currently watched run.
 mod artifacts;
 mod conversation;
+mod dock;
 mod mcp;
 #[cfg(test)]
 mod workflow_test;
@@ -15,6 +16,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 use conversation::Conversation;
+use dock::{Dock, Panel};
 use gpui::{Context, Div, Entity, Focusable, Render, Task, Window, div, prelude::*, px, rgb};
 use std::{collections::VecDeque, path::PathBuf};
 use tokio::{runtime::Runtime, sync::mpsc};
@@ -67,6 +69,9 @@ pub(crate) struct Servers {
     character: Entity<Character>,
     portrait: Entity<Character>,
     conversation: Conversation,
+    dock: Dock,
+    viewport: Option<gpui::Size<gpui::Pixels>>,
+    sidebar_expanded: Option<bool>,
     watch_version: u64,
     artifacts: artifacts::Artifacts,
     opened_files: Vec<tempfile::TempDir>,
@@ -121,6 +126,9 @@ impl Servers {
             character,
             portrait,
             conversation: Conversation::default(),
+            dock: Dock::default(),
+            viewport: None,
+            sidebar_expanded: None,
             watch_version: 0,
             artifacts: Default::default(),
             opened_files: Vec::new(),
@@ -176,6 +184,7 @@ impl Servers {
         self.chat = self.profiles.locations.get(&profile.url).map(|l| l.chat_id);
         self.run = None;
         self.conversation.reset_view();
+        self.dock.clear();
         self.active = profile.clone();
         self.ensure_draft(cx);
         self.status = Status::Connecting;
@@ -283,6 +292,13 @@ impl Servers {
                 approvals,
                 artifacts,
             } => {
+                if self.runs != runs
+                    || self.approvals != approvals
+                    || self.artifacts.revisions != artifacts
+                {
+                    self.conversation.follow_if_near_bottom();
+                    self.dock.follow_child_if_near_bottom();
+                }
                 self.chats = chats;
                 self.runs = runs;
                 self.approvals = approvals;
@@ -321,6 +337,9 @@ impl Servers {
                         run.outcome = e.event.data.as_str().map(str::to_owned);
                     }
                 }
+                self.conversation.follow_if_near_bottom();
+                self.dock.follow_child_if_near_bottom();
+                self.dock.receive_event(&e);
                 self.events.push_back(e);
             }
             Update::Reconnecting(e) => self.status = Status::Reconnecting(e),
@@ -329,9 +348,10 @@ impl Servers {
     }
     fn select_chat(&mut self, id: Uuid, cx: &mut Context<Self>) {
         self.mcp = None;
-        self.artifacts.visible = false;
+
         if self.chat != Some(id) {
             self.artifacts = Default::default();
+            self.dock.clear();
             self.chat = Some(id);
             self.run = None;
             self.runs.clear();
@@ -407,9 +427,57 @@ impl Servers {
             });
         }));
     }
-    fn sidebar(&self, cx: &mut Context<Self>) -> Div {
+    fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_chat(Uuid::new_v4(), cx);
+        if let Some(draft) = self.current_draft() {
+            window.focus(&draft.input.focus_handle(cx));
+        }
+    }
+    fn sidebar(&self, expanded: bool, cx: &mut Context<Self>) -> Div {
+        if !expanded {
+            return column()
+                .w(px(68.))
+                .h_full()
+                .flex_none()
+                .items_center()
+                .gap_3()
+                .py_4()
+                .bg(rgb(RAIL))
+                .border_r_1()
+                .border_color(rgb(LINE))
+                .child(
+                    hit("expand-sidebar")
+                        .p_2()
+                        .child(tile(Icon::Fold, TINT, GREEN))
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.sidebar_expanded = Some(true);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    hit("new-chat")
+                        .p_2()
+                        .child(Icon::New.draw(18., GREEN))
+                        .on_click(cx.listener(|s, _, w, cx| s.new_chat(w, cx))),
+                )
+                .child(
+                    hit("show-history")
+                        .p_2()
+                        .child(Icon::History.draw(18., GREEN))
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.sidebar_expanded = Some(true);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    hit("mcp-servers")
+                        .p_2()
+                        .child(Icon::Plug.draw(18., GREEN))
+                        .on_click(cx.listener(|s, _, _, cx| s.show_mcp(cx))),
+                );
+        }
         let mut side = column()
-            .w(px(225.))
+            .w(px(260.))
             .flex_none()
             .h_full()
             .p_3()
@@ -422,7 +490,16 @@ impl Servers {
                     .gap_2()
                     .h(px(52.))
                     .child(tile(Icon::Fold, TINT, GREEN))
-                    .child(heading("Wakefold", 21.)),
+                    .child(heading("Wakefold", 21.).flex_1())
+                    .child(
+                        hit("collapse-sidebar")
+                            .p_2()
+                            .child(Icon::Sidebar.draw(16., MUTED))
+                            .on_click(cx.listener(|s, _, _, cx| {
+                                s.sidebar_expanded = Some(false);
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(label("Servers", 12., MUTED).mt_3().mb_1());
         let mut servers = column()
@@ -454,12 +531,7 @@ impl Servers {
             .child(
                 nav("new-chat", Icon::New, "New chat", false)
                     .mt_3()
-                    .on_click(cx.listener(|s, _, w, cx| {
-                        s.select_chat(Uuid::new_v4(), cx);
-                        if let Some(d) = s.current_draft() {
-                            w.focus(&d.input.focus_handle(cx));
-                        }
-                    })),
+                    .on_click(cx.listener(|s, _, w, cx| s.new_chat(w, cx))),
             )
             .child(
                 nav("mcp-servers", Icon::Plug, "MCP servers", self.mcp.is_some())
@@ -475,6 +547,7 @@ impl Servers {
             let id = c.chat_id;
             chats = chats.child(
                 hit(format!("chat-{id}"))
+                    .flex_none()
                     .gap_2()
                     .px_2()
                     .py_2()
@@ -609,9 +682,6 @@ impl Servers {
         if let Some(mcp) = &self.mcp {
             return self.mcp_view(mcp, cx);
         }
-        if self.artifacts.visible {
-            return self.artifact_library(cx);
-        }
         if self.chat.is_some() {
             return self.chat_view(cx);
         }
@@ -643,7 +713,41 @@ impl Servers {
     }
 }
 impl Render for Servers {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        if self.viewport.replace(viewport) != Some(viewport) {
+            self.conversation.follow_if_near_bottom();
+            self.dock.follow_child_if_near_bottom();
+        }
+        let width = f32::from(viewport.width);
+        let chat_visible = self.chat.is_some()
+            && self.form.is_none()
+            && self.mcp.is_none()
+            && !matches!(self.status, Status::NeedsLocalKey(_));
+        let title = if chat_visible {
+            self.chats
+                .iter()
+                .find(|c| Some(c.chat_id) == self.chat)
+                .and_then(|c| c.title.clone())
+                .unwrap_or_else(|| "New chat".into())
+        } else {
+            self.active.name.clone()
+        };
+        let mut buttons = row()
+            .gap_3()
+            .flex_none()
+            .child(dot(if matches!(self.status, Status::Connected) {
+                GREEN
+            } else {
+                AMBER
+            }))
+            .child(label(self.status.label().to_owned(), 12., MUTED));
+        if chat_visible {
+            buttons = buttons.child(
+                action("chat-artifacts", "Artifacts", false)
+                    .on_click(cx.listener(|s, _, _, cx| s.open_panel(Panel::Artifacts, cx))),
+            );
+        }
         let header = row()
             .justify_between()
             .gap_3()
@@ -654,23 +758,41 @@ impl Render for Servers {
             .border_color(rgb(LINE))
             .child(
                 column()
-                    .child(heading(self.active.name.clone(), 17.))
-                    .child(label(self.active.url.clone(), 12., MUTED)),
+                    .min_w_0()
+                    .flex_1()
+                    .child(heading(title, 17.).truncate())
+                    .child(
+                        label(
+                            if chat_visible {
+                                self.active.name.clone()
+                            } else {
+                                self.active.url.clone()
+                            },
+                            12.,
+                            MUTED,
+                        )
+                        .truncate(),
+                    ),
             )
-            .child(
-                row()
-                    .gap_2()
-                    .child(dot(if matches!(self.status, Status::Connected) {
-                        GREEN
-                    } else {
-                        AMBER
-                    }))
-                    .child(label(self.status.label().to_owned(), 12., MUTED)),
-            );
+            .child(buttons);
+        let main = column()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
+            .child(header)
+            .child(self.content(cx));
+        let expanded = self.sidebar_expanded.unwrap_or(width > 860.);
+        let workspace = if chat_visible {
+            self.split_workspace(main, width - if expanded { 260. } else { 68. }, cx)
+        } else {
+            main
+        };
         row()
+            .on_drag_move(crate::scrollbar::drag)
             .on_action(cx.listener(|s, _: &crate::SendMessage, w, cx| {
                 if s.mcp.is_none()
-                    && !s.artifacts.visible
                     && s.form.is_none()
                     && s.current_draft()
                         .is_some_and(|d| d.input.focus_handle(cx).is_focused(w))
@@ -681,15 +803,9 @@ impl Render for Servers {
             .size_full()
             .bg(rgb(PAPER))
             .font_family("Inter")
-            .child(self.sidebar(cx))
-            .child(
-                column()
-                    .h_full()
-                    .flex_1()
-                    .min_w_0()
-                    .child(header)
-                    .child(self.content(cx)),
-            )
+            .overflow_hidden()
+            .child(self.sidebar(expanded, cx))
+            .child(workspace)
     }
 }
 impl Drop for Servers {

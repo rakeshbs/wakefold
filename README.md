@@ -59,13 +59,19 @@ OS credential store (Keychain on macOS). Add the same URL again to replace
 its token. For a private CA, you can set `WAKEFOLD_CA_FILE` to its PEM file
 when launching the client.
 
-Choose **New chat** and send a message, or open a chat in the sidebar. Each
+Choose **New chat** and press Return to send. Shift + Return inserts a line break,
+and pasting keeps newlines and indentation. Open an existing chat in the sidebar. Each
 follow-up goes to the same root agent. Expand **Activity** under a reply to
 see its child agents. Select a child to read its assignment and final result
-beside the conversation. Published files appear under the request that
-produced them. Choose **Artifacts** to see all revisions in the chat.
-**Open** launches a document in its desktop application. **Download** saves
-the selected revision to a location you choose.
+in a tab beside the conversation. Choose **Artifacts** for the chat’s published
+revisions, or click a file under a reply to preview that revision in another tab.
+Drag the divider to resize the panel. Each tab keeps its scroll position,
+and the message box stays available. The chat follows new replies while you
+are near the bottom and lets you scroll back to read earlier turns.
+
+Markdown, text and raster images have inline previews. On macOS, supported
+office documents and PDFs show a Quick Look thumbnail. **Open in app** opens
+the full document. **Download** saves the selected revision.
 
 A pending tool approval shows the tool name and
 arguments, with **Approve once** and **Decline** actions.

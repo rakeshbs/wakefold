@@ -4,6 +4,7 @@ use svgtypes::{PathParser, PathSegment};
 
 #[derive(Clone, Copy)]
 pub enum Icon {
+    Sidebar,
     Search,
     New,
     Library,
@@ -25,6 +26,7 @@ pub enum Icon {
 impl Icon {
     fn path(self) -> &'static str {
         match self {
+            Self::Sidebar => "M3 4 L21 4 L21 20 L3 20 Z M9 4 L9 20",
             Self::Search => {
                 "M16 16 L21 21 M18 10.5 C18 14.65 14.65 18 10.5 18 C6.35 18 3 14.65 3 10.5 C3 6.35 6.35 3 10.5 3 C14.65 3 18 6.35 18 10.5 Z"
             }

@@ -453,6 +453,22 @@ fn manage_mcp_and_download_revisions(cx: &mut TestAppContext) {
     });
     assert!(cx.debug_bounds("Download-1-1").is_some());
     click(cx, "chat-artifacts");
+    click(cx, "view-1-1");
+    wait(&view, cx, "first CSV preview", |s| {
+        s.dock.preview_text(1, 1) == Some("item,quantity\nnotebook,4\n")
+    });
+    assert!(
+        cx.debug_bounds("composer").unwrap().right()
+            <= cx.debug_bounds("workspace-panel").unwrap().left()
+    );
+    click(cx, "tab-artifacts");
+    click(cx, "view-1-2");
+    wait(&view, cx, "second CSV preview", |s| {
+        s.dock.preview_text(1, 2) == Some("item,quantity\nnotebook,6\n")
+    });
+    click(cx, "tab-file-1-1");
+    cx.update(|_, app| assert_eq!(view.read(app).dock.active, Some(Panel::File(1, 1))));
+    click(cx, "tab-artifacts");
     let _restarted = restart(running, cx);
     assert_eq!(
         fs::read_to_string(d.join("catalog-calls.jsonl"))

@@ -1,4 +1,5 @@
 // Adapted from Zed GPUI 0.2.2 examples/input.rs, Apache-2.0.
+mod multiline;
 use std::ops::Range;
 
 use gpui::{
@@ -13,6 +14,9 @@ use unicode_segmentation::*;
 actions!(
     text_input,
     [
+        Newline,
+        MoveUp,
+        MoveDown,
         Backspace,
         Delete,
         Left,
@@ -30,6 +34,7 @@ actions!(
 );
 
 pub struct TextInput {
+    multiline: Option<multiline::Multiline>,
     focus_handle: FocusHandle,
     content: SharedString,
     scroll_x: Pixels,
@@ -131,7 +136,13 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace("\n", " "), window, cx);
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            let text = if self.multiline.is_some() {
+                text
+            } else {
+                text.replace('\n', " ")
+            };
+            self.replace_text_in_range(None, &text, window, cx);
         }
     }
 
@@ -152,6 +163,9 @@ impl TextInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if let Some(m) = &mut self.multiline {
+            m.reveal_caret = true;
+        }
         self.selected_range = offset..offset;
         cx.notify()
     }
@@ -169,6 +183,12 @@ impl TextInput {
             return 0;
         }
 
+        if let Some(layout) = self.multiline.as_ref().and_then(|m| m.layout.as_ref()) {
+            return layout
+                .index_for_position(position)
+                .unwrap_or_else(|nearest| nearest)
+                .min(self.content.len());
+        }
         let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
         else {
             return 0;
@@ -316,6 +336,9 @@ impl EntityInputHandler for TextInput {
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        if let Some(m) = &mut self.multiline {
+            m.reveal_caret = true;
+        }
         self.marked_range.take();
         cx.notify();
     }
@@ -360,8 +383,21 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
+        if let Some(layout) = self.multiline.as_ref().and_then(|m| m.layout.as_ref()) {
+            let start = layout.position_for_index(range.start)?;
+            let end = layout.position_for_index(range.end)?;
+            let right = if start.y == end.y {
+                end.x.max(start.x + px(1.))
+            } else {
+                layout.bounds().right()
+            };
+            return Some(Bounds::from_corners(
+                start,
+                point(right, start.y + layout.line_height()),
+            ));
+        }
+        let last_layout = self.last_layout.as_ref()?;
         Some(Bounds::from_corners(
             point(
                 bounds.left() - self.scroll_x + last_layout.x_for_index(range.start),
@@ -380,6 +416,9 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
+        if self.multiline.is_some() {
+            return Some(self.offset_to_utf16(self.index_for_mouse_position(point)));
+        }
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
 
@@ -586,10 +625,30 @@ impl Element for TextElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let field = if self.multiline.is_some() {
+            self.wrapped(window, cx).into_any_element()
+        } else {
+            div()
+                .h(px(32.))
+                .w_full()
+                .p(px(4.))
+                .bg(white())
+                .child(TextElement { input: cx.entity() })
+                .into_any_element()
+        };
         div()
             .flex()
-            .key_context("TextInput")
+            .key_context(if self.multiline.is_some() {
+                "TextInput Multiline"
+            } else {
+                "TextInput"
+            })
+            .on_action(
+                cx.listener(|s, _: &Newline, w, cx| s.replace_text_in_range(None, "\n", w, cx)),
+            )
+            .on_action(cx.listener(|s, _: &MoveUp, _, cx| s.vertical_move(-1., cx)))
+            .on_action(cx.listener(|s, _: &MoveDown, _, cx| s.vertical_move(1., cx)))
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
@@ -613,14 +672,7 @@ impl Render for TextInput {
             .overflow_hidden()
             .line_height(px(24.))
             .text_size(px(15.))
-            .child(
-                div()
-                    .h(px(32.))
-                    .w_full()
-                    .p(px(4.))
-                    .bg(white())
-                    .child(TextElement { input: cx.entity() }),
-            )
+            .child(field)
     }
 }
 
@@ -632,10 +684,13 @@ impl Focusable for TextInput {
 
 impl TextInput {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        Self::with_placeholder("Message Wakefold…", cx)
+        let mut field = Self::with_placeholder("Message Wakefold…", cx);
+        field.multiline = Some(Default::default());
+        field
     }
     pub fn with_placeholder(placeholder: &'static str, cx: &mut Context<Self>) -> Self {
         Self {
+            multiline: None,
             focus_handle: cx.focus_handle(),
             content: "".into(),
             scroll_x: px(0.),
@@ -660,6 +715,9 @@ impl TextInput {
 }
 pub fn bind(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("shift-enter", Newline, Some("Multiline")),
+        KeyBinding::new("up", MoveUp, Some("Multiline")),
+        KeyBinding::new("down", MoveDown, Some("Multiline")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),
         KeyBinding::new("left", Left, Some("TextInput")),
