@@ -26,7 +26,18 @@ jobs:
         run: cargo test --locked --workspace --exclude wakefold-desktop --all-features
 
   desktop:
-    runs-on: macos-latest
+    name: Desktop (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
         with:
@@ -37,8 +48,14 @@ jobs:
           rustup toolchain install "$rust_version" --profile minimal --component clippy
           rustup override set "$rust_version"
       - name: Lint desktop
+        if: runner.os == 'macOS'
         run: cargo clippy --locked -p wakefold-desktop --all-targets -- -D warnings
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfontconfig-dev libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libvulkan1 mesa-vulkan-drivers fonts-dejavu-core
       - name: Test desktop
         run: cargo test --locked -p wakefold-desktop
-      - name: Test the remote connection and reconnect
-        run: crates/desktop/tests/remote-macos.sh
+      - name: Test reconnect, delegation, approvals and artifact revisions
+        run: python crates/desktop/tests/remote.py

@@ -47,7 +47,7 @@ fn daemon_for(dir: &Path, test: &str) -> Result<Process> {
         .append(true)
         .open(dir.join("daemon.log"))?;
     Ok(Process(
-        Command::new(std::env::var_os("WAKEFOLD_TEST_DAEMON").context("Run remote-macos.sh")?)
+        Command::new(std::env::var_os("WAKEFOLD_TEST_DAEMON").context("Run remote.py")?)
             .args(["--exact", test, "--nocapture"])
             .env("WAKEFOLD_DAEMON_TEST_CONFIG", dir.join("daemon.json"))
             .stdout(Stdio::null())
@@ -65,7 +65,7 @@ fn window(dir: &Path, phase: &str) -> Result<Process> {
     ))
 }
 #[test]
-#[ignore = "runs desktop and daemon processes with TLS; use crates/desktop/tests/remote-macos.sh"]
+#[ignore = "runs desktop and daemon processes with TLS; use crates/desktop/tests/remote.py"]
 fn reopen_chat_and_restart_daemon() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let d = dir.path();
@@ -81,7 +81,7 @@ fn reopen_chat_and_restart_daemon() -> Result<()> {
     let port = address.parse::<std::net::SocketAddr>()?.port();
     let mut profiles = Profiles::default();
     profiles.remember(Profile::remote(
-        "Mac fixture",
+        "Test daemon",
         &format!("https://localhost:{port}"),
     )?);
     profiles.save(&d.join("servers.json"))?;
@@ -327,7 +327,7 @@ fn chat_window(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-#[ignore = "uses a separate TLS daemon; run remote-macos.sh"]
+#[ignore = "uses a separate TLS daemon; run remote.py"]
 fn manage_mcp_and_download_revisions(cx: &mut TestAppContext) {
     // The real daemon connection wakes GPUI from Tokio's I/O thread.
     cx.executor().allow_parking();
@@ -348,7 +348,7 @@ fn manage_mcp_and_download_revisions(cx: &mut TestAppContext) {
     let mut process = daemon_for(d, fixture).unwrap();
     let address = until_file(&d.join("listen"), &mut process).unwrap();
     let port = address.parse::<std::net::SocketAddr>().unwrap().port();
-    let profile = Profile::remote("Mac fixture", &format!("https://localhost:{port}")).unwrap();
+    let profile = Profile::remote("Test daemon", &format!("https://localhost:{port}")).unwrap();
     let mut profiles = Profiles::default();
     profiles.remember(profile.clone());
     profiles.save(&d.join("servers.json")).unwrap();
@@ -375,7 +375,8 @@ fn manage_mcp_and_download_revisions(cx: &mut TestAppContext) {
     click(cx, "mcp-servers");
     wait_control(cx, "new-mcp");
     click(cx, "new-mcp");
-    for (selector, value) in [("mcp-name", "catalog"), ("mcp-command", "python3")] {
+    let python = std::env::var("WAKEFOLD_TEST_PYTHON").expect("Run remote.py");
+    for (selector, value) in [("mcp-name", "catalog"), ("mcp-command", python.as_str())] {
         click(cx, selector);
         cx.simulate_input(value);
     }

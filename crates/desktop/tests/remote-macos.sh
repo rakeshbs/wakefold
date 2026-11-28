@@ -1,10 +1,2 @@
 #!/bin/sh
-# Exercise the desktop transport against the daemon with its deterministic mailbox provider.
-set -eu
-cd "$(dirname "$0")/../../.."
-daemon_test=$(cargo test --locked --no-run -p wakefold-daemon --message-format=json |
-  python3 -c 'import json, sys
-print([record["executable"] for line in sys.stdin if (record := json.loads(line)).get("executable") and record["target"]["name"] == "wakefold"].pop())')
-WAKEFOLD_TEST_DAEMON="$daemon_test" cargo test --locked -p wakefold-desktop connection::tests::reconnect_to_remote_daemon -- --exact --ignored --nocapture
-WAKEFOLD_TEST_DAEMON="$daemon_test" cargo test --locked -p wakefold-desktop servers::workflow_test::reopen_chat_and_restart_daemon -- --exact --ignored --nocapture
-WAKEFOLD_TEST_DAEMON="$daemon_test" cargo test --locked -p wakefold-desktop servers::workflow_test::manage_mcp_and_download_revisions -- --exact --ignored --nocapture
+exec python3 "$(dirname "$0")/remote.py" "$@"

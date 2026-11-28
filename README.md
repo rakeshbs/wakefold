@@ -83,8 +83,9 @@ them. Launch with `--preview` to explore the design with sample data.
 
 On macOS, run `python3 crates/desktop/tests/local-daemon-macos.py` with port 8700 free
 to exercise first launch, daemon reuse and quitting the native app in temporary profiles.
-Run `crates/desktop/tests/remote-macos.sh` from the repository
-root to test with a separate daemon, temporary TLS credentials and a
+Run `python3 crates/desktop/tests/remote.py` on macOS or Linux, or
+`py -3 crates/desktop/tests/remote.py` on Windows, with the OpenSSL CLI on your
+path. The runner starts a separate daemon with temporary TLS credentials and a
 deterministic model. The tests replay events after a connection drop, reopen
 a chat with two children, restart the daemon during a pending approval, and
 send a follow-up to the original root. They also configure a stdio MCP server,

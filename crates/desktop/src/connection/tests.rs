@@ -108,7 +108,7 @@ async fn post(d: &Daemon, path: &str, body: Value) -> Result<reqwest::Response> 
 }
 
 #[tokio::test]
-#[ignore = "launches a daemon process and opens TLS sockets; run crates/desktop/tests/remote-macos.sh"]
+#[ignore = "launches a daemon process and opens TLS sockets; run crates/desktop/tests/remote.py"]
 async fn reconnect_to_remote_daemon() -> Result<()> {
     time::timeout(Duration::from_secs(55), scenario()).await?
 }
@@ -129,8 +129,8 @@ async fn scenario() -> Result<()> {
             "defaults":{"model":"scripted-workflow-provider","max_model_turns":6,"token_budget":30,"tool_grants":{"notices.wait":"require_approval"}}
         }))?,
     )?;
-    let executable = std::env::var_os("WAKEFOLD_TEST_DAEMON")
-        .context("Run crates/desktop/tests/remote-macos.sh")?;
+    let executable =
+        std::env::var_os("WAKEFOLD_TEST_DAEMON").context("Run crates/desktop/tests/remote.py")?;
     let mut process = tokio::process::Command::new(executable)
         .kill_on_drop(true)
         .args([
@@ -156,7 +156,7 @@ async fn scenario() -> Result<()> {
     };
     let ca = base.join("ca.pem");
     let profile = Profile::remote(
-        "Mac daemon",
+        "Test daemon",
         &format!("https://localhost:{}", address.port()),
     )?;
     let daemon = Daemon::new(&profile, Some(token), Some(&ca))?;
