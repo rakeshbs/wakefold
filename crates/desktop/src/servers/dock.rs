@@ -440,17 +440,18 @@ mod tests {
         let composer = cx.debug_bounds("composer").unwrap();
         let feed = cx.debug_bounds("conversation").unwrap();
         assert!(feed.bottom() <= composer.top());
-        let scroll = cx.update(|_, app| view.read(app).conversation.scroll.clone());
-        assert!(scroll.max_offset().y > px(500.));
+        let scroll = cx.update(|_, app| view.read(app).conversation.transcript.list.clone());
+        assert!(scroll.max_offset_for_scrollbar().y > px(500.));
         assert!(
-            (scroll.offset().y + scroll.max_offset().y).abs() < px(1.),
+            (scroll.scroll_px_offset_for_scrollbar().y + scroll.max_offset_for_scrollbar().y).abs()
+                < px(1.),
             "initial offset {:?}, maximum {:?}",
-            scroll.offset(),
-            scroll.max_offset()
+            scroll.scroll_px_offset_for_scrollbar(),
+            scroll.max_offset_for_scrollbar()
         );
         wheel(cx, "conversation", 380.);
-        let reading = scroll.offset().y;
-        assert!(reading + scroll.max_offset().y > px(300.));
+        let reading = scroll.scroll_px_offset_for_scrollbar().y;
+        assert!(reading + scroll.max_offset_for_scrollbar().y > px(300.));
         cx.update(|_, app| {
             view.update(app, |s, cx| {
                 let mut runs = s.runs.clone();
@@ -472,7 +473,7 @@ mod tests {
             })
         });
         cx.run_until_parked();
-        assert_eq!(scroll.offset().y, reading);
+        assert_eq!(scroll.scroll_px_offset_for_scrollbar().y, reading);
         assert_eq!(cx.debug_bounds("composer").unwrap(), composer);
         let rail = cx.debug_bounds("chat-scrollbar").unwrap();
         cx.simulate_click(
@@ -480,7 +481,7 @@ mod tests {
             Default::default(),
         );
         cx.run_until_parked();
-        assert_eq!(scroll.offset().y, px(0.));
+        assert_eq!(scroll.scroll_px_offset_for_scrollbar().y, px(0.));
         cx.update(|_, app| app.set_reduce_motion(false));
         check_edge_gesture(cx, "chat-scrollbar", "activity-1", 100.);
         cx.update(|_, app| app.set_reduce_motion(true));
@@ -493,7 +494,7 @@ mod tests {
             ..Default::default()
         });
         cx.run_until_parked();
-        assert_eq!(scroll.offset().y, px(-36.));
+        assert_eq!(scroll.scroll_px_offset_for_scrollbar().y, px(-36.));
         wheel(cx, "conversation", 36.);
         let grab = point(rail.right() - px(6.), rail.top() + px(4.));
         cx.simulate_mouse_down(grab, MouseButton::Left, Default::default());
@@ -511,8 +512,8 @@ mod tests {
             Default::default(),
         );
         cx.run_until_parked();
-        assert!(scroll.offset().y < px(-10.));
-        let reading = scroll.offset().y;
+        assert!(scroll.scroll_px_offset_for_scrollbar().y < px(-10.));
+        let reading = scroll.scroll_px_offset_for_scrollbar().y;
         click(cx, "chat-artifacts");
         cx.update(|_, app| view.update(app, |s, cx| s.open_panel(Panel::Child(2), cx)));
         cx.run_until_parked();
@@ -531,7 +532,7 @@ mod tests {
         cx.run_until_parked();
         assert!((panel_scroll.offset().y + panel_scroll.max_offset().y).abs() < px(1.));
         check_edge_gesture(cx, "panel-scrollbar", "panel-scroll", -100.);
-        assert_eq!(scroll.offset().y, reading);
+        assert_eq!(scroll.scroll_px_offset_for_scrollbar().y, reading);
         click(cx, "tab-artifacts");
         click(cx, "tab-agent-2");
         assert!(panel_scroll.offset().y < px(-100.));

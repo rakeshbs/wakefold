@@ -2,6 +2,9 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+thread_local! { static TURNS_RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 pub(super) struct Draft {
     pub(super) input: Entity<TextInput>,
     sending: bool,
@@ -16,7 +19,7 @@ pub(super) struct Conversation {
     show_events: bool,
     tool_detail: Option<(i64, u64)>,
     loaded: bool,
-    pub(super) scroll: gpui::ScrollHandle,
+    pub(super) transcript: super::transcript::Transcript,
 }
 pub(super) fn follow_if_near_bottom(scroll: &gpui::ScrollHandle) {
     if scroll.max_offset().y + scroll.offset().y < px(100.) {
@@ -26,7 +29,7 @@ pub(super) fn follow_if_near_bottom(scroll: &gpui::ScrollHandle) {
 
 impl Conversation {
     pub(super) fn follow_if_near_bottom(&self) {
-        follow_if_near_bottom(&self.scroll);
+        self.transcript.follow_if_near_bottom();
     }
 
     pub(super) fn reset_view(&mut self) {
@@ -34,7 +37,7 @@ impl Conversation {
         self.show_events = false;
         self.tool_detail = None;
         self.loaded = false;
-        self.scroll = gpui::ScrollHandle::new();
+        self.transcript = Default::default();
     }
 }
 
@@ -101,7 +104,7 @@ impl Servers {
         };
         self.ensure_draft(cx);
         if !self.conversation.loaded {
-            self.conversation.scroll.scroll_to_bottom();
+            self.conversation.transcript.follow_latest();
         }
         self.conversation.loaded = true;
         if let Some(key) = self.pending_request(&server, chat).map(|id| id.to_string())
@@ -230,7 +233,7 @@ impl Servers {
             .expect("selected chat has a draft");
         draft.sending = true;
         draft.error = None;
-        self.conversation.scroll.scroll_to_bottom();
+        self.conversation.transcript.follow_latest();
         let post = self
             .runtime
             .spawn(async move { client.send_prompt(chat, request, &prompt).await });
@@ -412,6 +415,8 @@ impl Servers {
         cx: &mut Context<Self>,
     ) -> Div {
         let colors = crate::theme::palette(cx);
+        #[cfg(test)]
+        TURNS_RENDERED.with(|count| count.set(count.get() + 1));
         let id = root.run_id;
         let expanded = !self.conversation.collapsed.contains(&id);
         let count = children.len();
@@ -642,21 +647,20 @@ impl Servers {
     }
     pub(super) fn chat_view(&self, cx: &mut Context<Self>) -> Div {
         let colors = crate::theme::palette(cx);
-        let mut feed = column()
+        let viewport = column()
             .id("conversation")
             .debug_selector(|| "conversation".into())
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.conversation.scroll)
-            .px(px(24.))
-            .pt(px(36.))
-            .pb(px(24.))
-            .items_center()
-            .gap(px(30.));
-        if self.runs.is_empty() {
-            feed = feed
+            .min_w_0();
+        let transcript = &self.conversation.transcript;
+        let feed = if transcript.turns.is_empty() {
+            use gpui::component::scroll::ScrollableElement;
+            viewport
+                .overflow_y_scrollbar()
+                .items_center()
                 .justify_center()
+                .gap(px(30.))
                 .child(self.character.clone())
                 .child(heading(
                     colors,
@@ -666,47 +670,70 @@ impl Servers {
                         "Opening chat…"
                     },
                     20.,
-                ));
+                ))
+                .into_any_element()
         } else {
-            let mut children = BTreeMap::<i64, Vec<&Run>>::new();
-            for run in &self.runs {
-                if let Some(parent) = run.spawned_by_run_id {
-                    children.entry(parent).or_default().push(run);
-                }
-            }
-            let latest = self.latest_root();
-            for root in self.runs.iter().filter(|r| r.parent_agent_id.is_none()) {
-                feed = feed.child(
+            transcript.apply_follow();
+            let view = cx.entity().downgrade();
+            let list = gpui::list(transcript.list.clone(), move |index, _, app| {
+                view.update(app, |server, cx| {
+                    let rows = &server.conversation.transcript.turns;
+                    let row = &rows[index];
+                    let root = &server.runs[row.root];
+                    let children: Vec<_> = row.children.iter().map(|i| &server.runs[*i]).collect();
                     column()
-                        .id(("turn", root.run_id as u64))
                         .w_full()
-                        .min_w_0()
-                        .max_w(px(1120.))
-                        .flex_none()
+                        .px(px(24.))
+                        .items_center()
+                        .when(index == 0, |e| e.pt(px(36.)))
+                        .pb(px(if index + 1 == rows.len() { 24. } else { 30. }))
                         .child(
-                            self.turn(
-                                root,
-                                children
-                                    .get(&root.run_id)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or_default(),
-                                latest,
-                                cx,
-                            ),
-                        ),
-                );
-            }
-        }
+                            column()
+                                .id(("turn", root.run_id as u64))
+                                .w_full()
+                                .min_w_0()
+                                .max_w(px(1120.))
+                                .child(server.turn(
+                                    root,
+                                    &children,
+                                    rows.last().map(|row| server.runs[row.root].run_id),
+                                    cx,
+                                )),
+                        )
+                        .into_any_element()
+                })
+                .unwrap_or_else(|_| div().into_any_element())
+            })
+            .size_full();
+            let state = transcript.list.clone();
+            // Reflow wrapped turns when pane width changes so the scrollbar stays accurate.
+            let measure_width = gpui::canvas(
+                move |bounds, _, _| {
+                    if state.viewport_bounds().size.width != bounds.size.width {
+                        state.clone().measure_all();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0();
+            scroll_pane(
+                "chat-scrollbar",
+                viewport
+                    .relative()
+                    .overflow_hidden()
+                    .child(measure_width)
+                    .child(list),
+                &transcript.list,
+            )
+            .into_any_element()
+        };
         let mut main = column()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
-            .child(scroll_pane(
-                "chat-scrollbar",
-                feed,
-                &self.conversation.scroll,
-            ));
+            .child(feed);
         if let Some(draft) = self.current_draft() {
             let status = if draft.sending {
                 "Sending…"
@@ -775,5 +802,134 @@ impl Servers {
             );
         }
         main
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{
+        ListState, ScrollDelta, ScrollEvent, TestAppContext, TouchPhase, VisualTestContext, point,
+        size,
+    };
+
+    fn run(run_id: i64) -> Run {
+        Run {
+            run_id,
+            agent_id: 1,
+            parent_agent_id: None,
+            spawned_by_run_id: None,
+            run_key: run_id.to_string(),
+            latest_event: "run_finished".into(),
+            task: format!("Summarize report {run_id}"),
+            outcome: Some(
+                "## Findings\n\n- **Storage** stays local.\n- Uploads resume after reconnecting."
+                    .into(),
+            ),
+            status: "completed".into(),
+        }
+    }
+
+    fn snapshot(runs: Vec<Run>) -> Update {
+        Update::Snapshot {
+            chats: vec![],
+            runs,
+            approvals: vec![],
+            artifacts: vec![],
+        }
+    }
+
+    #[gpui::test]
+    fn scrolling_long_chat_only_renders_nearby_turns(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let path = dir.path().join("settings.json");
+            let mut server = Servers::with_settings(Runtime::new().unwrap(), Some(path), cx);
+            server.load = None;
+            server.chat = Some(Uuid::new_v4());
+            server.apply(snapshot((1..=100).map(run).collect()), cx);
+            server
+        });
+        cx.simulate_resize(size(px(1180.), px(745.)));
+        cx.run_until_parked();
+        let list = cx.update(|_, app| view.read(app).conversation.transcript.list.clone());
+        let gap_to_bottom = |list: &ListState| {
+            list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y
+        };
+        assert!(
+            gap_to_bottom(&list).abs() < px(1.),
+            "gap {:?}",
+            gap_to_bottom(&list)
+        );
+        let position = cx.debug_bounds("conversation").unwrap().center();
+        let wheel = |cx: &mut VisualTestContext, dy: f32, phase| {
+            cx.simulate_event(ScrollEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                touch_phase: phase,
+                ..Default::default()
+            })
+        };
+
+        TURNS_RENDERED.with(|count| count.set(0));
+        for _ in 0..20 {
+            wheel(cx, 38., TouchPhase::Moved);
+        }
+        let rendered = TURNS_RENDERED.with(|count| count.get());
+        assert!(
+            (1..400).contains(&rendered),
+            "turns rebuilt during 20 scroll updates: {rendered}"
+        );
+        assert!((gap_to_bottom(&list) - px(760.)).abs() < px(1.));
+
+        let before = list.logical_scroll_top();
+        cx.update(|_, app| {
+            view.update(app, |s, cx| {
+                let mut runs = s.runs.clone();
+                runs.push(run(101));
+                s.apply(snapshot(runs), cx);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(list.logical_scroll_top().item_ix, before.item_ix);
+        assert_eq!(
+            list.logical_scroll_top().offset_in_item,
+            before.offset_in_item
+        );
+
+        let track = cx.debug_bounds("chat-scrollbar").unwrap();
+        cx.simulate_click(
+            point(track.right() - px(6.), track.top() + px(1.)),
+            Default::default(),
+        );
+        cx.run_until_parked();
+        assert_eq!(list.scroll_px_offset_for_scrollbar().y, px(0.));
+
+        cx.simulate_click(
+            point(track.right() - px(6.), track.bottom() - px(1.)),
+            Default::default(),
+        );
+        cx.run_until_parked();
+        assert!(
+            gap_to_bottom(&list).abs() < px(1.),
+            "gap {:?}",
+            gap_to_bottom(&list)
+        );
+        cx.update(|_, app| {
+            view.update(app, |s, cx| {
+                let mut runs = s.runs.clone();
+                runs.push(run(102));
+                s.apply(snapshot(runs), cx);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            gap_to_bottom(&list).abs() < px(1.),
+            "gap {:?}",
+            gap_to_bottom(&list)
+        );
+        assert!(cx.debug_bounds("activity-102").is_some());
     }
 }

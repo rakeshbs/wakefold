@@ -3,6 +3,7 @@ mod artifacts;
 mod conversation;
 mod dock;
 mod mcp;
+mod transcript;
 #[cfg(test)]
 mod workflow_test;
 use crate::{
@@ -300,6 +301,11 @@ impl Servers {
                 {
                     self.conversation.follow_if_near_bottom();
                     self.dock.follow_child_if_near_bottom();
+                    self.conversation.transcript.sync(
+                        &self.runs,
+                        &runs,
+                        self.approvals != approvals || self.artifacts.revisions != artifacts,
+                    );
                 }
                 self.chats = chats;
                 self.runs = runs;
@@ -325,21 +331,25 @@ impl Servers {
                 if self.events.len() >= 200 {
                     self.events.pop_front();
                 }
-                if let Some(run) = self.runs.iter_mut().find(|r| r.run_id == e.run_id)
-                    && !run.finished()
-                {
-                    run.latest_event.clone_from(&e.event.kind);
-                    if matches!(e.event.kind.as_str(), "run_finished" | "run_failed") {
-                        run.status = if e.event.kind == "run_finished" {
-                            "completed"
-                        } else {
-                            "failed"
-                        }
-                        .into();
-                        run.outcome = e.event.data.as_str().map(str::to_owned);
-                    }
-                }
                 self.conversation.follow_if_near_bottom();
+                if let Some(run) = self.runs.iter_mut().find(|r| r.run_id == e.run_id) {
+                    if !run.finished() {
+                        run.latest_event.clone_from(&e.event.kind);
+                        if matches!(e.event.kind.as_str(), "run_finished" | "run_failed") {
+                            run.status = if e.event.kind == "run_finished" {
+                                "completed"
+                            } else {
+                                "failed"
+                            }
+                            .into();
+                            run.outcome = e.event.data.as_str().map(str::to_owned);
+                        }
+                    }
+                    let root_id = run.spawned_by_run_id.unwrap_or(run.run_id);
+                    self.conversation
+                        .transcript
+                        .invalidate_hidden_turn(&self.runs, root_id);
+                }
                 self.dock.follow_child_if_near_bottom();
                 self.dock.receive_event(&e);
                 self.events.push_back(e);
