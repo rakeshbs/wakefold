@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod mcp;
+mod remote;
 mod replay;
 #[cfg(feature = "sandbox")]
 mod sandbox;
@@ -61,7 +62,15 @@ async fn main() -> Result<(), DaemonError> {
             })
             .await?;
             let listener = TcpListener::bind(runtime.bind).await?;
-            println!("Wakefold listening on http://{}", listener.local_addr()?);
+            let scheme = if runtime.remote.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            println!(
+                "Wakefold listening on {scheme}://{}",
+                listener.local_addr()?
+            );
             let stop = CancellationToken::new();
             let signal_stop = stop.clone();
             tokio::spawn(async move {

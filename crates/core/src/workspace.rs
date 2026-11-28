@@ -56,7 +56,41 @@ pub struct WorkspaceStore {
     pub(crate) state: PathBuf,
 }
 
+/// A root session as it appears in the saved chat list.
+#[derive(Debug, serde::Serialize)]
+pub struct SavedChat {
+    pub chat_id: ChatId,
+    pub root_agent_id: i64,
+    /// First user request, shortened for display. Empty chats have no title yet.
+    pub title: Option<String>,
+}
+
 impl WorkspaceStore {
+    /// Read a page of chat roots in descending creation order.
+    pub fn saved_chats(
+        &self,
+        before: Option<i64>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<SavedChat>, WorkspaceError> {
+        let mut query = self.connection.prepare(
+            "SELECT s.chat_id, s.agent_id,
+                (SELECT substr(json_extract(e.event_json, '$.data'), 1, 96)
+                 FROM run_events e WHERE e.agent_id=s.agent_id
+                 AND json_extract(e.event_json, '$.kind')='run_started'
+                 ORDER BY e.sequence LIMIT 1)
+             FROM agent_sessions s WHERE s.is_chat_root=1 AND (?1 IS NULL OR s.agent_id < ?1)
+             ORDER BY s.agent_id DESC LIMIT ?2",
+        )?;
+        let rows = query.query_map(params![before, limit.get()], |r| {
+            Ok(SavedChat {
+                chat_id: r.get(0)?,
+                root_agent_id: r.get(1)?,
+                title: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Open the runtime state directory, initializing its metadata if necessary.
     ///
     /// # Errors

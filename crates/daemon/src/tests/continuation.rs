@@ -155,6 +155,20 @@ async fn follow_up_keeps_the_agent_and_survives_restart() {
             until_event(address, first_id, "run_finished").await["event"]["data"],
             FIRST_ANSWER
         );
+        let chats: Vec<Value> = client
+            .get(format!("http://{address}/chats"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            chats,
+            vec![json!({"chat_id":chat, "root_agent_id":started["agent_id"], "title":FIRST})]
+        );
         let earlier = history(&client, address, chat).await;
 
         let second = json!({"chat_id":chat,"run_key":"edit","prompt":SECOND});

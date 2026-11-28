@@ -17,16 +17,27 @@ pub(crate) async fn serve(
     mut runtime: Runtime,
     stop: CancellationToken,
 ) -> Result<(), DaemonError> {
-    if !listener.local_addr()?.ip().is_loopback() {
+    if runtime.remote.is_none() && !listener.local_addr()?.ip().is_loopback() {
         return Err("daemon listener must be loopback".into());
     }
     let store = WorkspaceStore::open(&runtime.state_directory)?;
     tracing::info!(address = %listener.local_addr()?, "daemon started");
-    let app = api::router(store, runtime.defaults.clone(), stop.clone());
+    let remote = runtime.remote.take();
+    let app = api::router(
+        store,
+        runtime.defaults.clone(),
+        stop.clone(),
+        remote.as_ref().map(|r| r.bearer.clone()),
+    );
     let http = async {
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(stop.clone().cancelled_owned())
-            .await;
+        let result = match remote {
+            Some(remote) => remote.serve(listener, app, stop.clone()).await,
+            None => {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(stop.clone().cancelled_owned())
+                    .await
+            }
+        };
         stop.cancel();
         result
     };

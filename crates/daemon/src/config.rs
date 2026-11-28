@@ -26,6 +26,7 @@ pub(crate) struct Config {
     pub(crate) state_directory: PathBuf,
     #[serde(default = "default_bind")]
     pub(crate) bind: SocketAddr,
+    pub(crate) remote: Option<crate::remote::RemoteConfig>,
     #[serde(default = "default_concurrency")]
     max_concurrent: NonZeroUsize,
     #[serde(default)]
@@ -101,6 +102,7 @@ pub(crate) struct SharedProfile {
 }
 
 pub(crate) struct Runtime {
+    pub(crate) remote: Option<crate::remote::Remote>,
     pub(crate) state_directory: PathBuf,
     pub(crate) bind: SocketAddr,
     pub(crate) max_concurrent: NonZeroUsize,
@@ -119,9 +121,13 @@ impl Runtime {
         mut skills: BTreeMap<String, RegisteredSkill>,
         mut provider: impl FnMut(&str) -> Result<Box<dyn Provider>, DaemonError>,
     ) -> Result<Self, DaemonError> {
-        if !config.bind.ip().is_loopback() {
+        if config.remote.is_none() && !config.bind.ip().is_loopback() {
             return Err("daemon bind address must be loopback".into());
         }
+        let remote = config
+            .remote
+            .map(|r| r.load(&config.directory))
+            .transpose()?;
         // Own the state directory before starting the configured server processes.
         fs::create_dir_all(&config.state_directory)?;
         let state_lock = File::options()
@@ -286,6 +292,7 @@ impl Runtime {
             }
         }
         Ok(Self {
+            remote,
             state_directory: config.state_directory,
             bind: config.bind,
             max_concurrent: config.max_concurrent,

@@ -10,6 +10,10 @@ sandbox = ["dep:tempfile", "tokio/io-util", "tokio/sync"]
 [dependencies]
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
+subtle = "2"
+tokio-rustls = "0.26"
 percent-encoding = "2"
 rmcp = { version = "3.11", default-features = false, features = ["client", "transport-child-process"] }
 serde = { version = "1", features = ["derive"] }

@@ -4,6 +4,31 @@ Wakefold is a Rust library and local daemon for AI agents that can pause and res
 
 Agents can wait for a timer, a message, or human approval. They can delegate work to other agents with their own tool permissions and token budgets, load skills when needed, and call tools from local Model Context Protocol (MCP) servers.
 
+## Remote daemon access
+
+The default listener is HTTP on `127.0.0.1:8700`. To serve a desktop client on
+another machine, set the daemon's `bind` to its network address and configure
+TLS in the same JSON configuration:
+
+```json
+{
+  "bind": "192.168.1.40:8700",
+  "remote": {
+    "certificate_chain": "server-chain.pem",
+    "private_key": "server-key.pem",
+    "token_file": "desktop-token"
+  }
+}
+```
+
+Paths are relative to the configuration file. Use a certificate valid for the
+hostname or IP address the desktop will connect to, signed by a CA the client
+trusts. Generate a random token on the server, for example with
+`(umask 077 && openssl rand -hex 32 > desktop-token)`. Protect the private key
+and token file. Restart the daemon after changing either. Remote mode requires
+the same bearer token for every HTTPS request and WSS upgrade. Possession of
+the token grants access to that daemon's chats and management API.
+
 ## Chat workspaces
 
 `POST /chats` creates a chat and returns its `chat_id` UUID. Send that UUID
@@ -58,6 +83,9 @@ roots can load the spawning skill. Agents can load `mailbox` and use:
   Use `wait: false` to check immediately. An empty check returns `null`.
 - `completion_only: true` on a receive to select a child's final answer or
   failure. Progress messages stay available for a later receive.
+
+`GET /chats` lists up to 128 saved chats, newest root first, including empty
+chats. Pass the last `root_agent_id` as `before` to read the next page.
 
 `GET /chats/{chat_id}/runs` lists the root's requests and child runs.
 `GET /chats/{chat_id}/history?after=<sequence>` reads the root's journal across

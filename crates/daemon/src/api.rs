@@ -69,10 +69,11 @@ pub(crate) fn router(
     store: WorkspaceStore,
     defaults: wakefold::AgentSettings,
     stop: CancellationToken,
+    bearer: Option<Arc<str>>,
 ) -> Router {
     Router::new()
         .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
-        .route("/chats", post(create_chat))
+        .route("/chats", post(create_chat).get(saved_chats))
         .route("/runs", post(start_run))
         .route("/runs/{run_id}/events", get(events))
         .route("/runs/{run_id}/messages", post(post_message).get(messages))
@@ -85,7 +86,7 @@ pub(crate) fn router(
             "/artifacts/{artifact_id}/revisions/{revision}",
             get(download_artifact),
         )
-        .layer(middleware::from_fn(require_local_origin))
+        .layer(middleware::from_fn_with_state(bearer, authorize))
         .with_state(AppState {
             store: Arc::new(Mutex::new(store)),
             defaults: Arc::new(defaults),
@@ -191,7 +192,61 @@ async fn post_message(
     Ok((StatusCode::ACCEPTED, Json(json!({ "message_id": id }))))
 }
 
-async fn require_local_origin(request: Request, next: Next) -> Result<Response, ApiError> {
+#[derive(Deserialize)]
+struct ChatCursor {
+    before: Option<i64>,
+}
+
+async fn saved_chats(
+    State(state): State<AppState>,
+    Query(cursor): Query<ChatCursor>,
+) -> Result<Json<Vec<wakefold::SavedChat>>, ApiError> {
+    state
+        .database(move |store| {
+            store
+                .saved_chats(cursor.before, PAGE_SIZE)
+                .map(Json)
+                .map_err(ApiError::internal)
+        })
+        .await
+}
+
+async fn authorize(
+    State(bearer): State<Option<Arc<str>>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if let Some(expected) = bearer {
+        use subtle::ConstantTimeEq;
+        let supplied = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, s)| s);
+        if !supplied.is_some_and(|s| bool::from(expected.as_bytes().ct_eq(s.as_bytes()))) {
+            return Err(ApiError(
+                StatusCode::UNAUTHORIZED,
+                "a valid daemon access token is required",
+            ));
+        }
+        if let Some(origin) = request.headers().get(header::ORIGIN) {
+            let host = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok());
+            if !host.is_some_and(|host| {
+                origin.to_str().ok() == Some(format!("https://{host}").as_str())
+            }) {
+                return Err(ApiError(
+                    StatusCode::FORBIDDEN,
+                    "origin does not match Wakefold",
+                ));
+            }
+        }
+        return Ok(next.run(request).await);
+    }
     let headers = request.headers();
     let host = headers
         .get(header::HOST)

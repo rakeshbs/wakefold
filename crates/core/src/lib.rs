@@ -55,4 +55,4 @@ pub use uuid::Uuid as ChatId;
 pub use wait::{PendingWait, TimerWait, WaitOn, WakeEvent};
 #[cfg(feature = "derive")]
 pub use wakefold_macros::ToolInput;
-pub use workspace::{RunWorkspace, WorkspaceError, WorkspaceStore};
+pub use workspace::{RunWorkspace, SavedChat, WorkspaceError, WorkspaceStore};
