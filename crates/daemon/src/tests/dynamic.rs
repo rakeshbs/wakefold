@@ -190,7 +190,10 @@ async fn parent_and_children_resume_after_restart() {
         .as_i64()
         .unwrap();
     let tree = wait_for_tree(&client, address, chat, "wait_started").await;
-    assert!(tree.iter().all(|r| r["status"] == "waiting"));
+    assert!(
+        tree.iter()
+            .all(|r| r["status"] == "waiting" && r.get("outcome") == Some(&Value::Null))
+    );
     assert!(
         tree.iter()
             .skip(1)
@@ -232,6 +235,9 @@ async fn parent_and_children_resume_after_restart() {
         tree.iter().map(|r| &r["agent_id"]).collect::<Vec<_>>(),
         after.iter().map(|r| &r["agent_id"]).collect::<Vec<_>>()
     );
+    assert_eq!(after[0]["outcome"], "done");
+    assert_eq!(after[1]["outcome"], "report ready");
+    assert!(after[2]["outcome"].as_str().is_some_and(|s| !s.is_empty()));
     let messages = client
         .get(format!("http://{address}/runs/{root}/messages"))
         .send()

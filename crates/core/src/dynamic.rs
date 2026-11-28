@@ -142,15 +142,17 @@ impl WorkspaceStore {
             .collect()
     }
 
-    /// List run identities, their parents, tasks and latest journal event in a chat.
+    /// List each run with its parent, task, latest event, and terminal answer or failure.
     pub fn chat_runs(&self, chat: ChatId) -> Result<Vec<JsonValue>, JournalError> {
         let mut query = self.connection.prepare(
             "SELECT r.agent_id, s.parent_agent_id, r.run_key, r.status,
                     (SELECT json_extract(event_json, '$.data') FROM run_events
                      WHERE run_id=r.run_id ORDER BY sequence LIMIT 1),
-                    (SELECT json_extract(event_json, '$.kind') FROM run_events
-                     WHERE run_id=r.run_id ORDER BY sequence DESC LIMIT 1), r.run_id, s.spawned_by_run_id
+                    json_extract(last.event_json, '$.kind'), r.run_id, s.spawned_by_run_id,
+                    CASE WHEN r.status IN ('completed','failed') THEN json_extract(last.event_json, '$.data') END
              FROM agent_runs r JOIN agent_sessions s USING(agent_id)
+             JOIN run_events last ON last.run_id=r.run_id AND last.sequence=(
+                 SELECT MAX(sequence) FROM run_events WHERE run_id=r.run_id)
              WHERE r.chat_id=?1 AND r.status<>'reserved' ORDER BY r.run_id",
         )?;
         let rows = query.query_map([chat], |row| {
@@ -163,6 +165,7 @@ impl WorkspaceStore {
                 "status": row.get::<_, String>(3)?,
                 "task": row.get::<_, String>(4)?,
                 "latest_event": row.get::<_, String>(5)?,
+                "outcome": row.get::<_, Option<String>>(8)?,
             }))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
