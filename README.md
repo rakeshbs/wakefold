@@ -44,7 +44,12 @@ when launching the client.
 Choose **New chat** and send a message, or open a chat in the sidebar. Each
 follow-up goes to the same root agent. Expand **Activity** under a reply to
 see its child agents. Select a child to read its assignment and final result
-beside the conversation. A pending tool approval shows the tool name and
+beside the conversation. Published files appear under the request that
+produced them. Choose **Artifacts** to see all revisions in the chat.
+**Open** launches a document in its desktop application. **Download** saves
+the selected revision to a location you choose.
+
+A pending tool approval shows the tool name and
 arguments, with **Approve once** and **Decline** actions.
 
 The app remembers the last chat and selected child for each server. When it
@@ -56,7 +61,32 @@ On macOS, run `crates/desktop/tests/remote-macos.sh` from the repository
 root to test with a separate daemon, temporary TLS credentials and a
 deterministic model. The tests replay events after a connection drop, reopen
 a chat with two children, restart the daemon during a pending approval, and
-send a follow-up to the original root.
+send a follow-up to the original root. They also configure a stdio MCP server,
+approve a child’s tool call and verify two downloaded CSV revisions after a restart.
+
+## Managing MCP servers
+
+Choose **MCP servers** to see the selected daemon’s active tools, argument
+schemas, and skill grants. To allow changes, set the top-level
+`"allow_mcp_configuration": true` in the daemon’s JSON configuration and
+restart it. This gives clients with daemon access permission to start
+executables as the daemon’s OS user. The default is read-only.
+
+1. Choose **Add MCP server**. Enter the executable and its arguments as
+   individual values. Relative paths resolve on the daemon’s machine. The
+   environment field takes variable names from that machine.
+2. Click **Discover tools**, then **Add to skill** for each tool you want
+   agents to use. Choose its skill, local tool name and grant. New mappings
+   start with **Require approval**.
+3. Choose **Save configuration** and restart the daemon to activate the
+   changes. New chats receive the updated catalog. Existing chats retain
+   their saved skill catalog and remain subject to the available handlers
+   and approval rules.
+
+The API exposes the inventory at `GET /mcp`, discovery at
+`POST /mcp/discover`, and edits at `POST /mcp/servers/{name}`. Edits carry
+the last configuration the client saw so a stale client cannot overwrite
+another client’s settings.
 
 ## Chat workspaces
 
@@ -128,6 +158,7 @@ WebSocket. History and run events use the agent's journal sequence numbers.
 
 Agents can load the built-in `artifacts` skill. Set `artifacts.publish` to `require_approval` in the shared tool grants if publication needs approval. The tool publishes an existing file by title and chat-relative `path`. Pass its returned `artifact_id` with a later publication to add a revision.
 
+- `GET /chats/{chat_id}/artifact-revisions` lists all revisions with their publishing run IDs.
 - `GET /artifacts?chat_id=…` lists each artifact's latest revision.
 - `GET /artifacts/{artifact_id}/revisions/{revision}?chat_id=…` downloads that exact revision.
 

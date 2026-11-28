@@ -1,4 +1,5 @@
 //! HTTP snapshots and cursor-based WebSocket replay for one daemon.
+pub(crate) mod mcp;
 use crate::profiles::{LOCAL, Profile};
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
@@ -201,7 +202,11 @@ impl Daemon {
         Ok(())
     }
     async fn post(&self, url: Url, body: Value) -> Result<reqwest::Response> {
-        let mut request = self.http.post(url).json(&body);
+        let mut request = self
+            .http
+            .post(url)
+            .timeout(Duration::from_secs(35))
+            .json(&body);
         if let Some(auth) = &self.auth {
             request = request.header(AUTHORIZATION, auth);
         }

@@ -648,6 +648,12 @@ impl TextInput {
             is_selecting: false,
         }
     }
+    pub fn prefilled(placeholder: &'static str, value: String, cx: &mut Context<Self>) -> Self {
+        let mut input = Self::with_placeholder(placeholder, cx);
+        input.selected_range = value.len()..value.len();
+        input.content = value.into();
+        input
+    }
     pub fn text(&self) -> &str {
         self.content.as_ref()
     }

@@ -136,6 +136,20 @@ fn wait(
         thread::sleep(Duration::from_millis(15));
     }
 }
+fn wait_control(cx: &mut VisualTestContext, selector: &'static str) {
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        if cx.debug_bounds(selector).is_some() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(25),
+            "Missing {selector}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
 fn click(cx: &mut VisualTestContext, selector: &str) {
     // GPUI's test frame takes a static selector. Each process clicks only a handful.
     let b = cx
@@ -312,12 +326,17 @@ fn chat_window(cx: &mut TestAppContext) {
 
 #[gpui::test]
 #[ignore = "uses a separate TLS daemon; run remote-macos.sh"]
-fn download_published_revisions(cx: &mut TestAppContext) {
+fn manage_mcp_and_download_revisions(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     crate::connection::tests::certificates(d).unwrap();
     fs::write(d.join("token"), TOKEN).unwrap();
-    let mut config = json!({"state_directory":"state","bind":"127.0.0.1:0",
+    fs::write(
+        d.join("catalog_mcp.py"),
+        include_str!("../../../daemon/tests/fixtures/catalog_mcp.py"),
+    )
+    .unwrap();
+    let config = json!({"state_directory":"state","allow_mcp_configuration":true,"bind":"127.0.0.1:0",
         "remote":{"certificate_chain":"leaf.pem","private_key":"server.key","token_file":"token"},
         "defaults":{"model":"scripted","max_model_turns":20,"token_budget":300}});
     fs::write(d.join("daemon.json"), config.to_string()).unwrap();
@@ -345,28 +364,103 @@ fn download_published_revisions(cx: &mut TestAppContext) {
         s.watch(cx);
         s
     });
-    cx.simulate_resize(size(px(1360.), px(900.)));
+    cx.simulate_resize(size(px(1360.), px(1450.)));
     wait(&view, cx, "connected", |s| {
         matches!(s.status, Status::Connected)
     });
+    click(cx, "mcp-servers");
+    wait_control(cx, "new-mcp");
+    click(cx, "new-mcp");
+    for (selector, value) in [("mcp-name", "catalog"), ("mcp-command", "python3")] {
+        click(cx, selector);
+        cx.simulate_input(value);
+    }
+    click(cx, "add-arg");
+    click(cx, "mcp-arg-0");
+    cx.simulate_input("catalog_mcp.py");
+    click(cx, "discover-mcp");
+    wait_control(cx, "expose-lookup.price");
+    assert!(cx.debug_bounds("expose-private_notes").is_some());
+    click(cx, "expose-lookup.price");
+    click(cx, "grant-allow-0");
+    click(cx, "save-mcp");
+    wait_control(cx, "edit-catalog");
+    let saved: Value = serde_json::from_slice(&fs::read(d.join("daemon.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved["defaults"]["tool_grants"]["catalog.lookup_price"],
+        "allow"
+    );
+    click(cx, "edit-catalog");
+    wait(&view, cx, "edit saved catalog", |s| {
+        s.mcp.as_ref().is_some_and(|m| m.editor.is_some())
+    });
+    click(cx, "grant-approval-0");
+    click(cx, "save-mcp");
+    wait_control(cx, "edit-catalog");
+    wait(&view, cx, "saved approval grant", |s| {
+        s.mcp.as_ref().is_some_and(|m| m.editor.is_none())
+            && serde_json::from_slice::<Value>(&fs::read(d.join("daemon.json")).unwrap()).unwrap()["defaults"]
+                ["tool_grants"]["catalog.lookup_price"]
+                == "require_approval"
+    });
+    // Keep the same ephemeral TLS address across restarts.
+    let mut saved: Value =
+        serde_json::from_slice(&fs::read(d.join("daemon.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved["defaults"]["tool_grants"]["catalog.lookup_price"],
+        "require_approval"
+    );
+    saved["bind"] = json!(address);
+    fs::write(d.join("daemon.json"), saved.to_string()).unwrap();
+    let restart = |process: Process, cx: &mut VisualTestContext| {
+        drop(process);
+        wait(&view, cx, "daemon disconnect", |s| {
+            matches!(s.status, Status::Reconnecting(_))
+        });
+        fs::remove_file(d.join("listen")).unwrap();
+        let mut next = daemon_for(d, fixture).unwrap();
+        until_file(&d.join("listen"), &mut next).unwrap();
+        wait(&view, cx, "daemon reconnect", |s| {
+            matches!(s.status, Status::Connected)
+        });
+        next
+    };
+    let configured = restart(process, cx);
+    wait_control(cx, "schema-catalog-lookup.price");
+    click(cx, "schema-catalog-lookup.price");
     send_in_new_chat(&view, cx, "Publish two revisions of the inventory report.");
+    wait(&view, cx, "child MCP approval", |s| {
+        s.runs.len() == 2 && s.approvals.len() == 1
+    });
+    let (wait_id, child_id) = cx.update(|_, app| {
+        let s = view.read(app);
+        let approval = &s.approvals[0];
+        assert_eq!(
+            approval.wait["on"]["ToolApproval"]["tool_name"],
+            "catalog.lookup_price"
+        );
+        assert_eq!(s.runs[1].agent_id, approval.agent_id);
+        (
+            approval.wait["id"].as_str().unwrap().to_owned(),
+            approval.agent_id,
+        )
+    });
+    let running = restart(configured, cx);
+    cx.update(|_, app| assert_eq!(view.read(app).approvals[0].agent_id, child_id));
+    click(cx, &format!("approve-{wait_id}"));
     wait(&view, cx, "two published revisions", |s| {
         s.artifacts.revisions.len() == 2 && s.runs.iter().all(Run::finished)
     });
     assert!(cx.debug_bounds("Download-1-1").is_some());
     click(cx, "chat-artifacts");
-    drop(process);
-    wait(&view, cx, "disconnected", |s| {
-        matches!(s.status, Status::Reconnecting(_))
-    });
-    config["bind"] = json!(address);
-    fs::write(d.join("daemon.json"), config.to_string()).unwrap();
-    fs::remove_file(d.join("listen")).unwrap();
-    let mut restarted = daemon_for(d, fixture).unwrap();
-    until_file(&d.join("listen"), &mut restarted).unwrap();
-    wait(&view, cx, "reconnected", |s| {
-        matches!(s.status, Status::Connected) && s.artifacts.revisions.len() == 2
-    });
+    let _restarted = restart(running, cx);
+    assert_eq!(
+        fs::read_to_string(d.join("catalog-calls.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
     for (revision, quantity) in [(1, 4), (2, 6)] {
         let dest = d.join(format!("saved-{revision}.csv"));
         click(cx, &format!("Download-1-{revision}"));

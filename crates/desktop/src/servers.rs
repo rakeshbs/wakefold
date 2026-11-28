@@ -1,6 +1,7 @@
 //! Server selection, saved chats and the currently watched run.
 mod artifacts;
 mod conversation;
+mod mcp;
 #[cfg(test)]
 mod workflow_test;
 use crate::{
@@ -66,6 +67,7 @@ pub(crate) struct Servers {
     watch_version: u64,
     artifacts: artifacts::Artifacts,
     opened_files: Vec<tempfile::TempDir>,
+    mcp: Option<mcp::McpView>,
 }
 impl Servers {
     pub(crate) fn new(runtime: Runtime, cx: &mut Context<Self>) -> Self {
@@ -119,6 +121,7 @@ impl Servers {
             watch_version: 0,
             artifacts: Default::default(),
             opened_files: Vec::new(),
+            mcp: None,
         };
         view.connect(view.active.clone(), cx);
         view
@@ -162,6 +165,7 @@ impl Servers {
         self.client = None;
         self.form = None;
         self.artifacts = Default::default();
+        self.mcp = None;
         self.chats.clear();
         self.runs.clear();
         self.events.clear();
@@ -248,7 +252,11 @@ impl Servers {
                 self.runs = runs;
                 self.approvals = approvals;
                 self.artifacts.revisions = artifacts;
+                let reconnected = !matches!(self.status, Status::Connected);
                 self.status = Status::Connected;
+                if reconnected && self.mcp.as_ref().is_some_and(|m| m.editor.is_none()) {
+                    self.reload_mcp(cx);
+                }
                 self.sync_conversation(cx);
             }
             Update::Event(e) => {
@@ -285,6 +293,7 @@ impl Servers {
         }
     }
     fn select_chat(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.mcp = None;
         self.artifacts.visible = false;
         if self.chat != Some(id) {
             self.artifacts = Default::default();
@@ -302,6 +311,7 @@ impl Servers {
         cx.notify();
     }
     fn show_form(&mut self, cx: &mut Context<Self>) {
+        self.mcp = None;
         self.save = None;
         self.form = Some(AddServer {
             name: cx.new(|c| TextInput::with_placeholder("Home Pi", c)),
@@ -415,6 +425,10 @@ impl Servers {
                             w.focus(&d.input.focus_handle(cx));
                         }
                     })),
+            )
+            .child(
+                nav("mcp-servers", Icon::Plug, "MCP servers", self.mcp.is_some())
+                    .on_click(cx.listener(|s, _, _, cx| s.show_mcp(cx))),
             )
             .child(label("Saved chats", 12., MUTED).mt_3().mb_1());
         let mut chats = column()
@@ -536,6 +550,9 @@ impl Servers {
         if let Some(form) = &self.form {
             return column().flex_1().child(body.child(self.form(form, cx)));
         }
+        if let Some(mcp) = &self.mcp {
+            return self.mcp_view(mcp, cx);
+        }
         if self.artifacts.visible {
             return self.artifact_library(cx);
         }
@@ -595,7 +612,9 @@ impl Render for Servers {
             );
         row()
             .on_action(cx.listener(|s, _: &crate::SendMessage, w, cx| {
-                if s.form.is_none()
+                if s.mcp.is_none()
+                    && !s.artifacts.visible
+                    && s.form.is_none()
                     && s.current_draft()
                         .is_some_and(|d| d.input.focus_handle(cx).is_focused(w))
                 {

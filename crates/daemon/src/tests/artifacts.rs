@@ -44,7 +44,9 @@ impl<S: Subscriber> Layer<S> for PauseAfterCopy {
     }
 }
 
-struct ArtifactProvider;
+struct ArtifactProvider {
+    use_catalog: bool,
+}
 
 fn tool_result<'a>(request: &ModelRequest<'a>, call_id: &str) -> &'a Value {
     let call_id = ToolCallId::from(call_id);
@@ -79,10 +81,23 @@ impl Provider for ArtifactProvider {
         let draft = matches!(prompt.as_str(), FIRST_TASK | SECOND_TASK);
         let load = |name: &str| ToolCall::new("load", "load_skill", json!({ "name": name }));
         let response = match request.messages.last().unwrap() {
+            Message::Developer(_) if prompt == FIRST_TASK && self.use_catalog => {
+                ToolCall::new("catalog", "load_skill", json!({"name":"catalog"})).into()
+            }
             Message::Developer(_) => load(if draft { "drafts" } else { "agents" }).into(),
             Message::Tool(result) => {
                 let work = |id, task| dispatch(id, "agents.spawn", json!({ "task": task }));
                 match result.call_id.to_string().as_str() {
+                    "catalog" => {
+                        let tools = result.value["tools"].as_array().unwrap();
+                        assert_eq!(tools.len(), 1);
+                        assert_eq!(tools[0]["name"], "catalog.lookup_price");
+                        dispatch("price", "catalog.lookup_price", json!({"sku":"WF-318"})).into()
+                    }
+                    "price" => {
+                        assert_eq!(result.value["structuredContent"]["price_cents"], 350);
+                        load("drafts").into()
+                    }
                     "load" if draft => dispatch(
                         "write",
                         "drafts.write",
@@ -196,6 +211,8 @@ async fn daemon(config: &Path) -> Result<(), DaemonError> {
         .with(pause)
         .try_init()?;
 
+    let settings: Value = serde_json::from_slice(&fs::read(config)?)?;
+    let use_catalog = settings["skills"].get("catalog").is_some();
     let runtime = Runtime::build(
         Config::load(config)?,
         BTreeMap::from([(
@@ -205,7 +222,7 @@ async fn daemon(config: &Path) -> Result<(), DaemonError> {
                 tools: vec![Box::new(DraftReport)],
             },
         )]),
-        |_| Ok(Box::new(ArtifactProvider)),
+        |_| Ok(Box::new(ArtifactProvider { use_catalog })),
     )
     .await?;
     let socket = TcpListener::bind(runtime.bind).await?;
