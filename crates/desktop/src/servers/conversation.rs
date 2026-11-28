@@ -479,6 +479,14 @@ impl Servers {
                 body = body.child(card);
             }
         }
+        for file in self
+            .artifacts
+            .revisions
+            .iter()
+            .filter(|a| a.run_id == id || children.iter().any(|child| child.run_id == a.run_id))
+        {
+            body = body.child(self.artifact_card(file, cx));
+        }
         let figure = if Some(id) == latest {
             self.portrait.clone().into_any_element()
         } else {
@@ -599,7 +607,22 @@ impl Servers {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(heading(title, 16.).truncate().px_5().py_3())
+            .child(
+                row()
+                    .justify_between()
+                    .gap_2()
+                    .px_5()
+                    .py_3()
+                    .child(heading(title, 16.).truncate())
+                    .child(
+                        action("chat-artifacts", "Artifacts", false).on_click(cx.listener(
+                            |s, _, _, cx| {
+                                s.artifacts.visible = true;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
             .child(feed);
         if let Some(draft) = self.current_draft() {
             let status = if draft.sending {

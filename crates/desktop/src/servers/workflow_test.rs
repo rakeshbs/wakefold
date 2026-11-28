@@ -41,18 +41,14 @@ fn until_file(path: &Path, process: &mut Process) -> Result<String> {
     }
     anyhow::bail!("timed out waiting for {}", path.display())
 }
-fn daemon(dir: &Path) -> Result<Process> {
+fn daemon_for(dir: &Path, test: &str) -> Result<Process> {
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join("daemon.log"))?;
     Ok(Process(
         Command::new(std::env::var_os("WAKEFOLD_TEST_DAEMON").context("Run remote-macos.sh")?)
-            .args([
-                "--exact",
-                "tests::http_workflow_survives_daemon_restart",
-                "--nocapture",
-            ])
+            .args(["--exact", test, "--nocapture"])
             .env("WAKEFOLD_DAEMON_TEST_CONFIG", dir.join("daemon.json"))
             .stdout(Stdio::null())
             .stderr(log)
@@ -80,7 +76,7 @@ fn reopen_chat_and_restart_daemon() -> Result<()> {
         "defaults":{"model":"scripted-workflow-provider","max_model_turns":15,"token_budget":1000,
                     "tool_grants":{"orders.review":"require_approval"}}});
     fs::write(d.join("daemon.json"), serde_json::to_vec(&settings)?)?;
-    let mut first_daemon = daemon(d)?;
+    let mut first_daemon = daemon_for(d, "tests::http_workflow_survives_daemon_restart")?;
     let address = until_file(&d.join("listen"), &mut first_daemon)?;
     let port = address.parse::<std::net::SocketAddr>()?.port();
     let mut profiles = Profiles::default();
@@ -100,7 +96,7 @@ fn reopen_chat_and_restart_daemon() -> Result<()> {
     settings["bind"] = json!(address);
     fs::write(d.join("daemon.json"), serde_json::to_vec(&settings)?)?;
     fs::remove_file(d.join("listen"))?;
-    let mut restarted = daemon(d)?;
+    let mut restarted = daemon_for(d, "tests::http_workflow_survives_daemon_restart")?;
     until_file(&d.join("listen"), &mut restarted)?;
     ensure!(
         reopened.0.wait()?.success(),
@@ -311,5 +307,75 @@ fn chat_window(cx: &mut TestAppContext) {
         wait(&v, cx, "declined review", |s| {
             s.approvals.is_empty() && s.runs[0].outcome.as_deref() == Some("Review declined.")
         });
+    }
+}
+
+#[gpui::test]
+#[ignore = "uses a separate TLS daemon; run remote-macos.sh"]
+fn download_published_revisions(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    crate::connection::tests::certificates(d).unwrap();
+    fs::write(d.join("token"), TOKEN).unwrap();
+    let mut config = json!({"state_directory":"state","bind":"127.0.0.1:0",
+        "remote":{"certificate_chain":"leaf.pem","private_key":"server.key","token_file":"token"},
+        "defaults":{"model":"scripted","max_model_turns":20,"token_budget":300}});
+    fs::write(d.join("daemon.json"), config.to_string()).unwrap();
+    let fixture = "tests::artifacts::artifact_publication_survives_daemon_crash";
+    let mut process = daemon_for(d, fixture).unwrap();
+    let address = until_file(&d.join("listen"), &mut process).unwrap();
+    let port = address.parse::<std::net::SocketAddr>().unwrap().port();
+    let profile = Profile::remote("Mac fixture", &format!("https://localhost:{port}")).unwrap();
+    let mut profiles = Profiles::default();
+    profiles.remember(profile.clone());
+    profiles.save(&d.join("servers.json")).unwrap();
+    cx.update(|app| {
+        crate::input::bind(app);
+        app.bind_keys([KeyBinding::new(
+            "enter",
+            crate::SendMessage,
+            Some("TextInput"),
+        )]);
+    });
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut s =
+            Servers::with_settings(Runtime::new().unwrap(), Some(d.join("servers.json")), cx);
+        s.load = None;
+        s.client = Some(Daemon::new(&profile, Some(TOKEN), Some(&d.join("ca.pem"))).unwrap());
+        s.watch(cx);
+        s
+    });
+    cx.simulate_resize(size(px(1360.), px(900.)));
+    wait(&view, cx, "connected", |s| {
+        matches!(s.status, Status::Connected)
+    });
+    send_in_new_chat(&view, cx, "Publish two revisions of the inventory report.");
+    wait(&view, cx, "two published revisions", |s| {
+        s.artifacts.revisions.len() == 2 && s.runs.iter().all(Run::finished)
+    });
+    assert!(cx.debug_bounds("Download-1-1").is_some());
+    click(cx, "chat-artifacts");
+    drop(process);
+    wait(&view, cx, "disconnected", |s| {
+        matches!(s.status, Status::Reconnecting(_))
+    });
+    config["bind"] = json!(address);
+    fs::write(d.join("daemon.json"), config.to_string()).unwrap();
+    fs::remove_file(d.join("listen")).unwrap();
+    let mut restarted = daemon_for(d, fixture).unwrap();
+    until_file(&d.join("listen"), &mut restarted).unwrap();
+    wait(&view, cx, "reconnected", |s| {
+        matches!(s.status, Status::Connected) && s.artifacts.revisions.len() == 2
+    });
+    for (revision, quantity) in [(1, 4), (2, 6)] {
+        let dest = d.join(format!("saved-{revision}.csv"));
+        click(cx, &format!("Download-1-{revision}"));
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection(|_| Some(dest.clone()));
+        wait(&view, cx, "download", |_| dest.exists());
+        assert_eq!(
+            fs::read_to_string(dest).unwrap(),
+            format!("item,quantity\nnotebook,{quantity}\n")
+        );
     }
 }

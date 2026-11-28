@@ -70,11 +70,22 @@ pub struct EventBody {
     pub data: Value,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ArtifactRevision {
+    pub artifact_id: i64,
+    pub revision: u64,
+    pub run_id: i64,
+    pub title: String,
+    pub filename: String,
+    pub size_bytes: u64,
+}
+
 pub enum Update {
     Snapshot {
         chats: Vec<SavedChat>,
         runs: Vec<Run>,
         approvals: Vec<Approval>,
+        artifacts: Vec<ArtifactRevision>,
     },
     Event(Event),
     Reconnecting(String),
@@ -137,12 +148,57 @@ impl Daemon {
             tls,
         })
     }
-    pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+    fn request(&self, path: &str) -> Result<reqwest::RequestBuilder> {
         let mut req = self.http.get(self.url.join(path)?);
         if let Some(auth) = &self.auth {
             req = req.header(AUTHORIZATION, auth);
         }
-        Ok(req.send().await?.error_for_status()?.json().await?)
+        Ok(req)
+    }
+    pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        Ok(self
+            .request(path)?
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+    pub async fn download_revision(
+        &self,
+        chat: Uuid,
+        file: &ArtifactRevision,
+        destination: &Path,
+    ) -> Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let mut response = self
+            .request(&format!(
+                "artifacts/{}/revisions/{}?chat_id={chat}",
+                file.artifact_id, file.revision
+            ))?
+            .timeout(Duration::from_secs(600))
+            .send()
+            .await?
+            .error_for_status()?;
+        let temp = tempfile::NamedTempFile::new_in(
+            destination.parent().context("Missing destination folder")?,
+        )?;
+        let mut output = tokio::fs::File::from_std(temp.reopen()?);
+        let mut received = 0u64;
+        while let Some(chunk) = response.chunk().await? {
+            received += chunk.len() as u64;
+            ensure!(
+                received <= file.size_bytes,
+                "Download exceeds the published size"
+            );
+            output.write_all(&chunk).await?;
+        }
+        ensure!(received == file.size_bytes, "Incomplete artifact download");
+        output.flush().await?;
+        output.sync_all().await?;
+        drop(output);
+        temp.persist(destination)?;
+        Ok(())
     }
     async fn post(&self, url: Url, body: Value) -> Result<reqwest::Response> {
         let mut request = self.http.post(url).json(&body);
@@ -203,17 +259,29 @@ impl Daemon {
         Ok(all)
     }
     async fn snapshot(&self, chat: Option<Uuid>) -> Result<Update> {
-        let (chats, approvals, runs) =
+        let (chats, approvals, (runs, artifacts)) =
             tokio::try_join!(self.chats(), self.get("approvals"), async {
                 match chat {
-                    Some(id) => self.get(&format!("chats/{id}/runs")).await,
-                    None => Ok(vec![]),
+                    Some(id) => {
+                        let runs = format!("chats/{id}/runs");
+                        let versions = format!("chats/{id}/artifact-revisions");
+                        tokio::try_join!(self.get(&runs), async {
+                            let response = self.request(&versions)?.send().await?;
+                            // Older daemons still support chatting.
+                            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                                return Ok(Vec::new());
+                            }
+                            Ok(response.error_for_status()?.json().await?)
+                        })
+                    }
+                    None => Ok((vec![], vec![])),
                 }
             })?;
         Ok(Update::Snapshot {
             chats,
             approvals,
             runs,
+            artifacts,
         })
     }
     async fn socket(&self, run: i64, after: u64) -> Result<Socket> {

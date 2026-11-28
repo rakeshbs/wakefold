@@ -1,4 +1,5 @@
 //! Server selection, saved chats and the currently watched run.
+mod artifacts;
 mod conversation;
 #[cfg(test)]
 mod workflow_test;
@@ -63,6 +64,8 @@ pub(crate) struct Servers {
     portrait: Entity<Character>,
     conversation: Conversation,
     watch_version: u64,
+    artifacts: artifacts::Artifacts,
+    opened_files: Vec<tempfile::TempDir>,
 }
 impl Servers {
     pub(crate) fn new(runtime: Runtime, cx: &mut Context<Self>) -> Self {
@@ -114,6 +117,8 @@ impl Servers {
             portrait,
             conversation: Conversation::default(),
             watch_version: 0,
+            artifacts: Default::default(),
+            opened_files: Vec::new(),
         };
         view.connect(view.active.clone(), cx);
         view
@@ -156,6 +161,7 @@ impl Servers {
         self.save = None;
         self.client = None;
         self.form = None;
+        self.artifacts = Default::default();
         self.chats.clear();
         self.runs.clear();
         self.events.clear();
@@ -236,10 +242,12 @@ impl Servers {
                 chats,
                 runs,
                 approvals,
+                artifacts,
             } => {
                 self.chats = chats;
                 self.runs = runs;
                 self.approvals = approvals;
+                self.artifacts.revisions = artifacts;
                 self.status = Status::Connected;
                 self.sync_conversation(cx);
             }
@@ -277,7 +285,9 @@ impl Servers {
         }
     }
     fn select_chat(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.artifacts.visible = false;
         if self.chat != Some(id) {
+            self.artifacts = Default::default();
             self.chat = Some(id);
             self.run = None;
             self.runs.clear();
@@ -525,6 +535,9 @@ impl Servers {
             .overflow_y_scroll();
         if let Some(form) = &self.form {
             return column().flex_1().child(body.child(self.form(form, cx)));
+        }
+        if self.artifacts.visible {
+            return self.artifact_library(cx);
         }
         if self.chat.is_some() {
             return self.chat_view(cx);
