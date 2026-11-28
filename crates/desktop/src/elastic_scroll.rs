@@ -3,6 +3,7 @@ use gpui::{
     Along, AnyElement, App, Axis, Bounds, Div, ElementId, GlobalElementId, IntoElement, LayoutId,
     Pixels, Point, ScrollHandle, Stateful, StyleRefinement, TouchPhase, Window, prelude::*, px,
 };
+use gpui_component::scroll::Scrollbar;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
@@ -193,10 +194,29 @@ impl RenderOnce for ElasticScroll {
             }
         });
         if let Some(id) = self.thumb {
-            crate::scrollbar::scroll_region(id, viewport, &handle, move |cx| {
-                state.update(cx, |s, _| s.spring = Spring::default())
-            })
-            .into_any_element()
+            crate::theme::ensure_scrollbar_theme(cx);
+            let scrollbar = Scrollbar::vertical(&handle);
+            gpui::div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_hidden()
+                .capture_any_mouse_down(move |_, _, cx| {
+                    if state.read(cx).spring.pull != 0. {
+                        state.update(cx, |state, cx| {
+                            state.spring = Spring::default();
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(viewport)
+                .child(scrollbar)
+                .into_any_element()
         } else {
             viewport.into_any_element()
         }
@@ -387,7 +407,8 @@ mod tests {
         });
         cx.run_until_parked();
         let bottom = cx.debug_bounds("body").unwrap().bottom();
-        let track = cx.debug_bounds("track").unwrap().center();
+        let bounds = cx.debug_bounds("track").unwrap();
+        let track = point(bounds.right() - px(6.), bounds.center().y);
         wheel(
             cx,
             track,

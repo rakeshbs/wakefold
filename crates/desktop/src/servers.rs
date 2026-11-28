@@ -822,7 +822,6 @@ impl Render for Servers {
             main
         };
         row()
-            .on_drag_move(crate::scrollbar::drag)
             .on_action(cx.listener(|s, _: &crate::SendMessage, w, cx| {
                 if s.mcp.is_none()
                     && s.form.is_none()

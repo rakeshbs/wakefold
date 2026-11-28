@@ -125,6 +125,7 @@ pub(crate) fn initialize(cx: &mut App) {
         })
         .unwrap_or_default();
     cx.set_global(Appearance { theme, path });
+    apply_scrollbar_theme(cx);
 }
 pub(crate) fn current(cx: &App) -> Theme {
     cx.try_global::<Appearance>()
@@ -133,6 +134,33 @@ pub(crate) fn current(cx: &App) -> Theme {
 }
 pub(crate) fn palette(cx: &App) -> Palette {
     current(cx).palette()
+}
+
+/// The standalone scrollbar reads its colors from GPUI Component's app-wide theme.
+pub(crate) fn ensure_scrollbar_theme(cx: &mut App) {
+    if !cx.has_global::<gpui_component::Theme>() {
+        apply_scrollbar_theme(cx);
+    }
+}
+
+fn apply_scrollbar_theme(cx: &mut App) {
+    use gpui_component::{Theme as ComponentTheme, ThemeMode, ThemeRegistry};
+    if !cx.has_global::<ThemeRegistry>() {
+        gpui_component::theme::init(cx);
+    }
+    let appearance = current(cx);
+    let mode = match appearance {
+        Theme::Dark => ThemeMode::Dark,
+        Theme::Light => ThemeMode::Light,
+    };
+    ComponentTheme::change(mode, None, cx);
+    let colors = appearance.palette();
+    let theme = ComponentTheme::global_mut(cx);
+    theme.scrollbar_show = gpui_component::scroll::ScrollbarShow::Always;
+    theme.scrollbar = gpui::Hsla::transparent_black();
+    theme.scrollbar_thumb = gpui::rgb(colors.scroll_thumb).into();
+    theme.scrollbar_thumb_hover = gpui::rgb(colors.muted).into();
+    theme.border = gpui::rgb(colors.border).into();
 }
 
 pub(crate) fn toggle_button(expanded: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
@@ -165,6 +193,7 @@ pub(crate) fn toggle_button(expanded: bool, cx: &App) -> gpui::Stateful<gpui::Di
             {
                 eprintln!("Could not save appearance settings: {error}");
             }
+            apply_scrollbar_theme(cx);
             cx.refresh_windows();
         })
 }

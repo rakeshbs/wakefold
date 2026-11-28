@@ -417,12 +417,12 @@ mod tests {
         assert_eq!(cx.debug_bounds("composer").unwrap(), composer);
         let rail = cx.debug_bounds("chat-scrollbar").unwrap();
         cx.simulate_click(
-            point(rail.center().x, rail.top() + px(2.)),
+            point(rail.right() - px(6.), rail.top() + px(2.)),
             Default::default(),
         );
         cx.run_until_parked();
         assert_eq!(scroll.offset().y, px(0.));
-        let grab = point(rail.center().x, rail.top() + px(4.));
+        let grab = point(rail.right() - px(6.), rail.top() + px(4.));
         cx.simulate_mouse_down(grab, MouseButton::Left, Default::default());
         for dy in [8., 80.] {
             cx.simulate_mouse_move(
@@ -450,6 +450,13 @@ mod tests {
         assert!(panel_scroll.max_offset().height > px(400.));
         wheel(cx, "panel-scroll", -180.);
         assert!(panel_scroll.offset().y < px(-100.));
+        let panel_rail = cx.debug_bounds("panel-scrollbar").unwrap();
+        cx.simulate_click(
+            point(panel_rail.right() - px(6.), panel_rail.bottom() - px(2.)),
+            Default::default(),
+        );
+        cx.run_until_parked();
+        assert!((panel_scroll.offset().y + panel_scroll.max_offset().height).abs() < px(1.));
         assert_eq!(scroll.offset().y, reading);
         click(cx, "tab-artifacts");
         click(cx, "tab-agent-2");

@@ -8,7 +8,6 @@ mod local_daemon;
 mod markdown;
 mod preview;
 mod profiles;
-mod scrollbar;
 mod servers;
 mod style;
 mod theme;

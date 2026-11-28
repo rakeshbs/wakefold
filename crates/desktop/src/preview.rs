@@ -886,16 +886,21 @@ mod tests {
     #[gpui::test]
     fn sidebar_switches_appearance_in_both_directions(cx: &mut TestAppContext) {
         let (_, cx) = window(cx);
+        cx.update(|_, app| crate::theme::ensure_scrollbar_theme(app));
         for theme in [
             crate::theme::Theme::Dark,
             crate::theme::Theme::Light,
             crate::theme::Theme::Dark,
         ] {
             cx.update(|_, app| {
+                let colors = theme.palette();
+                assert_eq!(crate::theme::palette(app).background, colors.background);
+                let component = gpui_component::Theme::global(app);
+                assert_eq!(component.is_dark(), theme == crate::theme::Theme::Dark);
                 assert_eq!(
-                    crate::theme::palette(app).background,
-                    theme.palette().background
-                )
+                    component.scrollbar_thumb,
+                    gpui::rgb(colors.scroll_thumb).into()
+                );
             });
             click(cx, "toggle-theme");
         }
