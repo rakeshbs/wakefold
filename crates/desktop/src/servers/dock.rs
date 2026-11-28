@@ -1,7 +1,6 @@
 //! One right-hand workspace for file revisions and child conversations.
 use super::artifacts::Preview;
 use super::*;
-use crate::elastic_scroll::ScrollExt;
 use gpui::{CursorStyle, DragMoveEvent, Empty, ScrollHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,7 +204,8 @@ impl Servers {
             .flex_none()
             .h(px(40.))
             .min_w_0()
-            .elastic_x(Some(&self.dock.tab_scroll))
+            .overflow_x_scroll()
+            .track_scroll(&self.dock.tab_scroll)
             .border_b_1()
             .border_color(rgb(colors.border));
         for t in &self.dock.tabs {
@@ -298,17 +298,19 @@ impl Servers {
                             .on_click(cx.listener(move |s, _, _, cx| s.close_panel(active, cx))),
                     ),
             )
-            .child(
+            .child(scroll_pane(
+                "panel-scrollbar",
                 column()
                     .id(gpui::SharedString::from(format!("scroll-{}", active.id())))
                     .debug_selector(|| "panel-scroll".into())
-                    .elastic_y(Some(&tab.scroll))
+                    .overflow_y_scroll()
+                    .track_scroll(&tab.scroll)
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .child(body.flex_none().w_full())
-                    .with_scrollbar("panel-scrollbar"),
-            );
+                    .child(body.flex_none().w_full()),
+                &tab.scroll,
+            ));
         if overlay {
             pane = pane
                 .absolute()
@@ -422,6 +424,17 @@ mod tests {
         );
         cx.run_until_parked();
         assert_eq!(scroll.offset().y, px(0.));
+        let top = cx.debug_bounds("activity-1").unwrap();
+        wheel(cx, "conversation", 90.);
+        assert_eq!(cx.debug_bounds("activity-1").unwrap(), top);
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(rail.right() - px(6.), rail.center().y),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-36.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert_eq!(scroll.offset().y, px(-36.));
+        wheel(cx, "conversation", 36.);
         let grab = point(rail.right() - px(6.), rail.top() + px(4.));
         cx.simulate_mouse_down(grab, MouseButton::Left, Default::default());
         for dy in [8., 80.] {

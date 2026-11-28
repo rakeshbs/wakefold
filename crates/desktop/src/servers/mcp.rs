@@ -1,7 +1,6 @@
 //! MCP discovery and per-tool access on the selected daemon.
 use super::*;
 use crate::connection::mcp::{Binding, Definition, Grant, Inventory, Launch, RemoteTool};
-use crate::elastic_scroll::ScrollExt;
 use std::future::Future;
 
 #[derive(Default)]
@@ -495,7 +494,7 @@ impl Servers {
         let colors = crate::theme::palette(cx);
         let mut content = column()
             .id("mcp-content")
-            .elastic_y(None)
+            .overflow_y_scroll()
             .flex_1()
             .min_h_0()
             .p_4()

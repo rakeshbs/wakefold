@@ -7,6 +7,25 @@ pub(crate) fn column() -> Div {
 pub(crate) fn row() -> Div {
     div().flex().items_center()
 }
+/// Keeps the library scrollbar fixed beside its independently scrolling content.
+pub(crate) fn scroll_pane(
+    id: &'static str,
+    content: impl IntoElement,
+    handle: &(impl gpui_component::scroll::ScrollbarHandle + Clone),
+) -> Stateful<Div> {
+    use gpui_component::scroll::ScrollableElement;
+    column()
+        .id(id)
+        .debug_selector(move || id.into())
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .overflow_hidden()
+        .child(content)
+        .vertical_scrollbar(handle)
+}
+
 pub(crate) fn label(s: impl Into<SharedString>, sz: f32, c: u32) -> Div {
     div().text_size(px(sz)).text_color(rgb(c)).child(s.into())
 }

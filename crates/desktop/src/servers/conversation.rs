@@ -1,6 +1,5 @@
 //! Chat commands and presentation for the selected daemon.
 use super::*;
-use crate::elastic_scroll::ScrollExt;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct Draft {
@@ -648,7 +647,8 @@ impl Servers {
             .debug_selector(|| "conversation".into())
             .flex_1()
             .min_h_0()
-            .elastic_y(Some(&self.conversation.scroll))
+            .overflow_y_scroll()
+            .track_scroll(&self.conversation.scroll)
             .px(px(24.))
             .pt(px(36.))
             .pb(px(24.))
@@ -702,7 +702,11 @@ impl Servers {
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
-            .child(feed.with_scrollbar("chat-scrollbar"));
+            .child(scroll_pane(
+                "chat-scrollbar",
+                feed,
+                &self.conversation.scroll,
+            ));
         if let Some(draft) = self.current_draft() {
             let status = if draft.sending {
                 "Sending…"
