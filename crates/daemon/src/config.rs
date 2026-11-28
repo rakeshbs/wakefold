@@ -6,7 +6,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+pub(crate) mod management;
+use serde::{Deserialize, Serialize};
 use wakefold::{
     Provider, PublishArtifact, RunOptions, SendMessage, TimerWait, Tool, ToolGrant, WaitForMessage,
 };
@@ -23,6 +24,10 @@ use std::sync::Arc;
 pub(crate) struct Config {
     #[serde(skip)]
     directory: PathBuf,
+    #[serde(skip)]
+    path: PathBuf,
+    #[serde(default)]
+    allow_mcp_configuration: bool,
     pub(crate) state_directory: PathBuf,
     #[serde(default = "default_bind")]
     pub(crate) bind: SocketAddr,
@@ -50,6 +55,7 @@ impl Config {
         if config.state_directory.is_relative() {
             config.state_directory = config.directory.join(config.state_directory);
         }
+        config.path = path;
         Ok(config)
     }
 }
@@ -62,14 +68,14 @@ fn default_concurrency() -> NonZeroUsize {
     NonZeroUsize::new(4).expect("default concurrency is nonzero")
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SkillConfig {
     description: String,
     tools: Vec<ToolConfig>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ToolConfig {
     TimerWait,
@@ -112,6 +118,7 @@ pub(crate) struct Runtime {
     pub(crate) mcp_servers: BTreeMap<String, McpServer>,
     #[cfg(feature = "sandbox")]
     pub(crate) sandbox: Option<Arc<Sandbox>>,
+    pub(crate) management: std::sync::Arc<management::McpManagement>,
     _state_lock: File,
 }
 
@@ -124,6 +131,8 @@ impl Runtime {
         if config.remote.is_none() && !config.bind.ip().is_loopback() {
             return Err("daemon bind address must be loopback".into());
         }
+        let mut management =
+            management::McpManagement::new(&config, skills.keys().cloned().collect());
         let remote = config
             .remote
             .map(|r| r.load(&config.directory))
@@ -291,7 +300,9 @@ impl Runtime {
                 entry.insert(SharedProfile { provider, options });
             }
         }
+        management.capture_tools(&mcp_servers);
         Ok(Self {
+            management: std::sync::Arc::new(management),
             remote,
             state_directory: config.state_directory,
             bind: config.bind,

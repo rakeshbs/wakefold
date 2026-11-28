@@ -719,3 +719,132 @@ async fn mcp_tool_works_after_daemon_restart() {
         assert_ne!(calls[0]["pid"], calls[1]["pid"], "the daemon must launch a new MCP process");
     }).await.expect("the MCP workflow must finish");
 }
+
+#[tokio::test]
+async fn manage_mcp_on_daemon() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("wakefold.json");
+    std::fs::write(
+        directory.path().join("catalog_mcp.py"),
+        include_str!("../tests/fixtures/catalog_mcp.py"),
+    )
+    .unwrap();
+    let mut config = json!({"state_directory":"state","bind":"127.0.0.1:0",
+        "skills":{"catalog":{"description":"Inventory and time","tools":[{"kind":"timer_wait"}]}},
+        "defaults":{"model":"scripted-workflow-provider","max_model_turns":15,"token_budget":100}});
+    std::fs::write(&path, config.to_string()).unwrap();
+    let client = Client::builder().no_proxy().build().unwrap();
+    let launch_config = json!({"command":"python3","args":["catalog_mcp.py"],"inherit_env":[]});
+    let definition = json!({"launch":launch_config,"bindings":[{"skill":"catalog","tool":"lookup.price","name":"lookup_price","grant":"require_approval"}]});
+    let create = json!({"expected":null,"replacement":definition});
+    let (first, address) = launch(&path, MCP_TEST).await;
+    assert_eq!(
+        client
+            .post(format!("http://{address}/mcp/discover"))
+            .json(&launch_config)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .post(format!("http://{address}/mcp/servers/inventory"))
+            .json(&create)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    drop(first);
+    config["allow_mcp_configuration"] = json!(true);
+    std::fs::write(&path, config.to_string()).unwrap();
+    let (second, address) = launch(&path, MCP_TEST).await;
+    let url = format!("http://{address}/mcp/servers/inventory");
+    let tools: Vec<Value> = client
+        .post(format!("http://{address}/mcp/discover"))
+        .json(&launch_config)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tools.len(), 2);
+    let mut collision = create.clone();
+    collision["replacement"]["bindings"][0]["name"] = json!("wait");
+    assert_eq!(
+        client
+            .post(&url)
+            .json(&collision)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(),
+        config
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .json(&create)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .json(&create)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let inventory: Value = client
+        .get(format!("http://{address}/mcp"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(inventory["servers"][0]["restart_required"], true);
+    drop(second);
+    let (_third, address) = launch(&path, MCP_TEST).await;
+    let inventory: Value = client
+        .get(format!("http://{address}/mcp"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let server = &inventory["servers"][0];
+    assert_eq!(server["tools"], json!(tools));
+    assert_eq!(server["configuration"], definition);
+    assert_eq!(server["restart_required"], false);
+    assert_eq!(
+        client
+            .post(format!("http://{address}/mcp/servers/inventory"))
+            .json(&json!({"expected":definition,"replacement":null}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let final_config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(final_config["skills"], config["skills"]);
+    assert_eq!(final_config["defaults"]["tool_grants"], json!({}));
+}

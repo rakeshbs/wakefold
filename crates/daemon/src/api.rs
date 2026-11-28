@@ -29,6 +29,7 @@ struct AppState {
     store: Arc<Mutex<WorkspaceStore>>,
     defaults: Arc<wakefold::AgentSettings>,
     stop: CancellationToken,
+    management: Arc<crate::config::management::McpManagement>,
 }
 
 impl AppState {
@@ -68,10 +69,14 @@ impl IntoResponse for ApiError {
 pub(crate) fn router(
     store: WorkspaceStore,
     defaults: wakefold::AgentSettings,
+    management: Arc<crate::config::management::McpManagement>,
     stop: CancellationToken,
     bearer: Option<Arc<str>>,
 ) -> Router {
     Router::new()
+        .route("/mcp", get(mcp_inventory))
+        .route("/mcp/discover", post(discover_mcp))
+        .route("/mcp/servers/{name}", post(save_mcp))
         .route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
         .route("/chats", post(create_chat).get(saved_chats))
         .route("/runs", post(start_run))
@@ -94,8 +99,34 @@ pub(crate) fn router(
         .with_state(AppState {
             store: Arc::new(Mutex::new(store)),
             defaults: Arc::new(defaults),
+            management,
             stop,
         })
+}
+
+async fn mcp_inventory(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .management
+        .inventory()
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+async fn discover_mcp(
+    State(state): State<AppState>,
+    Json(launch): Json<crate::mcp::ServerConfig>,
+) -> Result<Json<Vec<serde_json::Value>>, crate::config::management::ManagementError> {
+    state.management.discover(&launch).await.map(Json)
+}
+
+async fn save_mcp(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(change): Json<crate::config::management::ServerChange>,
+) -> Result<StatusCode, crate::config::management::ManagementError> {
+    state.management.save(name, change).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

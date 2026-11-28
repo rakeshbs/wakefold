@@ -26,6 +26,7 @@ pub(crate) async fn serve(
     let app = api::router(
         store,
         runtime.defaults.clone(),
+        runtime.management.clone(),
         stop.clone(),
         remote.as_ref().map(|r| r.bearer.clone()),
     );

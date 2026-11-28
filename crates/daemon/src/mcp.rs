@@ -12,7 +12,7 @@ use rmcp::model::{
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{Peer, RoleClient, ServiceExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::time::timeout;
 use wakefold::{JsonValue, Tool, ToolError, ToolSpec};
@@ -23,14 +23,14 @@ const START_TIMEOUT: Duration = Duration::from_secs(15);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(7);
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServerConfig {
-    command: PathBuf,
+    pub(crate) command: PathBuf,
     #[serde(default)]
-    args: Vec<String>,
+    pub(crate) args: Vec<String>,
     #[serde(default)]
-    inherit_env: Vec<String>,
+    pub(crate) inherit_env: Vec<String>,
 }
 
 pub(crate) struct McpServer {
@@ -44,6 +44,14 @@ impl McpServer {
         config: &ServerConfig,
         directory: &Path,
     ) -> Result<Self, DaemonError> {
+        if config.command.as_os_str().is_empty()
+            || config
+                .inherit_env
+                .iter()
+                .any(|key| key.is_empty() || key.contains(['=', '\0']))
+        {
+            return Err("Enter a server executable and valid environment variable names".into());
+        }
         let command = if config.command.is_relative() && config.command.components().count() > 1 {
             directory.join(&config.command)
         } else {
@@ -92,6 +100,10 @@ impl McpServer {
             "MCP tools discovered"
         );
         Ok(server)
+    }
+
+    pub(crate) fn discovered(&self) -> Vec<JsonValue> {
+        self.tools.values().map(|tool| serde_json::json!({"name":tool.name, "description":tool.description, "parameters":tool.input_schema})).collect()
     }
 
     pub(crate) fn tool(
