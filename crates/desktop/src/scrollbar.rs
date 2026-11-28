@@ -100,14 +100,17 @@ pub(crate) fn scroll_region(
                 .child(
                     canvas(
                         |_, _, _| (),
-                        move |bounds, _, window, _| {
+                        move |bounds, _, window, cx| {
+                            let colors = crate::theme::palette(cx);
                             let (height, top, _) = paint.geometry();
                             if height > px(0.) {
                                 let rect = Bounds::new(
                                     bounds.origin + point(px(2.), top),
                                     size(px(4.), height),
                                 );
-                                window.paint_quad(fill(rect, rgb(0xc4cec5)).corner_radii(px(2.)));
+                                window.paint_quad(
+                                    fill(rect, rgb(colors.scroll_thumb)).corner_radii(px(2.)),
+                                );
                             }
                         },
                     )

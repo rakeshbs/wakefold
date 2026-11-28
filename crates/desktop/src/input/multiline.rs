@@ -11,6 +11,7 @@ pub(super) struct Multiline {
 
 impl TextInput {
     pub(super) fn wrapped(&self, window: &Window, cx: &Context<Self>) -> gpui::Stateful<Div> {
+        let colors = crate::theme::palette(cx);
         let editor = self.multiline.as_ref().expect("chat composer");
         let display: SharedString = if self.content.is_empty() {
             self.placeholder.clone()
@@ -25,9 +26,9 @@ impl TextInput {
             len: 0,
             font: style.font(),
             color: if self.content.is_empty() {
-                hsla(0.40, 0.07, 0.41, 1.)
+                rgb(colors.secondary).into()
             } else {
-                rgb(0x23382f).into()
+                rgb(colors.text).into()
             },
             background_color: None,
             underline: None,
@@ -56,7 +57,7 @@ impl TextInput {
                     background_color: self
                         .selected_range
                         .contains(&b[0])
-                        .then(|| rgba(0x77a09355).into()),
+                        .then(|| rgba(colors.selection).into()),
                     underline: mark.then_some(UnderlineStyle {
                         color: Some(base.color),
                         thickness: px(1.),
@@ -101,7 +102,7 @@ impl TextInput {
                                 if field.selected_range.is_empty() {
                                     w.paint_quad(fill(
                                         Bounds::new(pos, size(px(2.), layout.line_height())),
-                                        rgb(0x29705d),
+                                        rgb(colors.accent),
                                     ));
                                 }
                                 if reveal {

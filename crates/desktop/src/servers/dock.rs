@@ -180,6 +180,7 @@ impl Servers {
     }
 
     pub(super) fn split_workspace(&self, main: Div, width: f32, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let mut layout = div()
             .relative()
             .flex()
@@ -206,7 +207,7 @@ impl Servers {
             .track_scroll(&self.dock.tab_scroll)
             .overflow_x_scroll()
             .border_b_1()
-            .border_color(rgb(LINE));
+            .border_color(rgb(colors.border));
         for t in &self.dock.tabs {
             let panel = t.panel;
             let selected = active == panel;
@@ -215,22 +216,30 @@ impl Servers {
                     .flex_none()
                     .h_full()
                     .border_b_2()
-                    .border_color(rgb(if selected { GREEN } else { WHITE }))
+                    .border_color(rgb(if selected {
+                        colors.accent
+                    } else {
+                        colors.surface
+                    }))
                     .child(
                         hit(format!("tab-{}", panel.id()))
                             .h_full()
                             .px_2()
                             .max_w(px(162.))
                             .child(
-                                label(t.title.clone(), 12., if selected { INK } else { MUTED })
-                                    .truncate(),
+                                label(
+                                    t.title.clone(),
+                                    12.,
+                                    if selected { colors.text } else { colors.muted },
+                                )
+                                .truncate(),
                             )
                             .on_click(cx.listener(move |s, _, _, cx| s.open_panel(panel, cx))),
                     )
                     .child(
                         hit(format!("close-tab-{}", panel.id()))
                             .p_1()
-                            .child(Icon::Close.draw(12., MUTED))
+                            .child(Icon::Close.draw(12., colors.muted))
                             .on_click(cx.listener(move |s, _, _, cx| s.close_panel(panel, cx))),
                     ),
             );
@@ -243,7 +252,7 @@ impl Servers {
                 .iter()
                 .find(|r| r.run_id == id)
                 .map(|r| self.child_panel(r, cx))
-                .unwrap_or_else(|| label("Loading agent…", 14., MUTED)),
+                .unwrap_or_else(|| label("Loading agent…", 14., colors.muted)),
         };
         let close_id = if matches!(active, Panel::Child(_)) {
             "close-child"
@@ -264,9 +273,9 @@ impl Servers {
             .w(px(pane_width))
             .h_full()
             .min_h_0()
-            .bg(rgb(WHITE))
+            .bg(rgb(colors.surface))
             .border_l_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(colors.border))
             .child(strip)
             .child(
                 row()
@@ -275,9 +284,9 @@ impl Servers {
                     .gap_2()
                     .flex_none()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(colors.border))
                     .child(
-                        heading(tab.title.clone(), 15.)
+                        heading(colors, tab.title.clone(), 15.)
                             .truncate()
                             .flex_1()
                             .min_w_0(),
@@ -285,7 +294,7 @@ impl Servers {
                     .child(
                         hit(close_id)
                             .p_2()
-                            .child(Icon::Close.draw(16., MUTED))
+                            .child(Icon::Close.draw(16., colors.muted))
                             .on_click(cx.listener(move |s, _, _, cx| s.close_panel(active, cx))),
                     ),
             )
@@ -321,7 +330,7 @@ impl Servers {
                     .bottom_0()
                     .w(px(6.))
                     .cursor(CursorStyle::ResizeLeftRight)
-                    .hover(|d| d.bg(rgb(TINT)))
+                    .hover(|d| d.bg(rgb(colors.tint)))
                     .on_drag(ResizeDock, |_, _, _, cx| cx.new(|_| Empty))
                     .on_drag_move(cx.listener(|s, event: &DragMoveEvent<ResizeDock>, w, cx| {
                         s.conversation.follow_if_near_bottom();

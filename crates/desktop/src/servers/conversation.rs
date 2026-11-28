@@ -314,6 +314,7 @@ impl Servers {
         cx.notify();
     }
     fn approval_card(&self, approval: &Approval, cx: &mut Context<Self>) -> Option<Div> {
+        let colors = crate::theme::palette(cx);
         let id = approval.wait["id"].as_str()?;
         let tool = &approval.wait["on"]["ToolApproval"];
         let name = tool["tool_name"].as_str()?;
@@ -326,22 +327,23 @@ impl Servers {
             .p_3()
             .gap_2()
             .border_1()
-            .border_color(rgb(0xe6d8b9))
+            .border_color(rgb(colors.warning_border))
             .rounded_lg()
-            .bg(rgb(0xfaf6ec))
+            .bg(rgb(colors.warning_surface))
             .child(
                 row()
                     .gap_2()
-                    .child(Icon::Gate.draw(16., AMBER))
+                    .child(Icon::Gate.draw(16., colors.warning))
                     .child(heading(
+                        colors,
                         format!("Agent {} requests approval", approval.agent_id),
                         14.,
                     )),
             )
-            .child(heading(name.to_string(), 13.))
-            .child(label(args, 13., INK));
+            .child(heading(colors, name.to_string(), 13.))
+            .child(label(args, 13., colors.text));
         if pending {
-            card = card.child(label("Sending decision…", 12., MUTED));
+            card = card.child(label("Sending decision…", 12., colors.muted));
         } else if matches!(self.status, Status::Connected) {
             let mut buttons = row().gap_2();
             for (approved, text) in [(true, "Approve once"), (false, "Decline")] {
@@ -353,8 +355,20 @@ impl Servers {
                     ))
                     .px_3()
                     .py_1()
-                    .bg(rgb(if approved { GREEN } else { WHITE }))
-                    .child(label(text, 13., if approved { WHITE } else { INK }))
+                    .bg(rgb(if approved {
+                        colors.accent
+                    } else {
+                        colors.surface
+                    }))
+                    .child(label(
+                        text,
+                        13.,
+                        if approved {
+                            colors.on_accent
+                        } else {
+                            colors.text
+                        },
+                    ))
                     .on_click(cx.listener(move |s, _, _, cx| s.decide(id.clone(), approved, cx))),
                 );
             }
@@ -363,13 +377,14 @@ impl Servers {
         Some(card)
     }
     fn event_list(&self, run: i64, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let active = self.run == Some(run) && self.conversation.show_events;
         let mut list = column().gap_1().child(
             hit(format!("events-{run}"))
                 .py_1()
                 .gap_2()
-                .child(if active { Icon::Down } else { Icon::Right }.draw(12., MUTED))
-                .child(label("Run events", 12., MUTED))
+                .child(if active { Icon::Down } else { Icon::Right }.draw(12., colors.muted))
+                .child(label("Run events", 12., colors.muted))
                 .on_click(cx.listener(move |s, _, _, cx| {
                     s.follow_run(Some(run), cx);
                     s.conversation.show_events = !active;
@@ -377,12 +392,12 @@ impl Servers {
                 })),
         );
         if active {
-            let mut entries = column().flex_none().p_2().gap_1().bg(rgb(RAIL));
+            let mut entries = column().flex_none().p_2().gap_1().bg(rgb(colors.sidebar));
             for e in self.events.iter().rev() {
                 entries = entries.child(label(
                     format!("{}  ·  {}", e.sequence, e.event.kind.replace('_', " ")),
                     12.,
-                    MUTED,
+                    colors.muted,
                 ));
             }
             list = list.child(entries);
@@ -396,6 +411,7 @@ impl Servers {
         latest: Option<i64>,
         cx: &mut Context<Self>,
     ) -> Div {
+        let colors = crate::theme::palette(cx);
         let id = root.run_id;
         let expanded = !self.conversation.collapsed.contains(&id);
         let count = children.len();
@@ -403,8 +419,8 @@ impl Servers {
             hit(format!("activity-{id}"))
                 .gap_2()
                 .py_1()
-                .child(if expanded { Icon::Down } else { Icon::Right }.draw(13., MUTED))
-                .child(heading("Activity", 12.))
+                .child(if expanded { Icon::Down } else { Icon::Right }.draw(13., colors.muted))
+                .child(heading(colors, "Activity", 12.))
                 .child(label(
                     match count {
                         0 => root.status.clone(),
@@ -412,7 +428,7 @@ impl Servers {
                         n => format!("{n} child agents"),
                     },
                     12.,
-                    MUTED,
+                    colors.muted,
                 ))
                 .on_click(cx.listener(move |s, _, _, cx| {
                     if !s.conversation.collapsed.remove(&id) {
@@ -433,20 +449,20 @@ impl Servers {
                             .py_1()
                             .rounded_md()
                             .border_1()
-                            .border_color(rgb(LINE))
+                            .border_color(rgb(colors.border))
                             .bg(rgb(if self.dock.active == Some(Panel::Child(child_id)) {
-                                TINT
+                                colors.tint
                             } else {
-                                WHITE
+                                colors.surface
                             }))
-                            .hover(|s| s.bg(rgb(TINT)))
-                            .child(tile(Icon::Branch, TINT, GREEN))
+                            .hover(move |s| s.bg(rgb(colors.tint)))
+                            .child(tile(Icon::Branch, colors.tint, colors.accent))
                             .child(
                                 column()
-                                    .child(heading(format!("Agent {}", r.agent_id), 12.))
-                                    .child(label(r.status.clone(), 11., MUTED)),
+                                    .child(heading(colors, format!("Agent {}", r.agent_id), 12.))
+                                    .child(label(r.status.clone(), 11., colors.muted)),
                             )
-                            .child(Icon::Right.draw(12., MUTED))
+                            .child(Icon::Right.draw(12., colors.muted))
                             .on_click(cx.listener(move |s, _, _, cx| {
                                 s.open_panel(Panel::Child(child_id), cx)
                             })),
@@ -459,14 +475,14 @@ impl Servers {
         }
         if let Some(outcome) = &root.outcome {
             if root.status == "failed" {
-                body = body.child(heading("Run failed", 13.));
+                body = body.child(heading(colors, "Run failed", 13.));
             }
-            body = body.child(crate::markdown::markdown(outcome));
+            body = body.child(crate::markdown::markdown(colors, outcome));
         } else {
             body = body.child(label(
                 format!("{} · {}", root.status, root.latest_event.replace('_', " ")),
                 12.,
-                MUTED,
+                colors.muted,
             ));
         }
         for a in &self.approvals {
@@ -499,12 +515,12 @@ impl Servers {
             .child(
                 row().justify_end().child(
                     div()
-                        .child(crate::markdown::markdown(&root.task))
+                        .child(crate::markdown::markdown(colors, &root.task))
                         .max_w(gpui::relative(0.75))
                         .min_w_0()
                         .rounded_xl()
                         .p_3()
-                        .bg(rgb(TINT))
+                        .bg(rgb(colors.tint))
                         .line_height(px(22.)),
                 ),
             )
@@ -522,7 +538,7 @@ impl Servers {
                             .items_center()
                             .justify_center()
                             .rounded_lg()
-                            .bg(rgb(TINT))
+                            .bg(rgb(colors.tint))
                             .overflow_hidden()
                             .child(figure),
                     )
@@ -530,6 +546,7 @@ impl Servers {
             )
     }
     pub(super) fn child_panel(&self, child: &Run, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let mut panel = column()
             .debug_selector(|| "child-panel".into())
             .p_4()
@@ -538,18 +555,18 @@ impl Servers {
             .child(
                 row()
                     .gap_3()
-                    .child(tile(Icon::Branch, TINT, GREEN))
-                    .child(heading(format!("Agent {}", child.agent_id), 16.))
-                    .child(label(child.status.clone(), 12., MUTED)),
+                    .child(tile(Icon::Branch, colors.tint, colors.accent))
+                    .child(heading(colors, format!("Agent {}", child.agent_id), 16.))
+                    .child(label(child.status.clone(), 12., colors.muted)),
             )
             .child(
                 column()
                     .p_3()
                     .gap_2()
                     .rounded_lg()
-                    .bg(rgb(RAIL))
-                    .child(heading("Assignment", 12.))
-                    .child(crate::markdown::markdown(&child.task)),
+                    .bg(rgb(colors.sidebar))
+                    .child(heading(colors, "Assignment", 12.))
+                    .child(crate::markdown::markdown(colors, &child.task)),
             )
             .child(self.event_list(child.run_id, cx));
         if let Some(events) = self.dock.child_events(child.run_id) {
@@ -561,7 +578,7 @@ impl Servers {
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                 {
-                    panel = panel.child(crate::markdown::markdown(text));
+                    panel = panel.child(crate::markdown::markdown(colors, text));
                 }
                 let (label_text, details) = match e.event.kind.as_str() {
                     "tool_call_started" => {
@@ -579,8 +596,10 @@ impl Servers {
                 let mut tool = column().gap_1().child(
                     hit(format!("child-tool-{}-{}", e.run_id, e.sequence))
                         .gap_2()
-                        .child(if expanded { Icon::Down } else { Icon::Right }.draw(12., MUTED))
-                        .child(label(label_text, 12., MUTED))
+                        .child(
+                            if expanded { Icon::Down } else { Icon::Right }.draw(12., colors.muted),
+                        )
+                        .child(label(label_text, 12., colors.muted))
                         .on_click(cx.listener(move |s, _, _, cx| {
                             s.conversation.tool_detail = (!expanded).then_some(key);
                             cx.notify();
@@ -589,10 +608,10 @@ impl Servers {
                 if expanded && let Some(details) = details {
                     let value = serde_json::to_string_pretty(details).unwrap_or_default();
                     tool = tool.child(
-                        label(value, 12., INK)
+                        label(value, 12., colors.text)
                             .font_family("monospace")
                             .p_2()
-                            .bg(rgb(RAIL)),
+                            .bg(rgb(colors.sidebar)),
                     );
                 }
                 panel = panel.child(tool);
@@ -601,6 +620,7 @@ impl Servers {
         if let Some(outcome) = &child.outcome {
             panel = panel
                 .child(heading(
+                    colors,
                     if child.status == "failed" {
                         "Failure"
                     } else {
@@ -608,7 +628,7 @@ impl Servers {
                     },
                     14.,
                 ))
-                .child(crate::markdown::markdown(outcome));
+                .child(crate::markdown::markdown(colors, outcome));
         }
         for file in self
             .artifacts
@@ -621,6 +641,7 @@ impl Servers {
         panel
     }
     pub(super) fn chat_view(&self, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let mut feed = column()
             .id("conversation")
             .debug_selector(|| "conversation".into())
@@ -638,6 +659,7 @@ impl Servers {
                 .justify_center()
                 .child(self.character.clone())
                 .child(heading(
+                    colors,
                     if self.conversation.loaded {
                         "What would you like to work on?"
                     } else {
@@ -702,19 +724,23 @@ impl Servers {
             };
             let mut footer = column().w_full().max_w(px(1120.)).min_w_0().gap_1();
             if let Some(error) = self.config_error.as_ref().or(draft.error.as_ref()) {
-                footer = footer.child(label(error.clone(), 12., AMBER));
+                footer = footer.child(label(error.clone(), 12., colors.warning));
             }
             if let Status::Reconnecting(e) | Status::Attention(e) = &self.status {
-                footer = footer.child(label(e.clone(), 12., AMBER));
+                footer = footer.child(label(e.clone(), 12., colors.warning));
             }
             if !status.is_empty() {
-                footer = footer.child(label(status, 12., MUTED));
+                footer = footer.child(label(status, 12., colors.muted));
             }
             let mut send = hit("send")
                 .size(px(33.))
                 .justify_center()
-                .bg(rgb(if self.can_send() { GREEN } else { MUTED }))
-                .child(Icon::Arrow.draw(17., WHITE));
+                .bg(rgb(if self.can_send() {
+                    colors.accent
+                } else {
+                    colors.muted
+                }))
+                .child(Icon::Arrow.draw(17., colors.on_accent));
             if self.can_send() {
                 send = send.on_click(cx.listener(|s, _, _, cx| s.send_prompt(cx)));
             }
@@ -733,8 +759,8 @@ impl Servers {
                                 .p_2()
                                 .rounded_lg()
                                 .border_1()
-                                .border_color(rgb(LINE))
-                                .bg(rgb(WHITE))
+                                .border_color(rgb(colors.border))
+                                .bg(rgb(colors.surface))
                                 .child(
                                     div()
                                         .id("composer")

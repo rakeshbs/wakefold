@@ -434,6 +434,7 @@ impl Servers {
         }
     }
     fn sidebar(&self, expanded: bool, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         if !expanded {
             return column()
                 .w(px(68.))
@@ -442,13 +443,13 @@ impl Servers {
                 .items_center()
                 .gap_3()
                 .py_4()
-                .bg(rgb(RAIL))
+                .bg(rgb(colors.sidebar))
                 .border_r_1()
-                .border_color(rgb(LINE))
+                .border_color(rgb(colors.border))
                 .child(
                     hit("expand-sidebar")
                         .p_2()
-                        .child(tile(Icon::Fold, TINT, GREEN))
+                        .child(tile(Icon::Fold, colors.tint, colors.accent))
                         .on_click(cx.listener(|s, _, _, cx| {
                             s.sidebar_expanded = Some(true);
                             cx.notify();
@@ -457,13 +458,13 @@ impl Servers {
                 .child(
                     hit("new-chat")
                         .p_2()
-                        .child(Icon::New.draw(18., GREEN))
+                        .child(Icon::New.draw(18., colors.accent))
                         .on_click(cx.listener(|s, _, w, cx| s.new_chat(w, cx))),
                 )
                 .child(
                     hit("show-history")
                         .p_2()
-                        .child(Icon::History.draw(18., GREEN))
+                        .child(Icon::History.draw(18., colors.accent))
                         .on_click(cx.listener(|s, _, _, cx| {
                             s.sidebar_expanded = Some(true);
                             cx.notify();
@@ -472,9 +473,11 @@ impl Servers {
                 .child(
                     hit("mcp-servers")
                         .p_2()
-                        .child(Icon::Plug.draw(18., GREEN))
+                        .child(Icon::Plug.draw(18., colors.accent))
                         .on_click(cx.listener(|s, _, _, cx| s.show_mcp(cx))),
-                );
+                )
+                .child(div().flex_1())
+                .child(crate::theme::toggle_button(false, cx));
         }
         let mut side = column()
             .w(px(260.))
@@ -482,26 +485,26 @@ impl Servers {
             .h_full()
             .p_3()
             .gap_1()
-            .bg(rgb(RAIL))
+            .bg(rgb(colors.sidebar))
             .border_r_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(colors.border))
             .child(
                 row()
                     .gap_2()
                     .h(px(52.))
-                    .child(tile(Icon::Fold, TINT, GREEN))
-                    .child(heading("Wakefold", 21.).flex_1())
+                    .child(tile(Icon::Fold, colors.tint, colors.accent))
+                    .child(heading(colors, "Wakefold", 21.).flex_1())
                     .child(
                         hit("collapse-sidebar")
                             .p_2()
-                            .child(Icon::Sidebar.draw(16., MUTED))
+                            .child(Icon::Sidebar.draw(16., colors.muted))
                             .on_click(cx.listener(|s, _, _, cx| {
                                 s.sidebar_expanded = Some(false);
                                 cx.notify();
                             })),
                     ),
             )
-            .child(label("Servers", 12., MUTED).mt_3().mb_1());
+            .child(label("Servers", 12., colors.muted).mt_3().mb_1());
         let mut servers = column()
             .id("server-list")
             .max_h(px(175.))
@@ -515,29 +518,45 @@ impl Servers {
                     .gap_2()
                     .px_3()
                     .py_2()
-                    .bg(rgb(if self.active.url == p.url { TINT } else { RAIL }))
-                    .hover(|s| s.bg(rgb(TINT)))
-                    .child(Icon::Plug.draw(15., GREEN))
-                    .child(label(p.name.clone(), 13., INK).truncate())
+                    .bg(rgb(if self.active.url == p.url {
+                        colors.tint
+                    } else {
+                        colors.sidebar
+                    }))
+                    .hover(move |s| s.bg(rgb(colors.tint)))
+                    .child(Icon::Plug.draw(15., colors.accent))
+                    .child(label(p.name.clone(), 13., colors.text).truncate())
                     .on_click(cx.listener(move |s, _, _, cx| s.connect(p.clone(), cx))),
             );
         }
         side = side
             .child(servers)
             .child(
-                nav("add-server", Icon::New, "Add server", self.form.is_some())
-                    .on_click(cx.listener(|s, _, _, cx| s.show_form(cx))),
+                nav(
+                    colors,
+                    "add-server",
+                    Icon::New,
+                    "Add server",
+                    self.form.is_some(),
+                )
+                .on_click(cx.listener(|s, _, _, cx| s.show_form(cx))),
             )
             .child(
-                nav("new-chat", Icon::New, "New chat", false)
+                nav(colors, "new-chat", Icon::New, "New chat", false)
                     .mt_3()
                     .on_click(cx.listener(|s, _, w, cx| s.new_chat(w, cx))),
             )
             .child(
-                nav("mcp-servers", Icon::Plug, "MCP servers", self.mcp.is_some())
-                    .on_click(cx.listener(|s, _, _, cx| s.show_mcp(cx))),
+                nav(
+                    colors,
+                    "mcp-servers",
+                    Icon::Plug,
+                    "MCP servers",
+                    self.mcp.is_some(),
+                )
+                .on_click(cx.listener(|s, _, _, cx| s.show_mcp(cx))),
             )
-            .child(label("Saved chats", 12., MUTED).mt_3().mb_1());
+            .child(label("Saved chats", 12., colors.muted).mt_3().mb_1());
         let mut chats = column()
             .id("saved-chats")
             .flex_1()
@@ -551,14 +570,18 @@ impl Servers {
                     .gap_2()
                     .px_2()
                     .py_2()
-                    .bg(rgb(if self.chat == Some(id) { TINT } else { RAIL }))
-                    .hover(|s| s.bg(rgb(TINT)))
-                    .child(dot(GREEN))
+                    .bg(rgb(if self.chat == Some(id) {
+                        colors.tint
+                    } else {
+                        colors.sidebar
+                    }))
+                    .hover(move |s| s.bg(rgb(colors.tint)))
+                    .child(dot(colors.accent))
                     .child(
                         label(
                             c.title.as_deref().unwrap_or("Empty chat").to_owned(),
                             13.,
-                            INK,
+                            colors.text,
                         )
                         .truncate(),
                     )
@@ -566,31 +589,37 @@ impl Servers {
             );
         }
         side.child(chats)
+            .child(crate::theme::toggle_button(true, cx))
     }
     fn form(&self, form: &AddServer, cx: &mut Context<Self>) -> Div {
-        let mut card = column()
-            .gap_3()
-            .max_w(px(480.))
-            .w_full()
-            .child(heading("Add server", 23.));
+        let colors = crate::theme::palette(cx);
+        let mut card =
+            column()
+                .gap_3()
+                .max_w(px(480.))
+                .w_full()
+                .child(heading(colors, "Add server", 23.));
         for (title, field) in [("Name", &form.name), ("Server URL", &form.url)] {
             card = card.child(
-                column().gap_1().child(label(title, 12., MUTED)).child(
-                    div()
-                        .p_1()
-                        .bg(rgb(WHITE))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .child(field.clone()),
-                ),
+                column()
+                    .gap_1()
+                    .child(label(title, 12., colors.muted))
+                    .child(
+                        div()
+                            .p_1()
+                            .bg(rgb(colors.surface))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(colors.border))
+                            .child(field.clone()),
+                    ),
             );
         }
-        card = card.child(label("Access token", 12., MUTED)).child(
+        card = card.child(label("Access token", 12., colors.muted)).child(
             row()
                 .gap_2()
                 .child(
-                    action("paste-token", "Paste token", false).on_click(cx.listener(
+                    action(colors, "paste-token", "Paste token", false).on_click(cx.listener(
                         |s, _, _, cx| {
                             if let Some(f) = &mut s.form
                                 && !f.saving
@@ -616,17 +645,18 @@ impl Servers {
                         "Saved to your OS credential store"
                     },
                     12.,
-                    MUTED,
+                    colors.muted,
                 )),
         );
         if let Some(e) = &form.error {
-            card = card.child(label(e.clone(), 13., AMBER));
+            card = card.child(label(e.clone(), 13., colors.warning));
         }
         card.child(
             row()
                 .gap_2()
                 .child(
                     action(
+                        colors,
                         "save-server",
                         if form.saving {
                             "Connecting…"
@@ -638,15 +668,18 @@ impl Servers {
                     .on_click(cx.listener(|s, _, _, cx| s.save_server(cx))),
                 )
                 .child(
-                    action("cancel", "Cancel", false).on_click(cx.listener(|s, _, _, cx| {
-                        s.save = None;
-                        s.form = None;
-                        cx.notify()
-                    })),
+                    action(colors, "cancel", "Cancel", false).on_click(cx.listener(
+                        |s, _, _, cx| {
+                            s.save = None;
+                            s.form = None;
+                            cx.notify()
+                        },
+                    )),
                 ),
         )
     }
     fn content(&self, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let mut body = column()
             .flex_1()
             .min_w_0()
@@ -662,20 +695,20 @@ impl Servers {
             let mut setup = column()
                 .gap_3()
                 .max_w(px(480.))
-                .child(heading("Start the local daemon", 20.))
+                .child(heading(colors, "Start the local daemon", 20.))
                 .child(label(
                     "Copy your OpenAI API key, then save it to this computer’s credential store.",
                     14.,
-                    INK,
+                    colors.text,
                 ))
                 .child(
                     row().child(
-                        action("local-provider-key", "Paste key and start", true)
+                        action(colors, "local-provider-key", "Paste key and start", true)
                             .on_click(cx.listener(|s, _, _, cx| s.save_local_key(cx))),
                     ),
                 );
             if !error.is_empty() {
-                setup = setup.child(label(error.clone(), 13., AMBER));
+                setup = setup.child(label(error.clone(), 13., colors.warning));
             }
             return column().flex_1().child(body.child(setup));
         }
@@ -686,10 +719,10 @@ impl Servers {
             return self.chat_view(cx);
         }
         if let Some(error) = &self.config_error {
-            body = body.child(label(error.clone(), 13., AMBER));
+            body = body.child(label(error.clone(), 13., colors.warning));
         }
         if let Status::Reconnecting(error) | Status::Attention(error) = &self.status {
-            body = body.child(label(error.clone(), 13., AMBER));
+            body = body.child(label(error.clone(), 13., colors.warning));
         }
         let message = match self.status {
             Status::Connected if self.chats.is_empty() => "Start a new chat",
@@ -707,13 +740,14 @@ impl Servers {
                     .justify_center()
                     .gap_3()
                     .child(self.character.clone())
-                    .child(heading(message, 20.)),
+                    .child(heading(colors, message, 20.)),
             ),
         )
     }
 }
 impl Render for Servers {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = crate::theme::palette(cx);
         let viewport = window.viewport_size();
         if self.viewport.replace(viewport) != Some(viewport) {
             self.conversation.follow_if_near_bottom();
@@ -737,14 +771,14 @@ impl Render for Servers {
             .gap_3()
             .flex_none()
             .child(dot(if matches!(self.status, Status::Connected) {
-                GREEN
+                colors.accent
             } else {
-                AMBER
+                colors.warning
             }))
-            .child(label(self.status.label().to_owned(), 12., MUTED));
+            .child(label(self.status.label().to_owned(), 12., colors.muted));
         if chat_visible {
             buttons = buttons.child(
-                action("chat-artifacts", "Artifacts", false)
+                action(colors, "chat-artifacts", "Artifacts", false)
                     .on_click(cx.listener(|s, _, _, cx| s.open_panel(Panel::Artifacts, cx))),
             );
         }
@@ -755,12 +789,12 @@ impl Render for Servers {
             .h(px(64.))
             .flex_none()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(colors.border))
             .child(
                 column()
                     .min_w_0()
                     .flex_1()
-                    .child(heading(title, 17.).truncate())
+                    .child(heading(colors, title, 17.).truncate())
                     .child(
                         label(
                             if chat_visible {
@@ -769,7 +803,7 @@ impl Render for Servers {
                                 self.active.url.clone()
                             },
                             12.,
-                            MUTED,
+                            colors.muted,
                         )
                         .truncate(),
                     ),
@@ -801,7 +835,8 @@ impl Render for Servers {
                 }
             }))
             .size_full()
-            .bg(rgb(PAPER))
+            .bg(rgb(colors.background))
+            .text_color(rgb(colors.text))
             .font_family("Inter")
             .overflow_hidden()
             .child(self.sidebar(expanded, cx))

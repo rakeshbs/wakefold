@@ -6,8 +6,8 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, hsla,
-    point, prelude::*, px, relative, rgb, rgba, size, white,
+    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
+    point, prelude::*, px, relative, rgb, rgba, size,
 };
 use unicode_segmentation::*;
 
@@ -486,6 +486,7 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let colors = crate::theme::palette(cx);
         let input = self.input.read(cx);
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
@@ -493,7 +494,7 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), hsla(0.40, 0.07, 0.41, 1.))
+            (input.placeholder.clone(), rgb(colors.secondary).into())
         } else {
             (content, style.color)
         };
@@ -553,7 +554,7 @@ impl Element for TextElement {
                         point(bounds.left() - scroll_x + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(0x29705d),
+                    rgb(colors.accent),
                 )),
             )
         } else {
@@ -569,7 +570,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x3311ff30),
+                    rgba(colors.selection),
                 )),
                 None,
             )
@@ -626,6 +627,7 @@ impl Element for TextElement {
 
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = crate::theme::palette(cx);
         let field = if self.multiline.is_some() {
             self.wrapped(window, cx).into_any_element()
         } else {
@@ -633,7 +635,8 @@ impl Render for TextInput {
                 .h(px(32.))
                 .w_full()
                 .p(px(4.))
-                .bg(white())
+                .bg(rgb(colors.surface))
+                .text_color(rgb(colors.text))
                 .child(TextElement { input: cx.entity() })
                 .into_any_element()
         };

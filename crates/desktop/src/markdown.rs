@@ -17,12 +17,12 @@ struct Line {
 }
 
 impl Line {
-    fn push(&mut self, value: &str, code: bool) {
+    fn push(&mut self, colors: crate::theme::Palette, value: &str, code: bool) {
         let start = self.text.len();
         self.text.push_str(value);
         let mut style = self.inline.last().copied().unwrap_or_default();
         if code {
-            style.background_color = Some(rgb(TINT).into());
+            style.background_color = Some(rgb(colors.tint).into());
         }
         if style != HighlightStyle::default() {
             self.styles.push((start..self.text.len(), style));
@@ -57,13 +57,13 @@ struct Block {
     counter: Option<u64>,
 }
 
-pub(crate) fn markdown(source: &str) -> Div {
+pub(crate) fn markdown(colors: crate::theme::Palette, source: &str) -> Div {
     let root = column()
         .gap_2()
         .min_w_0()
         .text_size(px(15.))
         .line_height(px(24.))
-        .text_color(rgb(INK));
+        .text_color(rgb(colors.text));
     let mut stack = vec![Block {
         body: root,
         marker: None,
@@ -75,11 +75,11 @@ pub(crate) fn markdown(source: &str) -> Div {
     {
         let current = stack.last_mut().expect("document has a root");
         match event {
-            Event::Text(s) | Event::Html(s) | Event::InlineHtml(s) => line.push(&s, false),
-            Event::Code(s) => line.push(&s, true),
-            Event::SoftBreak => line.push(" ", false),
-            Event::HardBreak => line.push("\n", false),
-            Event::TaskListMarker(done) => line.push(if done { "☑ " } else { "☐ " }, false),
+            Event::Text(s) | Event::Html(s) | Event::InlineHtml(s) => line.push(colors, &s, false),
+            Event::Code(s) => line.push(colors, &s, true),
+            Event::SoftBreak => line.push(colors, " ", false),
+            Event::HardBreak => line.push(colors, "\n", false),
+            Event::TaskListMarker(done) => line.push(colors, if done { "☑ " } else { "☐ " }, false),
             Event::Start(Tag::Strong | Tag::Emphasis | Tag::Link { .. } | Tag::Image { .. }) => {
                 let mut style = line.inline.last().copied().unwrap_or_default();
                 match event {
@@ -88,7 +88,7 @@ pub(crate) fn markdown(source: &str) -> Div {
                     Event::Start(Tag::Link { dest_url, .. })
                         if dest_url.starts_with("https://") || dest_url.starts_with("http://") =>
                     {
-                        style.color = Some(rgb(GREEN).into());
+                        style.color = Some(rgb(colors.accent).into());
                         line.link = Some((line.text.len(), dest_url.into_string()));
                     }
                     _ => {}
@@ -125,7 +125,7 @@ pub(crate) fn markdown(source: &str) -> Div {
                             .line_height(px(size * 1.35))
                     }
                     Tag::CodeBlock(_) => body
-                        .bg(rgb(RAIL))
+                        .bg(rgb(colors.sidebar))
                         .rounded_lg()
                         .p_3()
                         .text_size(px(13.))
@@ -133,9 +133,9 @@ pub(crate) fn markdown(source: &str) -> Div {
                         .font_family("monospace"),
                     Tag::BlockQuote(_) => body
                         .border_l_2()
-                        .border_color(rgb(LINE))
+                        .border_color(rgb(colors.border))
                         .pl_3()
-                        .text_color(rgb(MUTED)),
+                        .text_color(rgb(colors.muted)),
                     Tag::List(number) => {
                         counter = number;
                         body.gap_1()
@@ -157,9 +157,10 @@ pub(crate) fn markdown(source: &str) -> Div {
                             .flex_none()
                             .min_w_0()
                             .border_b_1()
-                            .border_color(rgb(LINE));
+                            .border_color(rgb(colors.border));
                         if matches!(tag, Tag::TableHead) {
-                            row.font_weight(FontWeight::SEMIBOLD).bg(rgb(RAIL))
+                            row.font_weight(FontWeight::SEMIBOLD)
+                                .bg(rgb(colors.sidebar))
                         } else {
                             row
                         }
@@ -197,7 +198,7 @@ pub(crate) fn markdown(source: &str) -> Div {
                 line.flush(current, index);
                 current
                     .body
-                    .extend([div().h(px(1.)).bg(rgb(LINE)).into_any_element()]);
+                    .extend([div().h(px(1.)).bg(rgb(colors.border)).into_any_element()]);
             }
             _ => {}
         }

@@ -102,6 +102,7 @@ impl Desktop {
         }
     }
     fn sidebar(&self, narrow: bool, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let brand = row()
             .gap_2()
             .px_2()
@@ -111,38 +112,38 @@ impl Desktop {
                     .size(px(32.))
                     .rounded_lg()
                     .justify_center()
-                    .bg(rgb(GREEN))
-                    .child(Icon::Fold.draw(23., 0xf0f5df)),
+                    .bg(rgb(colors.accent))
+                    .child(Icon::Fold.draw(23., colors.on_accent)),
             )
-            .child(heading("Wakefold", 22.));
+            .child(heading(colors, "Wakefold", 22.));
         let mut rail = column()
             .w(px(if narrow { 170. } else { 212. }))
             .h_full()
             .flex_none()
             .px_3()
             .pt_3()
-            .bg(rgb(RAIL))
+            .bg(rgb(colors.sidebar))
             .border_r_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(colors.border))
             .child(brand)
             .child(div().h(px(20.)).flex_none())
             .child(
-                nav("new", Icon::New, "New chat", false)
+                nav(colors, "new", Icon::New, "New chat", false)
                     .on_click(cx.listener(|s, _, w, cx| s.new_chat(w, cx))),
             )
             .child(
-                nav("search", Icon::Search, "Search", self.searching).on_click(cx.listener(
-                    |s, _, w, cx| {
+                nav(colors, "search", Icon::Search, "Search", self.searching).on_click(
+                    cx.listener(|s, _, w, cx| {
                         s.searching = !s.searching;
                         if s.searching {
                             w.focus(&s.search.focus_handle(cx));
                         }
                         cx.notify()
-                    },
-                )),
+                    }),
+                ),
             )
             .child(
-                nav("history", Icon::History, "History", false).on_click(cx.listener(
+                nav(colors, "history", Icon::History, "History", false).on_click(cx.listener(
                     |s, _, _, cx| {
                         s.library = false;
                         s.searching = false;
@@ -151,12 +152,12 @@ impl Desktop {
                 )),
             )
             .child(
-                nav("library", Icon::Library, "Artifacts", self.library).on_click(cx.listener(
-                    |s, _, _, cx| {
+                nav(colors, "library", Icon::Library, "Artifacts", self.library).on_click(
+                    cx.listener(|s, _, _, cx| {
                         s.library = true;
                         cx.notify()
-                    },
-                )),
+                    }),
+                ),
             );
         if self.searching {
             rail = rail.child(
@@ -164,9 +165,9 @@ impl Desktop {
                     .mt_2()
                     .p_1()
                     .rounded_md()
-                    .bg(rgb(WHITE))
+                    .bg(rgb(colors.surface))
                     .border_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(colors.border))
                     .child(self.search.clone()),
             );
         }
@@ -196,42 +197,53 @@ impl Desktop {
                     .gap_2()
                     .px_3()
                     .py_2()
-                    .bg(rgb(if current { TINT } else { RAIL }))
-                    .hover(|s| s.bg(rgb(TINT)))
-                    .child(dot(if c.waiting() { 0xa37c3d } else { 0x92a599 }))
+                    .bg(rgb(if current { colors.tint } else { colors.sidebar }))
+                    .hover(move |s| s.bg(rgb(colors.tint)))
+                    .child(dot(if c.waiting() {
+                        colors.warning
+                    } else {
+                        colors.secondary
+                    }))
                     .child(
-                        label(c.title.clone(), 13., if current { GREEN } else { MUTED }).truncate(),
+                        label(
+                            c.title.clone(),
+                            13.,
+                            if current { colors.accent } else { colors.muted },
+                        )
+                        .truncate(),
                     )
                     .on_click(cx.listener(move |s, _, _, cx| s.select(i, cx))),
             );
         }
         if !any {
-            list = list.child(label("No matching chats", 12., MUTED).px_3());
+            list = list.child(label("No matching chats", 12., colors.muted).px_3());
         }
         rail.child(
-            label("Recent chats", 11., MUTED)
+            label("Recent chats", 11., colors.muted)
                 .font_weight(FontWeight::SEMIBOLD)
                 .px_3()
                 .mt_6()
                 .mb_2(),
         )
         .child(list)
+        .child(crate::theme::toggle_button(true, cx))
         .child(
             row()
                 .gap_2()
                 .py_4()
                 .px_2()
                 .border_t_1()
-                .border_color(rgb(LINE))
-                .child(tile(Icon::Folder, 0xe3e9de, GREEN))
-                .child(column().child(heading("Local workspace", 12.)).child(label(
-                    "Design preview",
-                    11.,
-                    SOFT,
-                ))),
+                .border_color(rgb(colors.border))
+                .child(tile(Icon::Folder, colors.tint, colors.accent))
+                .child(
+                    column()
+                        .child(heading(colors, "Local workspace", 12.))
+                        .child(label("Design preview", 11., colors.secondary)),
+                ),
         )
     }
     fn activity(&self, t: usize, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let turn = &self.chat().turns[t];
         let mut box_ = column().gap_2();
         box_ = box_.child(
@@ -239,17 +251,21 @@ impl Desktop {
                 .gap_2()
                 .px_1()
                 .py_1()
-                .hover(|s| s.bg(rgb(TINT)))
+                .hover(move |s| s.bg(rgb(colors.tint)))
                 .child(
                     if turn.expanded {
                         Icon::Down
                     } else {
                         Icon::Right
                     }
-                    .draw(13., MUTED),
+                    .draw(13., colors.muted),
                 )
-                .child(heading("Activity", 12.))
-                .child(label(format!("{} agents", turn.workers.len()), 12., MUTED))
+                .child(heading(colors, "Activity", 12.))
+                .child(label(
+                    format!("{} agents", turn.workers.len()),
+                    12.,
+                    colors.muted,
+                ))
                 .on_click(cx.listener(move |s, _, _, cx| {
                     let expanded = &mut s.chats[s.current].turns[t].expanded;
                     *expanded = !*expanded;
@@ -262,28 +278,36 @@ impl Desktop {
                 .gap_2()
                 .pl_3()
                 .border_l_1()
-                .border_color(rgb(LINE));
+                .border_color(rgb(colors.border));
             for (i, worker) in turn.workers.iter().enumerate() {
                 cards = cards.child(
                     hit(format!("worker-{t}-{i}"))
                         .gap_2()
                         .px_2()
                         .py_1p5()
-                        .bg(rgb(WHITE))
+                        .bg(rgb(colors.surface))
                         .border_1()
-                        .border_color(rgb(LINE))
-                        .hover(|s| s.bg(rgb(TINT)))
+                        .border_color(rgb(colors.border))
+                        .hover(move |s| s.bg(rgb(colors.tint)))
                         .child(tile(
                             Icon::Branch,
-                            if i % 2 == 0 { 0xe6eee3 } else { 0xe5edf3 },
-                            if i % 2 == 0 { GREEN } else { 0x536e7b },
+                            if i % 2 == 0 {
+                                colors.tint
+                            } else {
+                                colors.blue_surface
+                            },
+                            if i % 2 == 0 {
+                                colors.accent
+                            } else {
+                                colors.blue_text
+                            },
                         ))
                         .child(
                             column()
-                                .child(heading(worker.name, 12.))
-                                .child(label("Finished", 10., MUTED)),
+                                .child(heading(colors, worker.name, 12.))
+                                .child(label("Finished", 10., colors.muted)),
                         )
-                        .child(Icon::Right.draw(12., SOFT))
+                        .child(Icon::Right.draw(12., colors.secondary))
                         .on_click(cx.listener(move |s, _, _, cx| s.open(Tab::Worker(t, i), cx))),
                 );
             }
@@ -299,23 +323,24 @@ impl Desktop {
         id: String,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let colors = crate::theme::palette(cx);
         hit(id)
             .gap_3()
             .px_3()
             .py_2()
-            .bg(rgb(WHITE))
+            .bg(rgb(colors.surface))
             .border_1()
-            .border_color(rgb(LINE))
-            .hover(|s| s.bg(rgb(TINT)))
-            .child(tile(Icon::File, TINT, GREEN))
+            .border_color(rgb(colors.border))
+            .hover(move |s| s.bg(rgb(colors.tint)))
+            .child(tile(Icon::File, colors.tint, colors.accent))
             .child(
                 column()
                     .flex_1()
                     .min_w_0()
-                    .child(heading(file.filename, 13.).truncate())
-                    .child(label("Markdown  ·  Revision 1", 11., MUTED)),
+                    .child(heading(colors, file.filename, 13.).truncate())
+                    .child(label("Markdown  ·  Revision 1", 11., colors.muted)),
             )
-            .child(Icon::Right.draw(14., SOFT))
+            .child(Icon::Right.draw(14., colors.secondary))
             .on_click(cx.listener(move |s, _, _, cx| {
                 if s.current != chat {
                     s.select(chat, cx);
@@ -330,34 +355,35 @@ impl Desktop {
         state: Publication,
         cx: &mut Context<Self>,
     ) -> Div {
+        let colors = crate::theme::palette(cx);
         match state {
             Publication::Pending => column()
                 .p_3()
                 .gap_2()
                 .rounded_lg()
-                .bg(rgb(0xfaf6ec))
+                .bg(rgb(colors.warning_surface))
                 .border_1()
-                .border_color(rgb(0xe6d8b9))
+                .border_color(rgb(colors.warning_border))
                 .child(
                     row()
                         .gap_2()
-                        .child(Icon::Gate.draw(16., AMBER))
-                        .child(heading("Publish the brief?", 14.)),
+                        .child(Icon::Gate.draw(16., colors.warning))
+                        .child(heading(colors, "Publish the brief?", 14.)),
                 )
                 .child(label(
                     format!("Save {} to this chat’s artifacts.", file.filename),
                     12.,
-                    0x685b42,
+                    colors.warning,
                 ))
                 .child(
                     row()
                         .gap_2()
                         .child(
-                            action("approve", "Approve once", true)
+                            action(colors, "approve", "Approve once", true)
                                 .on_click(cx.listener(move |s, _, _, cx| s.resolve(t, true, cx))),
                         )
                         .child(
-                            action("decline", "Decline", false)
+                            action(colors, "decline", "Decline", false)
                                 .on_click(cx.listener(move |s, _, _, cx| s.resolve(t, false, cx))),
                         ),
                 ),
@@ -366,8 +392,8 @@ impl Desktop {
             }
             Publication::Declined => row()
                 .gap_2()
-                .child(Icon::Gate.draw(14., MUTED))
-                .child(label("Publication declined", 12., MUTED)),
+                .child(Icon::Gate.draw(14., colors.muted))
+                .child(label("Publication declined", 12., colors.muted)),
         }
     }
     fn turn(
@@ -377,15 +403,16 @@ impl Desktop {
         narrow: bool,
         cx: &mut Context<Self>,
     ) -> Div {
+        let colors = crate::theme::palette(cx);
         let turn = &self.chat().turns[t];
         let mut group = column().gap_5().flex_none().child(
             row().justify_end().child(
-                label(turn.prompt.clone(), 15., INK)
+                label(turn.prompt.clone(), 15., colors.text)
                     .max_w(px(if narrow { 385. } else { 550. }))
                     .rounded_xl()
                     .px_4()
                     .py_3()
-                    .bg(rgb(0xeaf0e8))
+                    .bg(rgb(colors.tint))
                     .line_height(px(22.)),
             ),
         );
@@ -394,11 +421,11 @@ impl Desktop {
                 .flex_1()
                 .min_w_0()
                 .gap_3()
-                .child(heading("Wakefold", 14.));
+                .child(heading(colors, "Wakefold", 14.));
             if !turn.workers.is_empty() {
                 body = body.child(self.activity(t, cx));
             }
-            body = body.child(label(reply, 15., INK).line_height(px(23.)));
+            body = body.child(label(reply, 15., colors.text).line_height(px(23.)));
             if let Some((file, state)) = turn.artifact {
                 body = body.child(self.publication(t, file, state, cx));
             }
@@ -412,12 +439,13 @@ impl Desktop {
             group = group.child(row().justify_end().child(label(
                 "Saved in this local preview",
                 11.,
-                SOFT,
+                colors.secondary,
             )));
         }
         group
     }
     fn conversation(&self, compact: bool, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let chat = self.chat();
         let pad = if compact { 18. } else { 38. };
         let header = row()
@@ -427,12 +455,12 @@ impl Desktop {
             .px(px(pad))
             .h(px(66.))
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(colors.border))
             .child(
                 column()
                     .min_w_0()
-                    .child(heading(chat.title.clone(), 16.).truncate())
-                    .child(label("Root agent", 11., MUTED)),
+                    .child(heading(colors, chat.title.clone(), 16.).truncate())
+                    .child(label("Root agent", 11., colors.muted)),
             )
             .child(
                 hit("workspace")
@@ -441,11 +469,11 @@ impl Desktop {
                     .h(px(32.))
                     .flex_none()
                     .border_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(WHITE))
-                    .hover(|s| s.bg(rgb(TINT)))
-                    .child(Icon::Folder.draw(15., GREEN))
-                    .child(label("Workspace", 12., INK))
+                    .border_color(rgb(colors.border))
+                    .bg(rgb(colors.surface))
+                    .hover(move |s| s.bg(rgb(colors.tint)))
+                    .child(Icon::Folder.draw(15., colors.accent))
+                    .child(label("Workspace", 12., colors.text))
                     .on_click(cx.listener(|s, _, _, cx| s.open(Tab::Workspace, cx))),
             );
         let mut feed = column()
@@ -462,7 +490,7 @@ impl Desktop {
                     .items_center()
                     .gap_2()
                     .child(self.welcome.clone())
-                    .child(heading("What would you like to work on?", 25.)),
+                    .child(heading(colors, "What would you like to work on?", 25.)),
             );
         } else {
             let latest = chat.turns.iter().rposition(|t| t.reply.is_some());
@@ -484,9 +512,9 @@ impl Desktop {
             .px_3()
             .h(px(55.))
             .rounded_xl()
-            .bg(rgb(WHITE))
+            .bg(rgb(colors.surface))
             .border_1()
-            .border_color(rgb(0xc5d1c7))
+            .border_color(rgb(colors.border))
             .child(
                 div()
                     .flex_1()
@@ -499,9 +527,9 @@ impl Desktop {
                     .size(px(33.))
                     .justify_center()
                     .rounded_lg()
-                    .bg(rgb(GREEN))
-                    .hover(|s| s.bg(rgb(0x36755b)))
-                    .child(Icon::Arrow.draw(17., WHITE))
+                    .bg(rgb(colors.accent))
+                    .hover(move |s| s.bg(rgb(colors.accent_hover)))
+                    .child(Icon::Arrow.draw(17., colors.on_accent))
                     .on_click(cx.listener(|s, _, _, cx| s.send(cx))),
             );
         let status = if chat.waiting() {
@@ -528,10 +556,14 @@ impl Desktop {
                             .child(
                                 row()
                                     .gap_2()
-                                    .child(dot(if chat.waiting() { 0xb18a47 } else { 0x769a7d }))
-                                    .child(label(status, 11., MUTED)),
+                                    .child(dot(if chat.waiting() {
+                                        colors.warning
+                                    } else {
+                                        colors.accent
+                                    }))
+                                    .child(label(status, 11., colors.muted)),
                             )
-                            .child(label("Return to send", 11., SOFT)),
+                            .child(label("Return to send", 11., colors.secondary)),
                     ),
             );
         column()
@@ -543,6 +575,7 @@ impl Desktop {
             .child(footer)
     }
     fn library(&self, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let mut files = column().gap_4().w_full().max_w(px(720.));
         for (i, chat) in self.chats.iter().enumerate().rev() {
             for (t, turn) in chat.turns.iter().enumerate() {
@@ -550,7 +583,7 @@ impl Desktop {
                     files = files.child(
                         column()
                             .gap_2()
-                            .child(label(chat.title.clone(), 12., MUTED))
+                            .child(label(chat.title.clone(), 12., colors.muted))
                             .child(self.file_link(i, t, f, format!("library-file-{i}-{t}"), cx)),
                     );
                 }
@@ -564,8 +597,8 @@ impl Desktop {
                     .h(px(66.))
                     .px_6()
                     .border_b_1()
-                    .border_color(rgb(LINE))
-                    .child(heading("Artifacts", 18.)),
+                    .border_color(rgb(colors.border))
+                    .child(heading(colors, "Artifacts", 18.)),
             )
             .child(
                 column()
@@ -577,6 +610,7 @@ impl Desktop {
             )
     }
     fn dock(&self, compact: bool, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let chat = self.chat();
         let active = chat.active.expect("open dock");
         let mut tabs = row()
@@ -586,7 +620,7 @@ impl Desktop {
             .h(px(41.))
             .px_2()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(colors.border))
             .flex_none();
         for (index, &tab) in chat.tabs.iter().enumerate() {
             tabs = tabs.child(
@@ -595,12 +629,20 @@ impl Desktop {
                     .h(px(26.))
                     .max_w(px(140.))
                     .flex_none()
-                    .bg(rgb(if tab == active { TINT } else { RAIL }))
+                    .bg(rgb(if tab == active {
+                        colors.tint
+                    } else {
+                        colors.sidebar
+                    }))
                     .child(
                         label(
                             chat.tab_title(tab).to_owned(),
                             11.,
-                            if tab == active { GREEN } else { MUTED },
+                            if tab == active {
+                                colors.accent
+                            } else {
+                                colors.muted
+                            },
                         )
                         .truncate(),
                     )
@@ -618,43 +660,46 @@ impl Desktop {
             Tab::Worker(t, w) => {
                 let worker = &chat.turns[t].workers[w];
                 content = content
-                    .child(row().gap_2().child(tile(Icon::Branch, TINT, GREEN)).child(
-                        column().child(heading(worker.name, 17.)).child(label(
-                            "Child agent  ·  Finished",
-                            11.,
-                            MUTED,
-                        )),
-                    ))
+                    .child(
+                        row()
+                            .gap_2()
+                            .child(tile(Icon::Branch, colors.tint, colors.accent))
+                            .child(
+                                column()
+                                    .child(heading(colors, worker.name, 17.))
+                                    .child(label("Child agent  ·  Finished", 11., colors.muted)),
+                            ),
+                    )
                     .child(
                         column()
                             .gap_2()
                             .mt_2()
                             .child(
-                                label("From root agent", 11., MUTED)
+                                label("From root agent", 11., colors.muted)
                                     .font_weight(FontWeight::SEMIBOLD),
                             )
                             .child(
-                                label(worker.task, 14., INK)
+                                label(worker.task, 14., colors.text)
                                     .line_height(px(21.))
                                     .p_3()
-                                    .bg(rgb(TINT))
+                                    .bg(rgb(colors.tint))
                                     .rounded_lg(),
                             ),
                     )
                     .child(
                         column()
                             .gap_2()
-                            .child(heading("Final result", 13.))
-                            .child(label(worker.finding, 14., INK).line_height(px(22.))),
+                            .child(heading(colors, "Final result", 13.))
+                            .child(label(worker.finding, 14., colors.text).line_height(px(22.))),
                     )
                     .child(
                         row()
                             .gap_2()
                             .py_3()
                             .border_t_1()
-                            .border_color(rgb(LINE))
-                            .child(Icon::Check.draw(14., GREEN))
-                            .child(label("Delivered to root agent", 11., MUTED)),
+                            .border_color(rgb(colors.border))
+                            .child(Icon::Check.draw(14., colors.accent))
+                            .child(label("Delivered to root agent", 11., colors.muted)),
                     );
             }
             Tab::Artifact(t) => {
@@ -663,32 +708,32 @@ impl Desktop {
                     .child(
                         row()
                             .gap_2()
-                            .child(Icon::File.draw(15., GREEN))
-                            .child(label("Markdown  ·  Revision 1", 11., MUTED)),
+                            .child(Icon::File.draw(15., colors.accent))
+                            .child(label("Markdown  ·  Revision 1", 11., colors.muted)),
                     )
-                    .child(heading(file.title, 20.));
+                    .child(heading(colors, file.title, 20.));
                 for &(title, body) in file.sections {
                     content = content.child(
                         column()
                             .gap_2()
-                            .child(heading(title, 14.))
-                            .child(label(body, 14., INK).line_height(px(21.))),
+                            .child(heading(colors, title, 14.))
+                            .child(label(body, 14., colors.text).line_height(px(21.))),
                     );
                 }
                 content = content.child(
                     hit("copy-file")
                         .gap_2()
                         .p_2()
-                        .hover(|s| s.bg(rgb(TINT)))
-                        .child(Icon::Copy.draw(14., GREEN))
-                        .child(label("Copy Markdown", 12., GREEN))
+                        .hover(move |s| s.bg(rgb(colors.tint)))
+                        .child(Icon::Copy.draw(14., colors.accent))
+                        .child(label("Copy Markdown", 12., colors.accent))
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(file.markdown()))
                         }),
                 );
             }
             Tab::Workspace => {
-                content = content.child(heading("Chat artifacts", 16.));
+                content = content.child(heading(colors, "Chat artifacts", 16.));
                 let mut count = 0;
                 for (t, turn) in chat.turns.iter().enumerate() {
                     if let Some(f) = turn.published() {
@@ -703,28 +748,32 @@ impl Desktop {
                     }
                 }
                 if count == 0 {
-                    content = content.child(label("Published files will appear here.", 13., MUTED));
+                    content = content.child(label(
+                        "Published files will appear here.",
+                        13.,
+                        colors.muted,
+                    ));
                 }
                 content = content
                     .child(
-                        heading("MCP servers", 15.)
+                        heading(colors, "MCP servers", 15.)
                             .pt_4()
                             .border_t_1()
-                            .border_color(rgb(LINE)),
+                            .border_color(rgb(colors.border)),
                     )
                     .child(
                         hit("server")
                             .gap_2()
                             .p_2()
                             .border_1()
-                            .border_color(rgb(LINE))
-                            .hover(|s| s.bg(rgb(TINT)))
-                            .child(Icon::Plug.draw(17., GREEN))
+                            .border_color(rgb(colors.border))
+                            .hover(move |s| s.bg(rgb(colors.tint)))
+                            .child(Icon::Plug.draw(17., colors.accent))
                             .child(
                                 column()
                                     .flex_1()
-                                    .child(heading("Field catalog", 13.))
-                                    .child(label("Sample server  ·  2 tools", 11., MUTED)),
+                                    .child(heading(colors, "Field catalog", 13.))
+                                    .child(label("Sample server  ·  2 tools", 11., colors.muted)),
                             )
                             .child(
                                 if self.show_tools {
@@ -732,7 +781,7 @@ impl Desktop {
                                 } else {
                                     Icon::Right
                                 }
-                                .draw(13., MUTED),
+                                .draw(13., colors.muted),
                             )
                             .on_click(cx.listener(|s, _, _, cx| {
                                 s.show_tools = !s.show_tools;
@@ -740,8 +789,9 @@ impl Desktop {
                             })),
                     );
                 if self.show_tools {
-                    content = content
-                        .child(label("list_sensors\nread_station", 13., INK).line_height(px(22.)));
+                    content = content.child(
+                        label("list_sensors\nread_station", 13., colors.text).line_height(px(22.)),
+                    );
                 }
             }
         }
@@ -749,17 +799,18 @@ impl Desktop {
             .w(px(if compact { 271. } else { 313. }))
             .flex_none()
             .h_full()
-            .bg(rgb(0xf6f7f2))
+            .bg(rgb(colors.sidebar))
             .border_l_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(colors.border))
             .child(
                 row()
                     .px_4()
                     .justify_between()
                     .h(px(66.))
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(colors.border))
                     .child(heading(
+                        colors,
                         match active {
                             Tab::Workspace => "Workspace",
                             Tab::Worker(..) => "Agent conversation",
@@ -771,8 +822,8 @@ impl Desktop {
                         hit("close-tab")
                             .size(px(28.))
                             .justify_center()
-                            .hover(|s| s.bg(rgb(TINT)))
-                            .child(Icon::Close.draw(14., MUTED))
+                            .hover(move |s| s.bg(rgb(colors.tint)))
+                            .child(Icon::Close.draw(14., colors.muted))
                             .on_click(cx.listener(move |s, _, _, cx| {
                                 s.chats[s.current].close(active);
                                 cx.notify()
@@ -785,14 +836,15 @@ impl Desktop {
 }
 impl Render for Desktop {
     fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = crate::theme::palette(cx);
         let compact = w.viewport_size().width < px(1080.);
         let open = !self.library && self.chat().active.is_some();
         let mut shell = div()
             .size_full()
             .flex()
-            .bg(rgb(PAPER))
+            .bg(rgb(colors.background))
             .font_family("Inter")
-            .text_color(rgb(INK))
+            .text_color(rgb(colors.text))
             .on_action(cx.listener(|s, _: &SendMessage, w, cx| {
                 if !s.search.focus_handle(cx).is_focused(w) {
                     s.send(cx);
@@ -830,6 +882,23 @@ mod tests {
         cx.simulate_resize(size(px(1180.), px(745.)));
         cx.run_until_parked();
         (view, cx)
+    }
+    #[gpui::test]
+    fn sidebar_switches_appearance_in_both_directions(cx: &mut TestAppContext) {
+        let (_, cx) = window(cx);
+        for theme in [
+            crate::theme::Theme::Dark,
+            crate::theme::Theme::Light,
+            crate::theme::Theme::Dark,
+        ] {
+            cx.update(|_, app| {
+                assert_eq!(
+                    crate::theme::palette(app).background,
+                    theme.palette().background
+                )
+            });
+            click(cx, "toggle-theme");
+        }
     }
     #[gpui::test]
     fn inspect_workers_and_publication(cx: &mut TestAppContext) {

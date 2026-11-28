@@ -10,6 +10,7 @@ mod profiles;
 mod scrollbar;
 mod servers;
 mod style;
+mod theme;
 
 use gpui::{
     App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
@@ -30,6 +31,7 @@ fn main() -> anyhow::Result<()> {
     };
     let runtime = tokio::runtime::Runtime::new()?;
     Application::new().run(move |cx: &mut App| {
+        theme::initialize(cx);
         input::bind(cx);
         cx.bind_keys([
             KeyBinding::new("enter", SendMessage, Some("TextInput")),

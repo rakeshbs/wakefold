@@ -31,12 +31,17 @@ struct ToolAccess {
 fn input(placeholder: &'static str, value: String, cx: &mut Context<Servers>) -> Entity<TextInput> {
     cx.new(|cx| TextInput::prefilled(placeholder, value, cx))
 }
-fn field(id: String, title: &str, editor: &Entity<TextInput>) -> impl IntoElement {
+fn field(
+    colors: crate::theme::Palette,
+    id: String,
+    title: &str,
+    editor: &Entity<TextInput>,
+) -> impl IntoElement {
     column()
         .flex_1()
         .min_w_0()
         .gap_1()
-        .child(label(title.to_owned(), 12., MUTED))
+        .child(label(title.to_owned(), 12., colors.muted))
         .child(
             div()
                 .id(gpui::SharedString::from(id.clone()))
@@ -45,8 +50,8 @@ fn field(id: String, title: &str, editor: &Entity<TextInput>) -> impl IntoElemen
                 .py_1()
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(WHITE))
+                .border_color(rgb(colors.border))
+                .bg(rgb(colors.surface))
                 .child(editor.clone()),
         )
 }
@@ -242,12 +247,13 @@ impl Servers {
         );
     }
     fn tool_row(&self, key: String, t: &RemoteTool, edit: bool, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let mut line = row()
             .gap_2()
-            .child(Icon::Plug.draw(15., GREEN))
-            .child(heading(t.name.clone(), 14.).flex_1())
+            .child(Icon::Plug.draw(15., colors.accent))
+            .child(heading(colors, t.name.clone(), 14.).flex_1())
             .child(
-                action_for(format!("schema-{key}"), "Schema").on_click(cx.listener({
+                action_for(colors, format!("schema-{key}"), "Schema").on_click(cx.listener({
                     let key = key.clone();
                     move |s, _, _, cx| {
                         if let Some(m) = &mut s.mcp {
@@ -264,7 +270,7 @@ impl Servers {
         if edit {
             let tool = t.name.clone();
             line = line.child(
-                action_for(format!("expose-{tool}"), "Add to skill").on_click(cx.listener(
+                action_for(colors, format!("expose-{tool}"), "Add to skill").on_click(cx.listener(
                     move |s, _, _, cx| {
                         let Some(e) = s.editor() else { return };
                         let binding = Binding {
@@ -292,73 +298,80 @@ impl Servers {
             .gap_1()
             .p_2()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(colors.border))
             .child(line);
         if let Some(description) = &t.description {
-            item = item.child(label(description.clone(), 12., MUTED));
+            item = item.child(label(description.clone(), 12., colors.muted));
         }
         if self.mcp.as_ref().and_then(|m| m.expanded.as_ref()) == Some(&key) {
             item = item.child(
                 label(
                     serde_json::to_string_pretty(&t.parameters).unwrap_or_default(),
                     12.,
-                    INK,
+                    colors.text,
                 )
-                .bg(rgb(RAIL))
+                .bg(rgb(colors.sidebar))
                 .p_2(),
             );
         }
         item
     }
     fn mcp_editor(&self, e: &Editor, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let mut form = column().gap_3().w_full().max_w(px(760.));
         form = if e.expected.is_some() {
-            form.child(heading(e.name.read(cx).text().to_owned(), 17.))
+            form.child(heading(colors, e.name.read(cx).text().to_owned(), 17.))
         } else {
-            form.child(field("mcp-name".into(), "Server name", &e.name))
+            form.child(field(colors, "mcp-name".into(), "Server name", &e.name))
         };
         form = form.child(field(
+            colors,
             "mcp-command".into(),
             "Executable on daemon",
             &e.command,
         ));
         for (i, arg) in e.args.iter().enumerate() {
-            form =
-                form.child(
-                    row()
-                        .gap_2()
-                        .child(field(
-                            format!("mcp-arg-{i}"),
-                            &format!("Argument {}", i + 1),
-                            arg,
-                        ))
-                        .child(action_for(format!("remove-arg-{i}"), "Remove").on_click(
+            form = form.child(
+                row()
+                    .gap_2()
+                    .child(field(
+                        colors,
+                        format!("mcp-arg-{i}"),
+                        &format!("Argument {}", i + 1),
+                        arg,
+                    ))
+                    .child(
+                        action_for(colors, format!("remove-arg-{i}"), "Remove").on_click(
                             cx.listener(move |s, _, _, cx| {
                                 if let Some(e) = s.editor() {
                                     e.args.remove(i);
                                 }
                                 cx.notify();
                             }),
-                        )),
-                );
+                        ),
+                    ),
+            );
         }
         form = form
-            .child(row().child(
-                action("add-arg", "Add argument", false).on_click(cx.listener(|s, _, _, cx| {
-                    if let Some(e) = s.editor() {
-                        e.args.push(input("Argument", String::new(), cx));
-                    }
-                    cx.notify();
-                })),
-            ))
+            .child(
+                row().child(action(colors, "add-arg", "Add argument", false).on_click(
+                    cx.listener(|s, _, _, cx| {
+                        if let Some(e) = s.editor() {
+                            e.args.push(input("Argument", String::new(), cx));
+                        }
+                        cx.notify();
+                    }),
+                )),
+            )
             .child(field(
+                colors,
                 "mcp-env".into(),
                 "Inherit environment variables",
                 &e.env,
             ))
             .child(
                 row().child(
-                    action("discover-mcp", "Discover tools", false)
+                    action(colors, "discover-mcp", "Discover tools", false)
                         .on_click(cx.listener(|s, _, _, cx| s.discover_mcp(cx))),
                 ),
             );
@@ -366,7 +379,7 @@ impl Servers {
             form = form.child(self.tool_row(tool.name.clone(), tool, true, cx));
         }
         if !e.bindings.is_empty() {
-            form = form.child(heading("Skill access", 15.));
+            form = form.child(heading(colors, "Skill access", 15.));
         }
         for (i, b) in e.bindings.iter().enumerate() {
             let mut grants = row().gap_2();
@@ -380,11 +393,19 @@ impl Servers {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(if selected { GREEN } else { WHITE }))
+                        .bg(rgb(if selected {
+                            colors.accent
+                        } else {
+                            colors.surface
+                        }))
                         .child(label(
                             grant.label(),
                             12.,
-                            if selected { WHITE } else { INK },
+                            if selected {
+                                colors.on_accent
+                            } else {
+                                colors.text
+                            },
                         ))
                         .on_click(cx.listener(move |s, _, _, cx| {
                             if let Some(e) = s.editor() {
@@ -397,18 +418,28 @@ impl Servers {
             form = form.child(
                 column()
                     .gap_2()
-                    .bg(rgb(RAIL))
+                    .bg(rgb(colors.sidebar))
                     .p_3()
                     .rounded_lg()
-                    .child(heading(b.tool.clone(), 13.))
+                    .child(heading(colors, b.tool.clone(), 13.))
                     .child(
                         row()
                             .gap_2()
-                            .child(field(format!("skill-{i}"), "Wakefold skill", &b.skill))
-                            .child(field(format!("alias-{i}"), "Tool name in skill", &b.alias)),
+                            .child(field(
+                                colors,
+                                format!("skill-{i}"),
+                                "Wakefold skill",
+                                &b.skill,
+                            ))
+                            .child(field(
+                                colors,
+                                format!("alias-{i}"),
+                                "Tool name in skill",
+                                &b.alias,
+                            )),
                     )
                     .child(grants.child(
-                        action_for(format!("unmap-{i}"), "Remove from skill").on_click(
+                        action_for(colors, format!("unmap-{i}"), "Remove from skill").on_click(
                             cx.listener(move |s, _, _, cx| {
                                 if let Some(e) = s.editor() {
                                     e.bindings.remove(i);
@@ -422,22 +453,25 @@ impl Servers {
         let mut buttons = row()
             .gap_2()
             .child(
-                action("save-mcp", "Save configuration", true)
+                action(colors, "save-mcp", "Save configuration", true)
                     .on_click(cx.listener(|s, _, _, cx| s.save_mcp(false, cx))),
             )
             .child(
-                action("cancel-mcp", "Cancel", false).on_click(cx.listener(|s, _, _, cx| {
-                    if let Some(m) = &mut s.mcp {
-                        m.editor = None;
-                        m.error = None;
-                    }
-                    s.reload_mcp(cx);
-                    cx.notify();
-                })),
+                action(colors, "cancel-mcp", "Cancel", false).on_click(cx.listener(
+                    |s, _, _, cx| {
+                        if let Some(m) = &mut s.mcp {
+                            m.editor = None;
+                            m.error = None;
+                        }
+                        s.reload_mcp(cx);
+                        cx.notify();
+                    },
+                )),
             );
         if e.expected.is_some() {
             buttons = buttons.child(
                 action(
+                    colors,
                     "remove-mcp",
                     if e.confirm_remove {
                         "Confirm removal"
@@ -452,11 +486,12 @@ impl Servers {
         form.child(label(
             "Saved changes take effect when this daemon restarts.",
             12.,
-            MUTED,
+            colors.muted,
         ))
         .child(buttons)
     }
     pub(super) fn mcp_view(&self, m: &McpView, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let mut content = column()
             .id("mcp-content")
             .overflow_y_scroll()
@@ -465,55 +500,55 @@ impl Servers {
             .p_4()
             .gap_3();
         if let Status::Reconnecting(reason) | Status::Attention(reason) = &self.status {
-            content = content.child(label(reason.clone(), 13., AMBER));
+            content = content.child(label(reason.clone(), 13., colors.warning));
         }
         if let Some(error) = &m.error {
-            content = content.child(label(error.clone(), 13., AMBER));
+            content = content.child(label(error.clone(), 13., colors.warning));
         }
         if m.request.is_some() {
-            content = content.child(label("Contacting daemon…", 14., MUTED));
+            content = content.child(label("Contacting daemon…", 14., colors.muted));
         } else if let Some(e) = &m.editor {
             content = content.child(self.mcp_editor(e, cx));
         } else {
             let mut toolbar = row().gap_2().child(
-                action("reload-mcp", "Refresh", false)
+                action(colors, "reload-mcp", "Refresh", false)
                     .on_click(cx.listener(|s, _, _, cx| s.reload_mcp(cx))),
             );
             if let Some(i) = &m.inventory {
                 if i.editable {
                     toolbar = toolbar.child(
-                        action("new-mcp", "Add MCP server", true)
+                        action(colors, "new-mcp", "Add MCP server", true)
                             .on_click(cx.listener(|s, _, _, cx| s.edit_mcp(None, cx))),
                     );
                 } else {
                     let instructions = "To edit servers, enable allow_mcp_configuration in the daemon configuration.";
-                    content = content.child(label(instructions, 13., MUTED));
+                    content = content.child(label(instructions, 13., colors.muted));
                 }
                 if i.servers.is_empty() {
-                    content = content.child(label("No MCP servers configured.", 14., MUTED));
+                    content = content.child(label("No MCP servers configured.", 14., colors.muted));
                 }
                 content = content.child(toolbar);
                 for server in &i.servers {
                     let mut top = row()
                         .gap_2()
-                        .child(heading(server.name.clone(), 16.).flex_1());
+                        .child(heading(colors, server.name.clone(), 16.).flex_1());
                     if i.editable && server.configuration.is_some() {
                         let name = server.name.clone();
                         top =
-                            top.child(action_for(format!("edit-{name}"), "Edit").on_click(
+                            top.child(action_for(colors, format!("edit-{name}"), "Edit").on_click(
                                 cx.listener(move |s, _, _, cx| s.edit_mcp(Some(&name), cx)),
                             ));
                     }
                     let mut card = column()
                         .rounded_lg()
                         .border_1()
-                        .border_color(rgb(LINE))
+                        .border_color(rgb(colors.border))
                         .p_3()
                         .gap_2()
                         .max_w(px(760.))
                         .child(top);
                     if server.restart_required {
-                        card = card.child(label("Pending daemon restart", 13., AMBER));
+                        card = card.child(label("Pending daemon restart", 13., colors.warning));
                     }
                     for t in &server.tools {
                         card = card.child(self.tool_row(
@@ -527,7 +562,7 @@ impl Servers {
                         card = card.child(label(
                             format!("{} → {}.{} · {}", b.tool, b.skill, b.name, b.grant.label()),
                             13.,
-                            INK,
+                            colors.text,
                         ));
                     }
                     content = content.child(card);
@@ -539,15 +574,15 @@ impl Servers {
         column()
             .flex_1()
             .min_h_0()
-            .child(heading("MCP servers", 19.).px_4().py_3())
+            .child(heading(colors, "MCP servers", 19.).px_4().py_3())
             .child(content)
     }
 }
-fn action_for(id: String, name: &str) -> gpui::Stateful<Div> {
+fn action_for(colors: crate::theme::Palette, id: String, name: &str) -> gpui::Stateful<Div> {
     hit(id)
         .px_2()
         .py_1()
         .rounded_md()
-        .bg(rgb(TINT))
-        .child(label(name.to_owned(), 12., GREEN))
+        .bg(rgb(colors.tint))
+        .child(label(name.to_owned(), 12., colors.accent))
 }

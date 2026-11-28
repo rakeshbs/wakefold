@@ -101,6 +101,7 @@ impl Servers {
     }
 
     pub(super) fn artifact_card(&self, file: &ArtifactRevision, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let panel = Panel::File(file.artifact_id, file.revision);
         let card = row()
             .min_w_0()
@@ -110,29 +111,29 @@ impl Servers {
             .py_2()
             .rounded_lg()
             .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(WHITE))
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.surface))
             .child(
                 hit(format!("view-{}-{}", file.artifact_id, file.revision))
                     .min_w_0()
                     .flex_1()
                     .gap_2()
-                    .child(tile(Icon::File, TINT, GREEN))
+                    .child(tile(Icon::File, colors.tint, colors.accent))
                     .child(
                         column()
                             .min_w_0()
                             .flex_1()
-                            .child(heading(file.title.clone(), 14.).truncate())
+                            .child(heading(colors, file.title.clone(), 14.).truncate())
                             .child(
                                 label(
                                     format!("{} · Revision {}", file.filename, file.revision),
                                     12.,
-                                    MUTED,
+                                    colors.muted,
                                 )
                                 .truncate(),
                             ),
                     )
-                    .child(Icon::Right.draw(14., GREEN))
+                    .child(Icon::Right.draw(14., colors.accent))
                     .on_click(cx.listener(move |s, _, _, cx| s.open_panel(panel, cx))),
             )
             .child(self.download_button(file, cx));
@@ -140,7 +141,7 @@ impl Servers {
         if let Some((id, rev, message)) = &self.artifacts.transfer
             && (*id, *rev) == (file.artifact_id, file.revision)
         {
-            body = body.child(label(message.clone(), 12., MUTED));
+            body = body.child(label(message.clone(), 12., colors.muted));
         }
         body
     }
@@ -149,16 +150,22 @@ impl Servers {
         file: &ArtifactRevision,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
+        let colors = crate::theme::palette(cx);
         let file = file.clone();
         hit(format!("Download-{}-{}", file.artifact_id, file.revision))
             .p_1()
-            .child(label("Download", 12., GREEN))
+            .child(label("Download", 12., colors.accent))
             .on_click(cx.listener(move |s, _, _, cx| s.transfer_artifact(file.clone(), false, cx)))
     }
     pub(super) fn artifact_library(&self, cx: &mut Context<Self>) -> Div {
+        let colors = crate::theme::palette(cx);
         let mut list = column().gap_2().p_4();
         if self.artifacts.revisions.is_empty() {
-            list = list.child(label("This chat has no published files yet.", 14., MUTED));
+            list = list.child(label(
+                "This chat has no published files yet.",
+                14.,
+                colors.muted,
+            ));
         }
         for file in &self.artifacts.revisions {
             list = list.child(self.artifact_card(file, cx));
@@ -196,13 +203,14 @@ impl Servers {
         preview: Option<&Preview>,
         cx: &mut Context<Self>,
     ) -> Div {
+        let colors = crate::theme::palette(cx);
         let Some(file) = self
             .artifacts
             .revisions
             .iter()
             .find(|f| (f.artifact_id, f.revision) == (id, rev))
         else {
-            return label("Loading revision…", 14., MUTED);
+            return label("Loading revision…", 14., colors.muted);
         };
         let mut actions = row()
             .flex_wrap()
@@ -213,7 +221,7 @@ impl Servers {
             actions = actions.child(
                 hit("open-externally")
                     .p_1()
-                    .child(label("Open in app", 12., GREEN))
+                    .child(label("Open in app", 12., colors.accent))
                     .on_click(
                         cx.listener(move |s, _, _, cx| s.transfer_artifact(file.clone(), true, cx)),
                     ),
@@ -223,28 +231,28 @@ impl Servers {
             .min_w_0()
             .p_4()
             .gap_3()
-            .child(heading(file.filename.clone(), 14.))
+            .child(heading(colors, file.filename.clone(), 14.))
             .child(actions);
         if let Some((a, r, msg)) = &self.artifacts.transfer
             && (*a, *r) == (id, rev)
         {
-            body = body.child(label(msg.clone(), 12., MUTED));
+            body = body.child(label(msg.clone(), 12., colors.muted));
         }
         match preview {
-            None => body.child(label("Loading preview…", 14., MUTED)),
-            Some(Preview::Notice(message)) => body.child(label(message.clone(), 14., MUTED)),
+            None => body.child(label("Loading preview…", 14., colors.muted)),
+            Some(Preview::Notice(message)) => body.child(label(message.clone(), 14., colors.muted)),
             Some(Preview::Text {
                 text,
                 markdown: true,
-            }) => body.child(crate::markdown::markdown(text)),
+            }) => body.child(crate::markdown::markdown(colors, text)),
             Some(Preview::Text { text, .. }) => body.child(
-                label(text.clone(), 13., INK)
+                label(text.clone(), 13., colors.text)
                     .font_family("monospace")
                     .line_height(px(20.)),
             ),
             Some(Preview::Image(image, caption)) => {
                 if let Some(caption) = caption {
-                    body = body.child(label(*caption, 12., MUTED));
+                    body = body.child(label(*caption, 12., colors.muted));
                 }
                 body.child(
                     gpui::img(image.clone())

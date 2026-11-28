@@ -21,6 +21,8 @@ pub enum Icon {
     Fold,
     Gate,
     Copy,
+    Sun,
+    Moon,
 }
 
 impl Icon {
@@ -58,6 +60,10 @@ impl Icon {
             Self::Gate => {
                 "M12 3 L20 6 L20 12 Q20 17 12 21 Q4 17 4 12 L4 6 Z M8.5 11.5 L11 14 L15.8 9"
             }
+            Self::Sun => {
+                "M16 12 C16 17.4 8 17.4 8 12 C8 6.6 16 6.6 16 12 Z M12 2 L12 4 M12 20 L12 22 M2 12 L4 12 M20 12 L22 12 M5 5 L6.5 6.5 M17.5 17.5 L19 19 M19 5 L17.5 6.5 M6.5 17.5 L5 19"
+            }
+            Self::Moon => "M20 14 Q18 20 12 20 C2 20 1 7 10 4 C6 12 13 18 20 14 Z",
             Self::Copy => "M8 7 L20 7 L20 21 L8 21 Z M5 17 L3 17 L3 3 L15 3 L15 5",
         }
     }
