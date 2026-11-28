@@ -1,6 +1,7 @@
 //! The composer uses GPUI's wrapped text layout for painting, mouse selection and IME coordinates.
 use super::*;
-use gpui::{Div, ScrollHandle, StyledText, TextLayout, canvas};
+use crate::elastic_scroll::ScrollExt;
+use gpui::{ScrollHandle, StyledText, TextLayout, canvas};
 
 #[derive(Default)]
 pub(super) struct Multiline {
@@ -10,7 +11,11 @@ pub(super) struct Multiline {
 }
 
 impl TextInput {
-    pub(super) fn wrapped(&self, window: &Window, cx: &Context<Self>) -> gpui::Stateful<Div> {
+    pub(super) fn wrapped(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> crate::elastic_scroll::ElasticScroll {
         let colors = crate::theme::palette(cx);
         let editor = self.multiline.as_ref().expect("chat composer");
         let display: SharedString = if self.content.is_empty() {
@@ -77,8 +82,7 @@ impl TextInput {
             .w_full()
             .min_h(px(32.))
             .max_h(px(120.))
-            .overflow_y_scroll()
-            .track_scroll(&scroll)
+            .elastic_y(Some(&scroll))
             .px_1()
             .py_1()
             .child(

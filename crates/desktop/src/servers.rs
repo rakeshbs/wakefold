@@ -5,6 +5,7 @@ mod dock;
 mod mcp;
 #[cfg(test)]
 mod workflow_test;
+use crate::elastic_scroll::ScrollExt;
 use crate::{
     avatar::{Artwork, Character},
     connection::{Approval, Daemon, Event, Run, SavedChat, Update},
@@ -505,10 +506,7 @@ impl Servers {
                     ),
             )
             .child(label("Servers", 12., colors.muted).mt_3().mb_1());
-        let mut servers = column()
-            .id("server-list")
-            .max_h(px(175.))
-            .overflow_y_scroll();
+        let mut servers = column().id("server-list").max_h(px(175.)).elastic_y(None);
         for (i, p) in std::iter::once(Profile::local())
             .chain(self.profiles.servers.clone())
             .enumerate()
@@ -561,7 +559,7 @@ impl Servers {
             .id("saved-chats")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll();
+            .elastic_y(None);
         for c in &self.chats {
             let id = c.chat_id;
             chats = chats.child(
@@ -687,7 +685,7 @@ impl Servers {
             .p_5()
             .gap_3()
             .id("run-list")
-            .overflow_y_scroll();
+            .elastic_y(None);
         if let Some(form) = &self.form {
             return column().flex_1().child(body.child(self.form(form, cx)));
         }

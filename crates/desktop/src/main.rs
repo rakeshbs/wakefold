@@ -1,6 +1,7 @@
 //! Native desktop client for a local or remote Wakefold daemon.
 mod avatar;
 mod connection;
+mod elastic_scroll;
 mod icons;
 mod input;
 mod local_daemon;

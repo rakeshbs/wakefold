@@ -50,13 +50,13 @@ pub(crate) fn scroll_region(
     id: &'static str,
     content: impl IntoElement,
     handle: &ScrollHandle,
+    cancel_bounce: impl Fn(&mut gpui::App) + 'static,
 ) -> Div {
     let thumb = ScrollThumb {
         handle: handle.clone(),
         grab: Rc::default(),
     };
     let paint = thumb.clone();
-    let wheel = handle.clone();
     div()
         .relative()
         .flex()
@@ -80,7 +80,8 @@ pub(crate) fn scroll_region(
                     thumb.grab.set((position.y - top).clamp(px(0.), height));
                     cx.new(|_: &mut Context<Empty>| Empty)
                 })
-                .on_mouse_down(MouseButton::Left, move |event, window, _| {
+                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                    cancel_bounce(cx);
                     let (height, top, _) = thumb.geometry();
                     let y = event.position.y - thumb.handle.bounds().top();
                     thumb.grab.set(if y >= top && y <= top + height {
@@ -89,12 +90,6 @@ pub(crate) fn scroll_region(
                         height / 2.
                     });
                     thumb.move_to(event.position.y);
-                    window.refresh();
-                })
-                .on_scroll_wheel(move |event, window, _| {
-                    let y = (wheel.offset().y + event.delta.pixel_delta(px(20.)).y)
-                        .clamp(-wheel.max_offset().height, px(0.));
-                    wheel.set_offset(point(wheel.offset().x, y));
                     window.refresh();
                 })
                 .child(

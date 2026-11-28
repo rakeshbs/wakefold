@@ -1,4 +1,5 @@
 mod model;
+use crate::elastic_scroll::ScrollExt;
 use crate::{
     SendMessage,
     avatar::{Artwork, Character},
@@ -180,7 +181,7 @@ impl Desktop {
             .id("recent-list")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .elastic_y(None)
             .gap_1();
         let mut any = false;
         for (i, c) in self
@@ -478,10 +479,9 @@ impl Desktop {
             );
         let mut feed = column()
             .id(("feed", self.current))
-            .track_scroll(&chat.scroll)
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .elastic_y(Some(&chat.scroll))
             .items_center()
             .px(px(pad));
         if chat.turns.is_empty() {
@@ -604,7 +604,7 @@ impl Desktop {
                 column()
                     .id("library-files")
                     .items_center()
-                    .overflow_y_scroll()
+                    .elastic_y(None)
                     .p_6()
                     .child(files),
             )
@@ -615,7 +615,7 @@ impl Desktop {
         let active = chat.active.expect("open dock");
         let mut tabs = row()
             .id("dock-tabs")
-            .overflow_x_scroll()
+            .elastic_x(None)
             .gap_1()
             .h(px(41.))
             .px_2()
@@ -653,7 +653,7 @@ impl Desktop {
             .id("dock-body")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .elastic_y(None)
             .gap_4()
             .p_4();
         match active {
