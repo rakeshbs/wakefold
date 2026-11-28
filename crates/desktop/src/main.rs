@@ -1,4 +1,6 @@
 //! Native desktop client for a local or remote Wakefold daemon.
+extern crate gpui_kit as gpui;
+
 mod avatar;
 mod connection;
 mod icons;
@@ -12,8 +14,8 @@ mod style;
 mod theme;
 
 use gpui::{
-    App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
-    prelude::*, px, size,
+    App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions, prelude::*, px,
+    size,
 };
 
 actions!(workspace, [SendMessage, Quit]);
@@ -29,7 +31,8 @@ fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("Usage: wakefold-desktop [--preview]"),
     };
     let runtime = tokio::runtime::Runtime::new()?;
-    Application::new().run(move |cx: &mut App| {
+    let app = gpui::application().with_assets(gpui::assets::Assets);
+    app.run(move |cx: &mut App| {
         theme::initialize(cx);
         input::bind(cx);
         cx.bind_keys([
@@ -37,7 +40,7 @@ fn main() -> anyhow::Result<()> {
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -61,10 +64,10 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         };
         if preview {
-            cx.open_window(options, |_, cx| cx.new(preview::Desktop::new))
+            gpui::open_window(options, cx, |_, cx| cx.new(preview::Desktop::new))
                 .expect("open desktop preview");
         } else {
-            cx.open_window(options, move |_, cx| {
+            gpui::open_window(options, cx, move |_, cx| {
                 cx.new(|cx| servers::Servers::new(runtime, cx))
             })
             .expect("open desktop");

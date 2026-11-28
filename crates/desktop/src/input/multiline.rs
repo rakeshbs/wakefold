@@ -10,7 +10,7 @@ pub(super) struct Multiline {
 }
 
 impl TextInput {
-    pub(super) fn wrapped(&self, window: &Window, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+    pub(super) fn wrapped(&self, window: &Window, cx: &Context<Self>) -> gpui::base::ScrollBounce {
         let colors = crate::theme::palette(cx);
         let editor = self.multiline.as_ref().expect("chat composer");
         let display: SharedString = if self.content.is_empty() {
@@ -72,7 +72,7 @@ impl TextInput {
         let input = cx.entity();
         let scroll = editor.scroll.clone();
         let paint_scroll = scroll.clone();
-        div()
+        let viewport = div()
             .id("wrapped-composer")
             .w_full()
             .min_h(px(32.))
@@ -117,7 +117,7 @@ impl TextInput {
                                         paint_scroll.set_offset(point(
                                             offset.x,
                                             (offset.y + shift)
-                                                .clamp(-paint_scroll.max_offset().height, px(0.)),
+                                                .clamp(-paint_scroll.max_offset().y, px(0.)),
                                         ));
                                         w.refresh();
                                     }
@@ -134,7 +134,8 @@ impl TextInput {
                     .absolute()
                     .inset_0(),
                 ),
-            )
+            );
+        gpui::base::ScrollBounce::new("composer-bounce", &scroll, viewport)
     }
     pub(super) fn vertical_move(&mut self, direction: f32, cx: &mut Context<Self>) {
         let Some(layout) = self.multiline.as_ref().and_then(|m| m.layout.as_ref()) else {
@@ -162,7 +163,7 @@ mod tests {
         cx.update(bind);
         let (input, cx) = cx.add_window_view(|_, cx| TextInput::new(cx));
         cx.simulate_resize(size(px(400.), px(300.)));
-        cx.update(|w, app| w.focus(&input.read(app).focus_handle(app)));
+        cx.update(|w, app| w.focus(&input.read(app).focus_handle(app), app));
         cx.simulate_input("Notes");
         cx.simulate_keystrokes("shift-enter");
         cx.update(|_, app| {

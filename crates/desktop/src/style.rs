@@ -11,9 +11,9 @@ pub(crate) fn row() -> Div {
 pub(crate) fn scroll_pane(
     id: &'static str,
     content: impl IntoElement,
-    handle: &(impl gpui_component::scroll::ScrollbarHandle + Clone),
+    handle: &(impl gpui::component::scroll::ScrollbarHandle + Clone),
 ) -> Stateful<Div> {
-    use gpui_component::scroll::ScrollableElement;
+    use gpui::component::scroll::ScrollableElement;
     column()
         .id(id)
         .debug_selector(move || id.into())
@@ -22,7 +22,7 @@ pub(crate) fn scroll_pane(
         .min_h_0()
         .min_w_0()
         .overflow_hidden()
-        .child(content)
+        .child(gpui::base::ScrollBounce::new("bounce", handle, content))
         .vertical_scrollbar(handle)
 }
 

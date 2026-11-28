@@ -51,7 +51,7 @@ pub(crate) async fn connect(
         Some(key) => key,
         None => {
             let saved = cx
-                .update(|app| app.read_credentials(PROVIDER_CREDENTIAL))?
+                .update(|app| app.read_credentials(PROVIDER_CREDENTIAL))
                 .await?;
             let Some((_, bytes)) = saved else {
                 return Ok(None);

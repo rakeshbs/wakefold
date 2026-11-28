@@ -494,7 +494,7 @@ impl Servers {
         let colors = crate::theme::palette(cx);
         let mut content = column()
             .id("mcp-content")
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .flex_1()
             .min_h_0()
             .p_4()

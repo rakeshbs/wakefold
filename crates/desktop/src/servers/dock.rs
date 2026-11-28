@@ -349,7 +349,7 @@ impl Servers {
 mod tests {
     use super::*;
     use gpui::{
-        MouseButton, ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext, point, size,
+        MouseButton, ScrollDelta, ScrollEvent, TestAppContext, VisualTestContext, point, size,
     };
     fn click(cx: &mut VisualTestContext, selector: &'static str) {
         let point = cx.debug_bounds(selector).unwrap().center();
@@ -358,13 +358,70 @@ mod tests {
     }
     fn wheel(cx: &mut VisualTestContext, selector: &'static str, dy: f32) {
         let position = cx.debug_bounds(selector).unwrap().center();
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
             ..Default::default()
         });
         cx.run_until_parked();
     }
+    fn check_edge_gesture(
+        cx: &mut VisualTestContext,
+        pane: &'static str,
+        content: &'static str,
+        delta: f32,
+    ) {
+        let frame = cx.debug_bounds(pane).unwrap();
+        let rest = cx.debug_bounds(content).unwrap().top();
+        let gesture = |cx: &mut VisualTestContext, dy, phase| {
+            cx.simulate_event(ScrollEvent {
+                position: frame.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                touch_phase: phase,
+                ..Default::default()
+            });
+            cx.run_until_parked();
+        };
+        gesture(cx, delta, gpui::TouchPhase::Started);
+        let displacement = cx.debug_bounds(content).unwrap().top() - rest;
+        if gpui::base::ScrollBounce::enabled_by_default()
+            && !cx.update(|_, app| app.reduce_motion())
+        {
+            assert!(
+                displacement * delta.signum() > px(0.),
+                "{pane} should stretch"
+            );
+        } else {
+            assert_eq!(displacement, px(0.));
+        }
+        assert_eq!(cx.debug_bounds(pane).unwrap(), frame);
+        gesture(cx, 0., gpui::TouchPhase::Ended);
+        for _ in 0..120 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.update(|window, app| window.draw(app).clear(app));
+            if cx.debug_bounds(content).unwrap().top() == rest {
+                break;
+            }
+        }
+        assert_eq!(
+            cx.debug_bounds(content).unwrap().top(),
+            rest,
+            "{pane} should settle"
+        );
+        cx.simulate_event(ScrollEvent {
+            position: frame.center(),
+            delta: ScrollDelta::Lines(point(0., delta.signum())),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.debug_bounds(content).unwrap().top(),
+            rest,
+            "line-wheel input should stop at the edge"
+        );
+    }
+
     #[gpui::test]
     fn scrolling_and_resizing_keep_the_chat_and_workspace_independent(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
@@ -384,16 +441,16 @@ mod tests {
         let feed = cx.debug_bounds("conversation").unwrap();
         assert!(feed.bottom() <= composer.top());
         let scroll = cx.update(|_, app| view.read(app).conversation.scroll.clone());
-        assert!(scroll.max_offset().height > px(500.));
+        assert!(scroll.max_offset().y > px(500.));
         assert!(
-            (scroll.offset().y + scroll.max_offset().height).abs() < px(1.),
+            (scroll.offset().y + scroll.max_offset().y).abs() < px(1.),
             "initial offset {:?}, maximum {:?}",
             scroll.offset(),
             scroll.max_offset()
         );
         wheel(cx, "conversation", 380.);
         let reading = scroll.offset().y;
-        assert!(reading + scroll.max_offset().height > px(300.));
+        assert!(reading + scroll.max_offset().y > px(300.));
         cx.update(|_, app| {
             view.update(app, |s, cx| {
                 let mut runs = s.runs.clone();
@@ -424,10 +481,13 @@ mod tests {
         );
         cx.run_until_parked();
         assert_eq!(scroll.offset().y, px(0.));
-        let top = cx.debug_bounds("activity-1").unwrap();
-        wheel(cx, "conversation", 90.);
-        assert_eq!(cx.debug_bounds("activity-1").unwrap(), top);
-        cx.simulate_event(ScrollWheelEvent {
+        cx.update(|_, app| app.set_reduce_motion(false));
+        check_edge_gesture(cx, "chat-scrollbar", "activity-1", 100.);
+        cx.update(|_, app| app.set_reduce_motion(true));
+        check_edge_gesture(cx, "chat-scrollbar", "activity-1", 100.);
+        cx.update(|_, app| app.set_reduce_motion(false));
+        assert_eq!(cx.debug_bounds("composer").unwrap(), composer);
+        cx.simulate_event(ScrollEvent {
             position: point(rail.right() - px(6.), rail.center().y),
             delta: ScrollDelta::Pixels(point(px(0.), px(-36.))),
             ..Default::default()
@@ -460,7 +520,7 @@ mod tests {
         assert!(cx.debug_bounds("composer").unwrap().right() <= dock.left());
         assert!(cx.debug_bounds("tab-artifacts").is_some());
         let panel_scroll = cx.update(|_, app| view.read(app).dock.tabs[1].scroll.clone());
-        assert!(panel_scroll.max_offset().height > px(400.));
+        assert!(panel_scroll.max_offset().y > px(400.));
         wheel(cx, "panel-scroll", -180.);
         assert!(panel_scroll.offset().y < px(-100.));
         let panel_rail = cx.debug_bounds("panel-scrollbar").unwrap();
@@ -469,7 +529,8 @@ mod tests {
             Default::default(),
         );
         cx.run_until_parked();
-        assert!((panel_scroll.offset().y + panel_scroll.max_offset().height).abs() < px(1.));
+        assert!((panel_scroll.offset().y + panel_scroll.max_offset().y).abs() < px(1.));
+        check_edge_gesture(cx, "panel-scrollbar", "panel-scroll", -100.);
         assert_eq!(scroll.offset().y, reading);
         click(cx, "tab-artifacts");
         click(cx, "tab-agent-2");

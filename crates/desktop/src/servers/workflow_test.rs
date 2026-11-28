@@ -172,6 +172,8 @@ fn ids(s: &Servers) -> Value {
 #[gpui::test]
 #[ignore = "child process of reopen_chat_and_restart_daemon"]
 fn chat_window(cx: &mut TestAppContext) {
+    // The real daemon connection wakes GPUI from Tokio's I/O thread.
+    cx.executor().allow_parking();
     let d = PathBuf::from(std::env::var_os("WAKEFOLD_CHAT_TEST_DIR").unwrap());
     let phase = std::env::var("WAKEFOLD_CHAT_TEST_PHASE").unwrap();
     cx.update(|a| {
@@ -327,6 +329,8 @@ fn chat_window(cx: &mut TestAppContext) {
 #[gpui::test]
 #[ignore = "uses a separate TLS daemon; run remote-macos.sh"]
 fn manage_mcp_and_download_revisions(cx: &mut TestAppContext) {
+    // The real daemon connection wakes GPUI from Tokio's I/O thread.
+    cx.executor().allow_parking();
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     crate::connection::tests::certificates(d).unwrap();
@@ -493,6 +497,8 @@ fn manage_mcp_and_download_revisions(cx: &mut TestAppContext) {
 #[gpui::test]
 #[ignore = "uses the real local daemon; run local-daemon-macos.py"]
 fn select_local_computer(cx: &mut TestAppContext) {
+    // The real daemon connection wakes GPUI from Tokio's I/O thread.
+    cx.executor().allow_parking();
     let directory = PathBuf::from(
         std::env::var_os("WAKEFOLD_CONFIG_DIR")
             .expect("the macOS test supplies a temporary profile"),

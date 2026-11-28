@@ -19,7 +19,7 @@ pub(super) struct Conversation {
     pub(super) scroll: gpui::ScrollHandle,
 }
 pub(super) fn follow_if_near_bottom(scroll: &gpui::ScrollHandle) {
-    if scroll.max_offset().height + scroll.offset().y < px(100.) {
+    if scroll.max_offset().y + scroll.offset().y < px(100.) {
         scroll.scroll_to_bottom();
     }
 }

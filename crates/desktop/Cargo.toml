@@ -9,8 +9,7 @@ publish = false
 anyhow = "1"
 dirs = "5"
 futures-util = { version = "0.3", features = ["sink"] }
-gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
-gpui-component = { version = "=0.5.1", default-features = false }
+gpui-kit = "=0.11.0"
 pulldown-cmark = { version = "0.13", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 roxmltree = "0.20"
@@ -26,4 +25,4 @@ unicode-segmentation = "1"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-gpui = { version = "=0.2.2", features = ["runtime_shaders", "test-support"] }
+gpui-kit = { version = "=0.11.0", features = ["test-support"] }

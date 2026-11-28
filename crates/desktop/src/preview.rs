@@ -6,6 +6,7 @@ use crate::{
     input::TextInput,
     style::*,
 };
+use gpui::component::scroll::ScrollableElement;
 use gpui::{
     ClipboardItem, Context, Div, Entity, Focusable, FontWeight, Render, Stateful, Window, div,
     prelude::*, px, rgb,
@@ -26,6 +27,7 @@ pub(crate) struct Desktop {
 }
 impl Desktop {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
+        crate::theme::ensure_scrollbar_theme(cx);
         let art = Artwork::load();
         let welcome = cx.new(|_| Character::new(art.clone(), (224., 174.)));
         let portrait = cx.new(|_| Character::new(art.clone(), (58., 50.)));
@@ -61,7 +63,7 @@ impl Desktop {
         self.chats.push(Chat::new("New chat", cx));
         self.searching = false;
         self.select(self.chats.len() - 1, cx);
-        win.focus(&self.chat().draft.focus_handle(cx));
+        win.focus(&self.chat().draft.focus_handle(cx), cx);
     }
     fn send(&mut self, cx: &mut Context<Self>) {
         if self.library {
@@ -136,7 +138,7 @@ impl Desktop {
                     cx.listener(|s, _, w, cx| {
                         s.searching = !s.searching;
                         if s.searching {
-                            w.focus(&s.search.focus_handle(cx));
+                            w.focus(&s.search.focus_handle(cx), cx);
                         }
                         cx.notify()
                     }),
@@ -180,7 +182,7 @@ impl Desktop {
             .id("recent-list")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .gap_1();
         let mut any = false;
         for (i, c) in self
@@ -571,7 +573,7 @@ impl Desktop {
             .min_w_0()
             .h_full()
             .child(header)
-            .child(feed)
+            .child(scroll_pane("preview-chat-scrollbar", feed, &chat.scroll))
             .child(footer)
     }
     fn library(&self, cx: &mut Context<Self>) -> Div {
@@ -604,7 +606,7 @@ impl Desktop {
                 column()
                     .id("library-files")
                     .items_center()
-                    .overflow_y_scroll()
+                    .overflow_y_scrollbar()
                     .p_6()
                     .child(files),
             )
@@ -653,7 +655,7 @@ impl Desktop {
             .id("dock-body")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .gap_4()
             .p_4();
         match active {
@@ -886,7 +888,6 @@ mod tests {
     #[gpui::test]
     fn sidebar_switches_appearance_in_both_directions(cx: &mut TestAppContext) {
         let (_, cx) = window(cx);
-        cx.update(|_, app| crate::theme::ensure_scrollbar_theme(app));
         for theme in [
             crate::theme::Theme::Dark,
             crate::theme::Theme::Light,
@@ -895,7 +896,7 @@ mod tests {
             cx.update(|_, app| {
                 let colors = theme.palette();
                 assert_eq!(crate::theme::palette(app).background, colors.background);
-                let component = gpui_component::Theme::global(app);
+                let component = gpui::component::Theme::global(app);
                 assert_eq!(component.is_dark(), theme == crate::theme::Theme::Dark);
                 assert_eq!(
                     component.scrollbar_thumb,

@@ -138,15 +138,15 @@ pub(crate) fn palette(cx: &App) -> Palette {
 
 /// The standalone scrollbar reads its colors from GPUI Component's app-wide theme.
 pub(crate) fn ensure_scrollbar_theme(cx: &mut App) {
-    if !cx.has_global::<gpui_component::Theme>() {
+    if !cx.has_global::<gpui::component::Theme>() {
         apply_scrollbar_theme(cx);
     }
 }
 
 fn apply_scrollbar_theme(cx: &mut App) {
-    use gpui_component::{Theme as ComponentTheme, ThemeMode, ThemeRegistry};
+    use gpui::component::{Theme as ComponentTheme, ThemeMode, ThemeRegistry};
     if !cx.has_global::<ThemeRegistry>() {
-        gpui_component::theme::init(cx);
+        gpui::init(cx);
     }
     let appearance = current(cx);
     let mode = match appearance {
@@ -155,12 +155,13 @@ fn apply_scrollbar_theme(cx: &mut App) {
     };
     ComponentTheme::change(mode, None, cx);
     let colors = appearance.palette();
-    let theme = ComponentTheme::global_mut(cx);
-    theme.scrollbar_show = gpui_component::scroll::ScrollbarShow::Always;
-    theme.scrollbar = gpui::Hsla::transparent_black();
-    theme.scrollbar_thumb = gpui::rgb(colors.scroll_thumb).into();
-    theme.scrollbar_thumb_hover = gpui::rgb(colors.muted).into();
-    theme.border = gpui::rgb(colors.border).into();
+    ComponentTheme::update(cx, |theme| {
+        theme.scrollbar_mode = gpui::component::scroll::ScrollbarMode::Always;
+        theme.scrollbar = gpui::Hsla::transparent_black();
+        theme.scrollbar_thumb = gpui::rgb(colors.scroll_thumb).into();
+        theme.scrollbar_thumb_hover = gpui::rgb(colors.muted).into();
+        theme.border = gpui::rgb(colors.border).into();
+    });
 }
 
 pub(crate) fn toggle_button(expanded: bool, cx: &App) -> gpui::Stateful<gpui::Div> {

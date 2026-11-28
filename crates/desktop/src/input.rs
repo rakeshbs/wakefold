@@ -105,7 +105,7 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
 
         if event.modifiers.shift {
@@ -444,14 +444,6 @@ struct PrepaintState {
     selection: Option<PaintQuad>,
 }
 
-impl IntoElement for TextElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for TextElement {
     type RequestLayoutState = ();
     type PrepaintState = PrepaintState;
@@ -606,6 +598,8 @@ impl Element for TextElement {
         line.paint(
             bounds.origin - point(prepaint.scroll_x, px(0.)),
             window.line_height(),
+            gpui::TextAlign::Left,
+            None,
             window,
             cx,
         )

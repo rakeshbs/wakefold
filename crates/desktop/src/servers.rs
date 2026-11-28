@@ -17,6 +17,7 @@ use crate::{
 use anyhow::{Context as _, Result};
 use conversation::Conversation;
 use dock::{Dock, Panel};
+use gpui::component::scroll::ScrollableElement;
 use gpui::{Context, Div, Entity, Focusable, Render, Task, Window, div, prelude::*, px, rgb};
 use std::{collections::VecDeque, path::PathBuf};
 use tokio::{runtime::Runtime, sync::mpsc};
@@ -201,7 +202,7 @@ impl Servers {
                     return local_daemon::connect(runtime, directory.as_deref(), cx).await;
                 }
                 let (_, token) = cx
-                    .update(|app| app.read_credentials(&profile.credential_key()))?
+                    .update(|app| app.read_credentials(&profile.credential_key()))
                     .await?
                     .context("Add the server again to save its access token.")?;
                 Self::client(&profile, Some(std::str::from_utf8(&token)?)).map(Some)
@@ -410,7 +411,7 @@ impl Servers {
                 let token = verify.await??;
                 let store = cx.update(|app| {
                     app.write_credentials(&profile.credential_key(), "daemon", token.as_bytes())
-                })?;
+                });
                 store.await?;
                 view.update(cx, |s, _| s.remember(profile.clone()))??;
                 Ok::<_, anyhow::Error>(())
@@ -431,7 +432,7 @@ impl Servers {
     fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.select_chat(Uuid::new_v4(), cx);
         if let Some(draft) = self.current_draft() {
-            window.focus(&draft.input.focus_handle(cx));
+            window.focus(&draft.input.focus_handle(cx), cx);
         }
     }
     fn sidebar(&self, expanded: bool, cx: &mut Context<Self>) -> Div {
@@ -509,7 +510,7 @@ impl Servers {
         let mut servers = column()
             .id("server-list")
             .max_h(px(175.))
-            .overflow_y_scroll();
+            .overflow_y_scrollbar();
         for (i, p) in std::iter::once(Profile::local())
             .chain(self.profiles.servers.clone())
             .enumerate()
@@ -562,7 +563,7 @@ impl Servers {
             .id("saved-chats")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll();
+            .overflow_y_scrollbar();
         for c in &self.chats {
             let id = c.chat_id;
             chats = chats.child(
@@ -688,7 +689,7 @@ impl Servers {
             .p_5()
             .gap_3()
             .id("run-list")
-            .overflow_y_scroll();
+            .overflow_y_scrollbar();
         if let Some(form) = &self.form {
             return column().flex_1().child(body.child(self.form(form, cx)));
         }
@@ -859,7 +860,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("servers.json");
         let (view, cx) = cx.add_window_view(|_, cx| {
-            Servers::with_settings(Runtime::new().unwrap(), Some(file.clone()), cx)
+            let mut servers =
+                Servers::with_settings(Runtime::new().unwrap(), Some(file.clone()), cx);
+            // This test switches profiles before connecting to the local daemon.
+            servers.load = None;
+            servers
         });
         cx.simulate_resize(size(px(1180.), px(745.)));
         cx.run_until_parked();
