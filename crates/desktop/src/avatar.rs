@@ -66,7 +66,8 @@ impl Artwork {
         let index = self.index(time);
         canvas(
             |_, _, _| (),
-            move |bounds: Bounds<Pixels>, _, win, _| {
+            move |bounds: Bounds<Pixels>, _, win, cx| {
+                let theme = crate::theme::current(cx);
                 let scale =
                     (f32::from(bounds.size.width) / 292.).min(f32::from(bounds.size.height) / 252.);
                 let origin = bounds.center() - point(px(146. * scale), px(126. * scale));
@@ -104,7 +105,13 @@ impl Artwork {
                         }
                     }
                     if let Ok(path) = builder.build() {
-                        win.paint_path(path, rgb(layer.color));
+                        let mut paper: gpui::Hsla = rgb(layer.color).into();
+                        if theme == crate::theme::Theme::Dark {
+                            // Keep each fold's shading as the paper bends.
+                            paper.h = 210. / 360.;
+                            paper.s = 0.14;
+                        }
+                        win.paint_path(path, paper);
                     }
                 }
             },

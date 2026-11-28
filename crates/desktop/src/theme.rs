@@ -58,25 +58,26 @@ impl Theme {
                 scroll_thumb: 0xa4b2a6,
                 selection: 0x77a09355,
             },
+            // Base colors from Tomorrow Night, with separate surfaces for the desktop UI.
             Self::Dark => Palette {
-                text: 0xe4ebe6,
-                muted: 0xafbeb5,
-                secondary: 0x99aaa0,
-                accent: 0x9bd7b3,
-                border: 0x38443e,
-                tint: 0x2c4035,
-                background: 0x181e1b,
-                sidebar: 0x141916,
-                surface: 0x202823,
-                warning: 0xeac589,
-                on_accent: 0x14271c,
-                accent_hover: 0xb2e3c5,
-                warning_border: 0x665537,
-                warning_surface: 0x362f23,
-                blue_surface: 0x29363d,
-                blue_text: 0xb0cbd9,
-                scroll_thumb: 0x708578,
-                selection: 0x8fc5a150,
+                text: 0xc5c8c6,
+                muted: 0xb0b2b3,
+                secondary: 0x969896,
+                accent: 0x81a2be,
+                border: 0x42454a,
+                tint: 0x32353a,
+                background: 0x1d1f21,
+                sidebar: 0x191a1c,
+                surface: 0x282a2e,
+                warning: 0xf0c674,
+                on_accent: 0x16181a,
+                accent_hover: 0xa0bcd3,
+                warning_border: 0x625442,
+                warning_surface: 0x302d29,
+                blue_surface: 0x303943,
+                blue_text: 0xa9c1d5,
+                scroll_thumb: 0x777b81,
+                selection: 0x4b4e55ff,
             },
         }
     }
@@ -125,7 +126,7 @@ pub(crate) fn initialize(cx: &mut App) {
         .unwrap_or_default();
     cx.set_global(Appearance { theme, path });
 }
-fn current(cx: &App) -> Theme {
+pub(crate) fn current(cx: &App) -> Theme {
     cx.try_global::<Appearance>()
         .map(|a| a.theme)
         .unwrap_or_default()
